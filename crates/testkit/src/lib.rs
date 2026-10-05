@@ -5,6 +5,8 @@
 //! It implements only what the protocol document says; it is not a model of the
 //! real portal's behaviour beyond that.
 
+pub mod minisign;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

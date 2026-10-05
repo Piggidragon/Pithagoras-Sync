@@ -371,12 +371,18 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "approvals",
         "approve 1",
         "deny 1",
+        "secret set elevation --stdin",
+        "secret clear elevation",
+        "update --manifest /nowhere/manifest.json",
     ]
     .iter()
     .enumerate()
     {
         let (out, _) = exec(&dl, 10 + i as u32, &me(args), &env.p("home/proj")).await;
         assert!(out.contains("exit=1"), "{args}: {out}");
+        if *args != "config set policy.mode full" {
+            assert!(out.contains("cannot come from commands"), "{args}: {out}");
+        }
     }
     let cfg = std::fs::read_to_string(env.config()).unwrap();
     assert!(cfg.contains("mode = \"folders\""), "{cfg}");
@@ -398,6 +404,7 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
             r#"{\"cmd\":\"answer\",\"id\":1,\"answer\":\"once\"}"#,
             r#"{\"cmd\":\"approvals\"}"#,
             r#"{\"cmd\":\"secret_set\",\"name\":\"elevation\",\"value\":\"x\"}"#,
+            r#"{\"cmd\":\"restart\"}"#,
         ]
         .iter()
         .enumerate()

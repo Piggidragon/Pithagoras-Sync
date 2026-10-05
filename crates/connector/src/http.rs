@@ -1,5 +1,6 @@
-//! One HTTP/1.1 request over an open connection, for pairing. The client needs no
-//! other HTTP, so this stays a few lines instead of a client library.
+//! One HTTP/1.1 request over an open connection: the pairing POST, and the GETs of
+//! the updater. The client needs no other HTTP, so this stays a few lines instead
+//! of a client library.
 
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Response {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The `Location` header of a redirect.
+    pub location: Option<String>,
 }
 
 /// POSTs a JSON body to `path` below the portal's base and reads the answer.
@@ -46,13 +49,73 @@ async fn post_inner(
     io.write_all(head.as_bytes()).await.map_err(io_err)?;
     io.write_all(body).await.map_err(io_err)?;
     io.flush().await.map_err(io_err)?;
+    read_response(io, &format!("{url}{path}"), MAX_BODY).await
+}
+
+/// GETs `url` (https, or http to this machine only), following up to five
+/// redirects, and returns the body of a 200 answer of at most `max` bytes.
+pub async fn get(url: &str, max: usize) -> Result<Vec<u8>, String> {
+    let mut url = url.to_string();
+    for _ in 0..=5 {
+        let (origin, target) = split_url(&url)?;
+        let mut io = crate::net::open(&origin, None).await?;
+        let head = format!(
+            "GET {target} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nUser-Agent: pithagoras-sync/{}\r\nConnection: close\r\n\r\n",
+            origin.authority(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let io_err = |e: std::io::Error| format!("{url}: {e}");
+        io.write_all(head.as_bytes()).await.map_err(io_err)?;
+        io.flush().await.map_err(io_err)?;
+        let r = tokio::time::timeout(Duration::from_secs(300), read_response(&mut io, &url, max))
+            .await
+            .map_err(|_| format!("{url}: no complete answer within 300s"))??;
+        match (r.status, r.location) {
+            (200, _) => return Ok(r.body),
+            (301 | 302 | 303 | 307 | 308, Some(loc)) => {
+                url = if loc.starts_with('/') {
+                    format!("{origin}{loc}")
+                } else {
+                    loc
+                };
+            }
+            (s, _) => return Err(format!("{url}: HTTP {s}")),
+        }
+    }
+    Err(format!("{url}: too many redirects"))
+}
+
+/// `https://host[:port]` and the request target (path and query) of a URL.
+fn split_url(url: &str) -> Result<(PortalUrl, String), String> {
+    let url = url.split('#').next().unwrap_or("");
+    let after_scheme = url
+        .find("://")
+        .map(|i| i + 3)
+        .ok_or_else(|| format!("{url:?}: not a URL"))?;
+    let end = url[after_scheme..]
+        .find(['/', '?'])
+        .map_or(url.len(), |i| after_scheme + i);
+    let origin = PortalUrl::parse(&url[..end])?;
+    let target = match &url[end..] {
+        "" => "/".to_string(),
+        t if t.starts_with('?') => format!("/{t}"),
+        t => t.to_string(),
+    };
+    if target.chars().any(|c| c.is_ascii_control() || c == ' ') {
+        return Err(format!("{url:?}: bad characters in the path"));
+    }
+    Ok((origin, target))
+}
+
+async fn read_response(io: &mut BoxIo, what: &str, max: usize) -> Result<Response, String> {
+    let io_err = |e: std::io::Error| format!("{what}: {e}");
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
-    let (status, head_len, length, chunked) = loop {
+    let (status, head_len, length, chunked, location) = loop {
         let n = io.read(&mut chunk).await.map_err(io_err)?;
         if n == 0 {
-            return Err(format!("{url}{path}: connection closed before the answer"));
+            return Err(format!("{what}: connection closed before the answer"));
         }
         buf.extend_from_slice(&chunk[..n]);
         let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -61,7 +124,11 @@ async fn post_inner(
             Ok(httparse::Status::Complete(len)) => {
                 let mut length = None;
                 let mut chunked = false;
+                let mut location = None;
                 for h in resp.headers.iter() {
+                    if h.name.eq_ignore_ascii_case("location") {
+                        location = std::str::from_utf8(h.value).ok().map(str::to_string);
+                    }
                     if h.name.eq_ignore_ascii_case("content-length") {
                         length = std::str::from_utf8(h.value)
                             .ok()
@@ -72,14 +139,17 @@ async fn post_inner(
                             .contains("chunked");
                     }
                 }
-                break (resp.code.unwrap_or(0), len, length, chunked);
+                break (resp.code.unwrap_or(0), len, length, chunked, location);
             }
             Ok(httparse::Status::Partial) if buf.len() < MAX_HEAD => {}
-            Ok(httparse::Status::Partial) => return Err(format!("{url}{path}: header too long")),
-            Err(e) => return Err(format!("{url}{path}: bad answer: {e}")),
+            Ok(httparse::Status::Partial) => return Err(format!("{what}: header too long")),
+            Err(e) => return Err(format!("{what}: bad answer: {e}")),
         }
     };
     let mut body = buf.split_off(head_len);
+    if length.is_some_and(|l| l > max) {
+        return Err(format!("{what}: answer too long"));
+    }
     loop {
         if let Some(len) = length
             && !chunked
@@ -92,19 +162,27 @@ async fn post_inner(
             body = done;
             break;
         }
-        if body.len() > MAX_BODY {
-            return Err(format!("{url}{path}: answer too long"));
+        // Chunk framing on top of the body itself.
+        if body.len() > max + max / 8 + 1024 {
+            return Err(format!("{what}: answer too long"));
         }
         let n = io.read(&mut chunk).await.map_err(io_err)?;
         if n == 0 {
             if length.is_some() || chunked {
-                return Err(format!("{url}{path}: answer cut short"));
+                return Err(format!("{what}: answer cut short"));
             }
             break;
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    Ok(Response { status, body })
+    if body.len() > max {
+        return Err(format!("{what}: answer too long"));
+    }
+    Ok(Response {
+        status,
+        body,
+        location,
+    })
 }
 
 /// Decodes a complete chunked body; `None` while more is needed.
@@ -133,6 +211,22 @@ fn dechunk(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_urls_into_origin_and_target() {
+        let (o, t) = split_url("https://example.org/a/b?x=1#frag").unwrap();
+        assert_eq!(
+            (o.to_string(), t.as_str()),
+            ("https://example.org".into(), "/a/b?x=1")
+        );
+        let (o, t) = split_url("http://127.0.0.1:8080").unwrap();
+        assert_eq!((o.port, t.as_str()), (8080, "/"));
+        let (_, t) = split_url("https://h?q").unwrap();
+        assert_eq!(t, "/?q");
+        assert!(split_url("https://u@h/x").is_err());
+        assert!(split_url("https://h/a b").is_err());
+        assert!(split_url("ftp-ish").is_err());
+    }
 
     #[test]
     fn dechunks() {

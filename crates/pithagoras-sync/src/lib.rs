@@ -9,3 +9,4 @@ pub mod install;
 pub mod owner;
 pub mod secrets;
 pub mod setup;
+pub mod update;

@@ -42,6 +42,9 @@ pub enum Request {
     SecretClear {
         name: String,
     },
+    /// Exit for the unit (or logon task) to start the client again: after an
+    /// update.
+    Restart,
 }
 
 impl Request {
@@ -262,6 +265,7 @@ mod tests {
         };
         assert!(!secret.allowed_from_own_commands());
         assert!(!format!("{secret:?}").contains("hunter2"));
+        assert!(!Request::Restart.allowed_from_own_commands());
         let r: Request = serde_json::from_str(r#"{"cmd":"panic"}"#).unwrap();
         assert_eq!(r, Request::Panic);
     }

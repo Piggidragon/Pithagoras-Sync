@@ -26,6 +26,10 @@ pub struct Daemon {
     link_status: watch::Receiver<LinkStatus>,
     relink: mpsc::Sender<()>,
     approvals: String,
+    /// `restart` asked the client to exit for its unit to start it again (after
+    /// an update).
+    restart: tokio::sync::Notify,
+    restarting: std::sync::atomic::AtomicBool,
 }
 
 /// With `approvals.desktop_notifications` on a Linux desktop: each approval is also
@@ -89,7 +93,9 @@ fn now_ms() -> i64 {
     system_clock()()
 }
 
-pub async fn run(dirs: Dirs) -> Result<(), String> {
+/// Runs until SIGTERM (`Ok(false)`) or a `restart` request (`Ok(true)`: the caller
+/// exits with a failure code so the unit or logon task starts it again).
+pub async fn run(dirs: Dirs) -> Result<bool, String> {
     // Other processes of this user (the commands it runs among them) cannot read
     // the client's memory, where the elevation secret lives.
     #[cfg(target_os = "linux")]
@@ -215,6 +221,8 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
         link_status,
         relink,
         approvals,
+        restart: tokio::sync::Notify::new(),
+        restarting: std::sync::atomic::AtomicBool::new(false),
     });
     let (shutdown_tx, shutdown) = watch::channel(false);
     let control = tokio::spawn(serve_control(
@@ -235,7 +243,7 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
     let _ = tokio::time::timeout(Duration::from_secs(15), supervisor).await;
     device.execs.kill_all().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), control).await;
-    Ok(())
+    Ok(daemon.restarting.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 #[cfg(unix)]
@@ -291,6 +299,7 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
             tokio::select! {
                 _ = term.recv() => return,
                 _ = int.recv() => return,
+                _ = daemon.restart.notified() => return,
                 _ = hup.recv() => {
                     if let Err(e) = daemon.reload() {
                         warn!("reload failed, keeping the old config: {e}");
@@ -301,8 +310,10 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
     }
     #[cfg(windows)]
     {
-        let _ = daemon;
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = daemon.restart.notified() => {}
+        }
     }
 }
 
@@ -399,6 +410,13 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e.to_string()),
             },
+            Request::Restart => {
+                info!("restarting on the owner's request");
+                self.restarting
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.restart.notify_one();
+                Reply::ok()
+            }
             Request::SecretSet { name, value } => match self.set_secret(&name, value) {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),

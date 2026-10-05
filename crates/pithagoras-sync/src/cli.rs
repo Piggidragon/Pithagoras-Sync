@@ -99,6 +99,15 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SecretCmd,
     },
+    /// Replace this program with a newer signed release, and restart the client.
+    Update {
+        /// Only say whether there is one.
+        #[arg(long)]
+        check: bool,
+        /// The release manifest: an https URL, or a local file.
+        #[arg(long)]
+        manifest: Option<String>,
+    },
     /// Start the client with the machine (systemd unit, or a logon task on Windows).
     Install {
         /// A system unit instead of a user unit (run as root).
@@ -207,6 +216,9 @@ pub enum FolderCmd {
 fn now_ms() -> i64 {
     sync_policy::system_clock()()
 }
+
+/// The client's exit code when it stops to be restarted (EX_TEMPFAIL).
+pub const RESTART_EXIT: u8 = 75;
 
 pub fn is_root() -> bool {
     #[cfg(unix)]
@@ -491,7 +503,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             #[cfg(not(windows))]
             let _ = detach;
-            crate::daemon::run(dirs).await?;
+            if crate::daemon::run(dirs).await? {
+                // A failure code, so Restart=on-failure (or the logon task's
+                // restart) starts the client again.
+                return Ok(ExitCode::from(RESTART_EXIT));
+            }
         }
         Cmd::Pair { uri, name } => {
             let mut cfg = owner_edit(&dirs).await?;
@@ -758,6 +774,33 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             println!("Denied #{id}.");
         }
         Cmd::Secret { cmd } => secret_cmd(&dirs, cmd).await?,
+        Cmd::Update { check, manifest } => {
+            owner::not_from_own_command(&dirs).await?;
+            let key = crate::update::PUBLIC_KEY
+                .ok_or("this build has no update key; updates come with release builds")?;
+            let source = manifest
+                .as_deref()
+                .or(crate::update::DEFAULT_MANIFEST)
+                .ok_or("this build names no release manifest; pass --manifest")?;
+            let current = env!("CARGO_PKG_VERSION");
+            let Some(plan) = crate::update::check(source, key, current).await? else {
+                println!("Up to date ({current}).");
+                return Ok(ExitCode::SUCCESS);
+            };
+            if check {
+                println!("Version {} is available (this is {current}).", plan.version);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            crate::update::install(&plan, &exe).await?;
+            println!("Updated {} to {}.", exe.display(), plan.version);
+            match control::send(&dirs.socket(), Request::Restart).await {
+                Ok(Some(r)) if r.ok => println!(
+                    "The running client restarts with it (its unit or logon task starts it again)."
+                ),
+                _ => println!("No client is running; it starts with the new version."),
+            }
+        }
         Cmd::Install {
             system,
             user,
