@@ -63,7 +63,11 @@ async fn a_release_in_a_local_folder_replaces_the_running_program() {
     // The installed program, running: some other program stands in for it.
     let exe = dir.join(r"bin\pithagoras-sync.exe");
     std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-    std::fs::copy(r"C:\Windows\System32\PING.EXE", &exe).unwrap();
+    std::fs::copy(
+        std::path::Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\PING.EXE"),
+        &exe,
+    )
+    .unwrap();
     let mut running = std::process::Command::new(&exe)
         .args(["-n", "60", "127.0.0.1"])
         .stdout(std::process::Stdio::null())

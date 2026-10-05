@@ -369,7 +369,12 @@ mod tests {
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let running = bin.join("p.exe");
-        std::fs::copy(r"C:\Windows\System32\PING.EXE", &running).unwrap();
+        std::fs::copy(
+            std::path::Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join(r"System32\PING.EXE"),
+            &running,
+        )
+        .unwrap();
         let mut child = std::process::Command::new(&running)
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
