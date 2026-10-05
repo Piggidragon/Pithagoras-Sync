@@ -759,6 +759,21 @@ async fn with_write_the_portal_changes_the_policy_and_each_change_is_audited() {
         all.last().unwrap()["settings"]["policy"]["tools"]["bash"],
         true
     );
+    // Audited with old and new value as well, and the switch itself too.
+    let audit = fx.audit();
+    assert!(
+        audit.contains(r#""target":"policy.tools.bash","decision":"changed","reason":"by the device owner: false -> true""#),
+        "{audit}"
+    );
+    let mut cfg = DeviceConfig::load(&fx.config_file()).unwrap();
+    cfg.portal_policy = PortalPolicy::Read;
+    cfg.save(&fx.config_file()).unwrap();
+    store.reload().unwrap();
+    let audit = fx.audit();
+    assert!(
+        audit.contains(r#"by the device owner: \"write\" -> \"read\""#),
+        "{audit}"
+    );
     r.stop().await;
 }
 

@@ -60,9 +60,21 @@ impl ConfigStore {
         Ok(cfg)
     }
 
-    /// The owner changed the file (CLI or by hand): take it.
+    /// The owner changed the file (CLI or by hand): take it. Each changed setting is
+    /// audited with its old and new value, as the portal's changes are.
     pub fn reload(&self) -> Result<DeviceConfig, String> {
         let cfg = self.load()?;
+        let mut changes = Vec::new();
+        settings::diff("", &owned(&self.config()), &owned(&cfg), &mut changes);
+        for c in &changes {
+            self.engine.record(
+                None,
+                "policy",
+                &c.key,
+                "changed",
+                Some(format!("by the device owner: {} -> {}", c.old, c.new)),
+            );
+        }
         self.apply(cfg.clone(), "the device owner");
         Ok(cfg)
     }
@@ -125,4 +137,14 @@ impl ConfigStore {
         self.apply(next.clone(), "the owner's portal session");
         Ok(settings::document(&next))
     }
+}
+
+/// The settings the owner keeps in the file, the pairing aside (`pair` and `unpair`
+/// change that, and it is not a permission).
+fn owned(cfg: &DeviceConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("portal");
+    }
+    v
 }

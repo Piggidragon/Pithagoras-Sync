@@ -436,7 +436,8 @@ pub struct ApprovalResolved {
     pub chat: String,
     pub answer: Choice,
     pub minutes: Option<u32>,
-    /// `portal`, `device` (the local CLI), `notification`, `timeout` or `pause`.
+    /// `portal`, `device` (the local CLI), `notification`, `timeout`, `pause` or
+    /// `withdrawn` (the call ended first).
     pub by: String,
 }
 
