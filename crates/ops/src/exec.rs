@@ -321,7 +321,7 @@ impl Execs {
     ) -> Result<(PathBuf, Vec<String>, Option<Secret>), RpcError> {
         #[cfg(not(target_os = "linux"))]
         return Err(RpcError::denied(
-            "elevated commands are only built for Linux in this version",
+            "elevated commands are Linux only (sudo); Windows has none",
         ));
         #[cfg(target_os = "linux")]
         {

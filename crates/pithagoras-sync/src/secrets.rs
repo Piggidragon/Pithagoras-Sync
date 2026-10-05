@@ -136,7 +136,7 @@ pub fn read_from_tty(prompt: &str) -> Result<Secret, String> {
 
 #[cfg(windows)]
 pub fn read_from_tty(_prompt: &str) -> Result<Secret, String> {
-    Err("elevation is built for Linux (sudo) only in this version".into())
+    Err("elevation is Linux only (sudo); Windows has none".into())
 }
 
 /// One line from stdin (a script piping it in); never from a command line.

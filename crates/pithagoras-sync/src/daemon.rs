@@ -446,7 +446,7 @@ impl Daemon {
             return Err(format!("there is no secret {name}"));
         }
         if !cfg!(target_os = "linux") {
-            return Err("elevation is built for Linux (sudo) only in this version".into());
+            return Err("elevation is Linux only (sudo); Windows has none".into());
         }
         #[cfg(target_os = "linux")]
         if sync_policy::secret::traced() {
