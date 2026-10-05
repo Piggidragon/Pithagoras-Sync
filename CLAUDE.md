@@ -14,9 +14,10 @@ This file applies to every agent in this repo.
 - `docs/permissions.md`: every setting with its default, CLI command and whether the portal may set it. A new setting goes there, and into `settings::DEVICE_ONLY` when the portal must not change it.
 - `docs/testing.md`: the tools for trying a client by hand and the record of the test machine.
 - `docs/windows.md`: what differs on Windows and what is unverified there.
+- `crates/release`: `sync-release`, the release tooling: the release key (`keygen`, `sign`) and the signed update manifest. The minisign signer lives here. `docs/releasing.md` and `.github/workflows/release.yml` describe the release.
 - `crates/testkit`: the mock portal the tests talk to, plus two programs for manual runs: `sync-mock-portal` (the mock on loopback, driven over stdin) and `sync-test-sign` (throwaway minisign keys and signatures). The real portal side does not exist yet.
 
-The updater trusts the minisign key compiled in from `PITHAGORAS_SYNC_UPDATE_KEY` (and takes its default manifest URL from `PITHAGORAS_SYNC_UPDATE_URL`). Builds without them cannot update themselves; never put a real release key into tests.
+The updater trusts the minisign key compiled in from `PITHAGORAS_SYNC_UPDATE_KEY` (without a key a build cannot update itself). The default manifest URL is the stable release channel, `<repo>/releases/latest/download/manifest.json`; `PITHAGORAS_SYNC_UPDATE_URL` overrides it. Never put a real release key into tests.
 
 The cargo feature `overlay` (phase 2: GUI, audio, hotkeys, computer use) is off; phase 1 builds without it.
 
