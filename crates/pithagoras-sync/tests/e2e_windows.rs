@@ -291,8 +291,24 @@ async fn windows_pair_run_exec_panic_unlock() {
         .next_device(WAIT)
         .await
         .expect("reconnects after unlock");
-    drop(dl);
+
+    // The client killed while a detached process runs: the job dies with it.
+    let flag = env.root.join("home/proj/outlived-the-client");
+    let cmd = format!(
+        "Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 6; Set-Content \"{}\" x'; Write-Output started; Start-Sleep 60",
+        flag.display()
+    );
+    dl.call(
+        "exec.start",
+        json!({"stream": 7, "command": cmd, "cwd": env.p("home/proj"), "ctx": {"chat": "c1"}}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
     stop(daemon).await;
+    drop(dl);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(!flag.exists(), "the detached process outlived the client");
 }
 
 #[tokio::test(flavor = "multi_thread")]
