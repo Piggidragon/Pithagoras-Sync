@@ -179,7 +179,19 @@ pub fn scrub_log_with(slot: Arc<SecretSlot>) {
     let _ = LOG_SECRETS.set(slot);
 }
 
-/// stderr for the log, one event at a time, with the secret taken out.
+/// Where the log goes instead of stderr, once `log_to_file` set it.
+static LOG_FILE: OnceLock<std::sync::Mutex<crate::logfile::LogFile>> = OnceLock::new();
+
+/// The client's log goes to `path` (capped, see `logfile`) from here on, instead of
+/// stderr: a client without a console has nowhere else to write it.
+pub fn log_to_file(path: PathBuf) -> std::io::Result<()> {
+    let file = crate::logfile::LogFile::open(path, crate::logfile::MAX_BYTES)?;
+    let _ = LOG_FILE.set(std::sync::Mutex::new(file));
+    Ok(())
+}
+
+/// stderr (or the log file) for the log, one event at a time, with the secret
+/// taken out.
 pub struct LogWriter;
 
 pub struct LogEvent(Vec<u8>);
@@ -198,7 +210,16 @@ impl Write for LogEvent {
 impl Drop for LogEvent {
     fn drop(&mut self) {
         let text = scrubbed_for_log(std::mem::take(&mut self.0));
-        let _ = std::io::stderr().lock().write_all(&text);
+        match LOG_FILE.get() {
+            Some(f) => {
+                if let Ok(mut f) = f.lock() {
+                    f.write_event(&text);
+                }
+            }
+            None => {
+                let _ = std::io::stderr().lock().write_all(&text);
+            }
+        }
     }
 }
 

@@ -884,3 +884,30 @@ async fn elevated_commands_are_refused_under_landlock() {
     drop(dl);
     stop(daemon).await;
 }
+
+/// `run --detach` (what the Windows logon task starts) has no console: the log goes
+/// to `client.log` in the state folder, as plain text, and nothing to stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_client_writes_its_log_to_a_file() {
+    let env = Env::new();
+    let err = std::fs::File::create(env.root.join("stderr.txt")).unwrap();
+    let child = env.cmd(&["run", "--detach"]).stderr(err).spawn().unwrap();
+    let mut up = false;
+    for _ in 0..100 {
+        let out = env.cmd(&["status", "--json"]).output().await.unwrap();
+        if out.status.success() {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(up, "the client answers");
+    stop(child).await;
+    let log =
+        std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/client.log")).unwrap();
+    assert!(log.contains("started: profile"), "{log}");
+    assert!(log.contains("shutting down"), "{log}");
+    assert!(!log.contains('\x1b'), "{log}");
+    let stderr = std::fs::read_to_string(env.root.join("stderr.txt")).unwrap();
+    assert!(stderr.is_empty(), "{stderr}");
+}

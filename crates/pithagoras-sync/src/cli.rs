@@ -34,7 +34,8 @@ pub struct Cli {
 pub enum Cmd {
     /// Run the client (what the systemd unit or the logon task starts).
     Run {
-        /// Windows: let go of the console window.
+        /// Run without a console (the Windows logon task): let go of the console
+        /// window and write the log to `client.log` in the state folder.
         #[arg(long, hide = true)]
         detach: bool,
     },
@@ -215,6 +216,11 @@ pub enum FolderCmd {
 
 fn now_ms() -> i64 {
     sync_policy::system_clock()()
+}
+
+/// Where a client without a console (`run --detach`) writes its log.
+pub fn log_file(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("client.log")
 }
 
 /// The client's exit code when it stops to be restarted (EX_TEMPFAIL).
@@ -516,14 +522,23 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
     let dirs = Dirs::from_env()?;
     match cli.cmd {
         Cmd::Run { detach } => {
-            #[cfg(windows)]
             if detach {
+                // Without a console the log would go nowhere; the file is capped.
+                if let Err(e) = crate::secrets::log_to_file(log_file(&dirs)) {
+                    eprintln!("pithagoras-sync: no log file: {e}");
+                }
+                #[cfg(windows)]
                 // SAFETY: FreeConsole has no preconditions.
-                unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+                unsafe {
+                    windows_sys::Win32::System::Console::FreeConsole()
+                };
             }
-            #[cfg(not(windows))]
-            let _ = detach;
-            if crate::daemon::run(dirs).await? {
+            let ran = crate::daemon::run(dirs).await;
+            if detach && let Err(e) = &ran {
+                // Why it stopped, for the owner reading the file later.
+                tracing::error!("{e}");
+            }
+            if ran? {
                 // A failure code, so Restart=on-failure (or the logon task's
                 // restart) starts the client again.
                 return Ok(ExitCode::from(RESTART_EXIT));

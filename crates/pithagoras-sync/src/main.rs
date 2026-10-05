@@ -31,7 +31,7 @@ fn main() -> ExitCode {
         .with_max_level(level)
         .with_target(false)
         // Colours only for a terminal: a log file or the journal gets plain text.
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(std::io::stderr().is_terminal() && !matches!(cli.cmd, Cmd::Run { detach: true }))
         .init();
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

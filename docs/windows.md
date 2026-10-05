@@ -61,11 +61,12 @@ Elevation is `sudo` on Linux and nothing else: Windows has none, and none is pla
 | Config | `%APPDATA%\pithagoras-sync\config.toml` |
 | Connector token | `%APPDATA%\pithagoras-sync\token` |
 | Audit log, pause flag | `%LOCALAPPDATA%\pithagoras-sync\` |
+| Log of the logon task's client | `%LOCALAPPDATA%\pithagoras-sync\client.log` (and `client.log.1`) |
 | Program (after `install`) | `%LOCALAPPDATA%\Programs\pithagoras-sync\pithagoras-sync.exe` |
 
 The token file relies on the profile folder's default permissions (the user, SYSTEM and Administrators). Linux refuses a token file others can read; Windows has no such check yet. The architecture's OS credential store (Credential Manager) is not used in phase 1 on either platform.
 
-The client the logon task starts has no console, so its log goes nowhere; `status` and the audit log show what it does. Started in a terminal, it logs there.
+The client the logon task starts (`run --detach`) has no console, so it writes its log to `%LOCALAPPDATA%\pithagoras-sync\client.log`, plain text, with the elevation password scrubbed as everywhere. The file is capped at 1 MiB: past that it moves to `client.log.1`, replacing the one before, and a new file starts, so the log never takes more than about 2 MiB. Why the client stopped (refusing an elevated session, a broken config) is the last line there. Started in a terminal, it logs to the terminal.
 
 ## Start at logon: a scheduled task, not a service
 
