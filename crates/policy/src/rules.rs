@@ -721,6 +721,8 @@ mod tests {
         assert!(c.always_ask("git status").is_none());
     }
 
+    // Linux paths; the Windows form is the test below.
+    #[cfg(unix)]
     #[test]
     fn deny_paths_and_globs() {
         let c = Compiled::new(
@@ -769,6 +771,47 @@ mod tests {
         let paths = c.denied_paths();
         assert!(paths.iter().any(|(p, _)| p == Path::new("/home/u/secret")));
         assert!(!paths.iter().any(|(p, _)| p.to_string_lossy().contains('*')));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deny_paths_and_globs_on_windows() {
+        let c = Compiled::new(
+            Path::new(r"C:\Users\u"),
+            &[
+                DenyRule {
+                    path: "~/secret".into(),
+                    rights: Rights::ALL,
+                },
+                DenyRule {
+                    path: "C:/srv/**/*.key".into(),
+                    rights: Rights::READ,
+                },
+                DenyRule {
+                    path: r"D:\ro".into(),
+                    rights: Rights::WRITE,
+                },
+            ],
+            &[GlobGrant {
+                glob: "~/notes/*.md".into(),
+                access: Access::Ro,
+            }],
+            &Commands::default(),
+            None,
+        )
+        .unwrap();
+        let denied = |p: &str, r| c.denied(Path::new(p), r).is_some();
+        assert!(denied(r"C:\Users\U\Secret\a", Rights::READ));
+        assert!(!denied(r"C:\Users\u\secrets", Rights::READ));
+        assert!(denied(r"c:\SRV\a\b\X.KEY", Rights::READ));
+        assert!(!denied(r"C:\srv\a\b\x.key", Rights::WRITE));
+        assert!(denied(r"d:\RO\f", Rights::WRITE));
+        assert!(!denied(r"D:\rofl", Rights::WRITE));
+        assert!(c.glob_grant(Path::new(r"C:\Users\U\Notes\A.md")).is_some());
+        assert!(
+            c.glob_grant(Path::new(r"C:\Users\u\notes\sub\a.md"))
+                .is_none()
+        );
     }
 
     #[test]

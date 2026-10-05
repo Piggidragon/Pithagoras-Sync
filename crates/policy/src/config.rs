@@ -297,7 +297,14 @@ impl Policy {
         if a.max_minutes > 7 * 24 * 60 || a.remember_minutes > 7 * 24 * 60 {
             return Err("approvals: minutes must be at most a week (10080)".into());
         }
-        if !self.privilege.sudo_path.is_absolute() {
+        // sudo is Linux only, so its path is a Unix one on every platform; Windows
+        // would not call `/usr/bin/sudo` absolute and refuse the default config.
+        if !self
+            .privilege
+            .sudo_path
+            .to_str()
+            .is_some_and(|s| s.starts_with('/'))
+        {
             return Err("privilege.sudo_path must be absolute".into());
         }
         for t in &self.protected.tool_config {
@@ -645,6 +652,7 @@ mod tests {
             "[policy.hours]\nfrom = \"25:00\"\nto = \"01:00\"\n",
             "[policy.approvals]\ntimeout_secs = 0\n",
             "[policy.protected]\ntool_config = [\"a/b\"]\n",
+            "[policy.privilege]\nsudo_path = \"sudo\"\n",
         ] {
             let cfg: Result<DeviceConfig, _> = toml::from_str(text);
             let ok = cfg.is_ok_and(|c| c.policy.validate(c.profile).is_ok());
@@ -658,7 +666,12 @@ mod tests {
         let path = dir.path().join("c/config.toml");
         let mut cfg = DeviceConfig::default();
         cfg.policy.folders.push(FolderGrant {
-            path: "/srv/a".into(),
+            path: if cfg!(windows) {
+                "C:\\srv\\a"
+            } else {
+                "/srv/a"
+            }
+            .into(),
             access: Access::Ro,
             execute: true,
         });
