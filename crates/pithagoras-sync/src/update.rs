@@ -198,8 +198,7 @@ fn check_runs(path: &Path, version: &str) -> Result<(), String> {
         {
             // A process forked by another thread while the file was open for
             // writing holds it open until it execs: try again shortly.
-            #[cfg(unix)]
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+            Err(e) if text_busy(&e) && tries < 50 => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -214,6 +213,16 @@ fn check_runs(path: &Path, version: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn text_busy(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(windows)]
+fn text_busy(_e: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(unix)]
