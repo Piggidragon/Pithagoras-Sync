@@ -144,6 +144,14 @@ The client ran with its own profile (`USERPROFILE`, `APPDATA` and `LOCALAPPDATA`
 - `uninstall` ended the client and deleted the task and its definition.
 - Not tested: a real logoff and logon, since the VM offers no way to log on again without its password, and whether a console window flashes then.
 
+### Second run: log file, known folders, release builds
+
+Run on 2026-10-05 after the log file, the known folders and the release tooling came in: `scripts/windows-vm-test.sh` again, 21 test programs, all passed. New among them: the protected paths ask Windows for Documents and `System32` (`KnownFolders`) and protect what is in them; the capped log file moves aside at its cap; `sync-release` signs and verifies.
+
+By hand, from the elevated ssh session: `run --detach` with a fresh config refused the elevated session (exit 1), and that refusal was the line in `%LOCALAPPDATA%\pithagoras-sync\client.log` (here under `PITHAGORAS_SYNC_CONFIG_DIR`), plain text. The test folder was removed afterwards.
+
+Not done in this run: a second local account for the control pipe's ACL, and a command sandbox (restricted token or AppContainer) with a check of processes started through WMI, scheduled tasks or COM; see windows.md.
+
 ### Cleanup
 
 The task was deleted, the client stopped, and the test folders, the client's folders under `%APPDATA%` and `%LOCALAPPDATA%` and the installed program removed from the VM.
