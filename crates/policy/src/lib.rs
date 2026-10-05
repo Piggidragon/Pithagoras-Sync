@@ -7,9 +7,11 @@ pub mod approve;
 pub mod audit;
 pub mod config;
 pub mod engine;
+#[cfg(unix)]
 pub mod notify;
 pub mod paths;
 pub mod patterns;
+pub mod private;
 pub mod protected;
 
 pub use approve::{Answer, ApprovalRequest, Approver, BoxFuture, NoApprover};

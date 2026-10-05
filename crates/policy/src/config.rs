@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -249,18 +248,16 @@ pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("no parent directory"))?;
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    crate::private::private_dir(dir)?;
     let tmp = dir.join(format!(
         ".{}.tmp{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
     let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
+    let mut f = crate::private::private_options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
@@ -277,8 +274,17 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    /// `$PITHAGORAS_SYNC_CONFIG_DIR` or the XDG directories of the current user.
+    /// `$PITHAGORAS_SYNC_CONFIG_DIR`, or the XDG directories of the current user
+    /// (on Windows `%APPDATA%` and `%LOCALAPPDATA%`).
     pub fn from_env() -> Result<Dirs, String> {
+        if let Some(base) = std::env::var_os("PITHAGORAS_SYNC_CONFIG_DIR") {
+            return Ok(Dirs::under(Path::new(&base)));
+        }
+        Dirs::platform()
+    }
+
+    #[cfg(not(windows))]
+    fn platform() -> Result<Dirs, String> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or("HOME is not set")?;
@@ -288,9 +294,6 @@ impl Dirs {
                 .filter(|p| p.is_absolute())
                 .unwrap_or_else(|| home.join(fallback))
         };
-        if let Some(base) = std::env::var_os("PITHAGORAS_SYNC_CONFIG_DIR") {
-            return Ok(Dirs::under(Path::new(&base)));
-        }
         let state = xdg("XDG_STATE_HOME", ".local/state").join("pithagoras-sync");
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -301,6 +304,21 @@ impl Dirs {
             config: xdg("XDG_CONFIG_HOME", ".config").join("pithagoras-sync"),
             state,
             runtime,
+        })
+    }
+
+    #[cfg(windows)]
+    fn platform() -> Result<Dirs, String> {
+        let var = |v: &str| {
+            std::env::var_os(v)
+                .map(PathBuf::from)
+                .ok_or(format!("{v} is not set"))
+        };
+        let state = var("LOCALAPPDATA")?.join("pithagoras-sync");
+        Ok(Dirs {
+            config: var("APPDATA")?.join("pithagoras-sync"),
+            runtime: state.join("run"),
+            state,
         })
     }
 
@@ -330,8 +348,23 @@ impl Dirs {
         self.state.join("paused")
     }
 
+    /// The control channel to the running client: a Unix socket, or on Windows a
+    /// named pipe whose name is derived from the config directory.
     pub fn socket(&self) -> PathBuf {
-        self.runtime.join("control.sock")
+        #[cfg(windows)]
+        {
+            // FNV-1a: stable across runs, and distinct per config directory.
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in self.config.to_string_lossy().to_lowercase().bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            PathBuf::from(format!(r"\\.\pipe\pithagoras-sync-{h:016x}"))
+        }
+        #[cfg(not(windows))]
+        {
+            self.runtime.join("control.sock")
+        }
     }
 }
 
@@ -397,8 +430,12 @@ mod tests {
         });
         cfg.save(&path).unwrap();
         assert_eq!(DeviceConfig::load(&path).unwrap(), cfg);
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         assert!(DeviceConfig::load(&dir.path().join("missing.toml")).is_ok());
         fs::write(&path, "[policy]\nmood = \"full\"\n").unwrap();
         assert!(DeviceConfig::load(&path).is_err());

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The notification approver against a private D-Bus daemon and a fake notification
 //! server, so no real notification ever shows on the machine running the tests.
 

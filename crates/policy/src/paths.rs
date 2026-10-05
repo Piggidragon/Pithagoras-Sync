@@ -1,10 +1,12 @@
 //! Turning a path from the portal into the real path the policy judges.
 //!
-//! The portal sends absolute device paths. The device refuses anything else instead
-//! of guessing (relative paths, Windows drive letters, NUL bytes), then resolves
-//! symlinks and `..` so the policy sees where a call would really land. The open
-//! itself later goes through `openat2` with the resolved path, so a symlink that
-//! appears between check and use makes the call fail instead of escaping.
+//! The portal sends absolute device paths in one form on every platform: `/home/x`
+//! on Linux, `/c/Users/x` for `C:\Users\x` on Windows. The device refuses anything
+//! else instead of guessing (relative paths, untranslated drive letters, UNC and
+//! `\\?\` paths, NUL bytes, Windows device names and alternate data streams), then
+//! resolves symlinks and `..` so the policy sees where a call would really land. The
+//! open itself later checks again (`openat2` on Linux, the handle's final path on
+//! Windows), so a symlink that appears between check and use fails the call.
 
 use std::fs;
 use std::io;
@@ -16,7 +18,14 @@ pub enum PathError {
     Relative,
     /// `C:\...` or `C:/...`: the portal must translate drive letters to `/c/...`.
     DriveLetter,
+    /// UNC, `\\?\` or device paths, or a backslash in a Windows wire path.
+    Unc,
     Nul,
+    /// A Windows device name (`CON`, `NUL`, `COM1`, ...) as a path component.
+    Reserved(String),
+    /// A component Windows would silently change or read as a stream: a `:`
+    /// (alternate data stream), a trailing dot or space, or a wildcard character.
+    BadComponent(String),
     /// The path names a symlink whose target does not exist.
     DanglingSymlink(PathBuf),
     /// `..` after the part of the path that exists; it cannot be resolved safely.
@@ -30,7 +39,10 @@ impl std::fmt::Display for PathError {
             PathError::Empty => write!(f, "empty path"),
             PathError::Relative => write!(f, "path must be absolute"),
             PathError::DriveLetter => write!(f, "untranslated drive-letter path"),
+            PathError::Unc => write!(f, "UNC and device paths are not accepted"),
             PathError::Nul => write!(f, "path contains a NUL byte"),
+            PathError::Reserved(c) => write!(f, "{c} is a Windows device name"),
+            PathError::BadComponent(c) => write!(f, "{c:?} is not a plain file name"),
             PathError::DanglingSymlink(p) => write!(f, "{} is a dangling symlink", p.display()),
             PathError::ParentInMissingPart => {
                 write!(f, "'..' after a path component that does not exist")
@@ -42,8 +54,7 @@ impl std::fmt::Display for PathError {
 
 impl std::error::Error for PathError {}
 
-/// Checks the syntax of a path from the portal.
-pub fn parse_device_path(s: &str) -> Result<PathBuf, PathError> {
+fn common_checks(s: &str) -> Result<(), PathError> {
     if s.is_empty() {
         return Err(PathError::Empty);
     }
@@ -54,13 +65,168 @@ pub fn parse_device_path(s: &str) -> Result<PathBuf, PathError> {
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         return Err(PathError::DriveLetter);
     }
-    if s.starts_with("\\\\") {
-        return Err(PathError::DriveLetter);
+    if s.starts_with("\\\\") || s.starts_with("//") {
+        return Err(PathError::Unc);
     }
     if !s.starts_with('/') {
         return Err(PathError::Relative);
     }
+    Ok(())
+}
+
+/// Checks the syntax of a path from the portal and turns it into a native path.
+#[cfg(not(windows))]
+pub fn parse_device_path(s: &str) -> Result<PathBuf, PathError> {
+    common_checks(s)?;
     Ok(PathBuf::from(s))
+}
+
+/// Checks the syntax of a path from the portal and turns it into a native path.
+#[cfg(windows)]
+pub fn parse_device_path(s: &str) -> Result<PathBuf, PathError> {
+    common_checks(s)?;
+    win::from_wire(s).map(PathBuf::from)
+}
+
+/// A native path as the portal sees it.
+pub fn to_wire(p: &Path) -> String {
+    #[cfg(windows)]
+    {
+        win::to_wire(&p.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_string_lossy().into_owned()
+    }
+}
+
+/// Windows path rules as pure string functions, so they are tested on every
+/// platform. On Windows they back `parse_device_path`, `within` and `to_wire`.
+pub mod win {
+    use super::PathError;
+
+    const RESERVED: &[&str] = &[
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "conin$",
+        "conout$",
+        "clock$",
+        "com0",
+        "com1",
+        "com2",
+        "com3",
+        "com4",
+        "com5",
+        "com6",
+        "com7",
+        "com8",
+        "com9",
+        "com\u{b9}",
+        "com\u{b2}",
+        "com\u{b3}",
+        "lpt0",
+        "lpt1",
+        "lpt2",
+        "lpt3",
+        "lpt4",
+        "lpt5",
+        "lpt6",
+        "lpt7",
+        "lpt8",
+        "lpt9",
+        "lpt\u{b9}",
+        "lpt\u{b2}",
+        "lpt\u{b3}",
+    ];
+
+    /// `/c/Users/x` to `C:\Users\x`. Refuses backslashes (the wire separator is `/`),
+    /// device names with or without an extension (`NUL.txt`), `:` (alternate data
+    /// streams), names ending in a dot or space (Windows strips them, so `a.` would
+    /// open `a`) and wildcard characters.
+    pub fn from_wire(s: &str) -> Result<String, PathError> {
+        super::common_checks(s)?;
+        if s.contains('\\') {
+            return Err(PathError::Unc);
+        }
+        let mut parts = s[1..].split('/');
+        let drive = parts.next().unwrap_or_default();
+        if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+            return Err(PathError::Relative);
+        }
+        let mut out = format!("{}:\\", drive.to_ascii_uppercase());
+        let mut first = true;
+        for c in parts {
+            if c.is_empty() || c == "." {
+                continue;
+            }
+            if c != ".." {
+                check_component(c)?;
+            }
+            if !first {
+                out.push('\\');
+            }
+            out.push_str(c);
+            first = false;
+        }
+        Ok(out)
+    }
+
+    fn check_component(c: &str) -> Result<(), PathError> {
+        if c.contains([':', '*', '?', '"', '<', '>', '|']) || c.chars().any(|ch| (ch as u32) < 32) {
+            return Err(PathError::BadComponent(c.to_string()));
+        }
+        if c.ends_with('.') || c.ends_with(' ') {
+            return Err(PathError::BadComponent(c.to_string()));
+        }
+        let base = c
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_lowercase();
+        if RESERVED.contains(&base.as_str()) {
+            return Err(PathError::Reserved(c.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Drops the `\\?\` prefix of a local drive path. A verbatim UNC path stays
+    /// as it is (and fails `to_wire`'s drive form).
+    pub fn strip_verbatim(s: &str) -> &str {
+        match s.strip_prefix("\\\\?\\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest,
+            _ => s,
+        }
+    }
+
+    /// `C:\Users\x` (or its `\\?\` form) to `/c/Users/x`.
+    pub fn to_wire(native: &str) -> String {
+        let s = strip_verbatim(native);
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[1] == b':' {
+            let rest = s[2..].replace('\\', "/");
+            let rest = rest.trim_end_matches('/');
+            format!("/{}{}", (b[0] as char).to_ascii_lowercase(), rest)
+        } else {
+            s.replace('\\', "/")
+        }
+    }
+
+    /// `path` is `base` or inside it, by whole components and ignoring case, as NTFS
+    /// does by default.
+    pub fn within(path: &str, base: &str) -> bool {
+        let split = |s: &str| -> Vec<String> {
+            strip_verbatim(s)
+                .split(['\\', '/'])
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_lowercase())
+                .collect()
+        };
+        let (p, b) = (split(path), split(base));
+        p.len() >= b.len() && p[..b.len()] == b[..]
+    }
 }
 
 /// Resolves an absolute path: the part that exists through `realpath`, the rest
@@ -70,16 +236,21 @@ pub fn resolve(path: &Path) -> Result<PathBuf, PathError> {
     if !path.is_absolute() {
         return Err(PathError::Relative);
     }
-    match fs::canonicalize(path) {
+    match canonical(path) {
         Ok(p) => return Ok(p),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(PathError::Io(e)),
     }
     let comps: Vec<Component> = path.components().collect();
+    // The root (and on Windows the drive) always exists.
+    let roots = comps
+        .iter()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .count();
+    let mut prefix: PathBuf = comps[..roots].iter().collect();
+    let mut existing = roots;
     // The longest prefix that exists (as anything, symlinks included).
-    let mut existing = 1; // the root always exists
-    let mut prefix = PathBuf::from("/");
-    for (i, c) in comps.iter().enumerate().skip(1) {
+    for (i, c) in comps.iter().enumerate().skip(roots) {
         let next = prefix.join(c.as_os_str());
         match fs::symlink_metadata(&next) {
             Ok(_) => {
@@ -90,7 +261,7 @@ pub fn resolve(path: &Path) -> Result<PathBuf, PathError> {
             Err(e) => return Err(PathError::Io(e)),
         }
     }
-    let real_prefix = match fs::canonicalize(&prefix) {
+    let real_prefix = match canonical(&prefix) {
         Ok(p) => p,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(PathError::DanglingSymlink(prefix));
@@ -108,13 +279,96 @@ pub fn resolve(path: &Path) -> Result<PathBuf, PathError> {
     Ok(out)
 }
 
+/// `realpath`, on Windows without the `\\?\` prefix so resolved paths compare with
+/// configured ones.
+fn canonical(p: &Path) -> io::Result<PathBuf> {
+    let c = fs::canonicalize(p)?;
+    #[cfg(windows)]
+    {
+        let s = c.to_string_lossy();
+        let stripped = win::strip_verbatim(&s);
+        if stripped.starts_with("\\\\") {
+            return Err(io::Error::other("network paths are not accepted"));
+        }
+        Ok(PathBuf::from(stripped))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(c)
+    }
+}
+
 /// `path` is `base` or inside it, compared by whole components (`/a/bc` is not inside
-/// `/a/b`). Both should be resolved paths.
+/// `/a/b`); on Windows ignoring case. Both should be resolved paths.
 pub fn within(path: &Path, base: &Path) -> bool {
-    path.starts_with(base)
+    #[cfg(windows)]
+    {
+        win::within(&path.to_string_lossy(), &base.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(base)
+    }
 }
 
 #[cfg(test)]
+mod win_tests {
+    use super::PathError;
+    use super::win::*;
+
+    #[test]
+    fn translates_wire_paths() {
+        assert_eq!(from_wire("/c/Users/x/proj").unwrap(), "C:\\Users\\x\\proj");
+        assert_eq!(from_wire("/d").unwrap(), "D:\\");
+        assert_eq!(from_wire("/c/a//./b/").unwrap(), "C:\\a\\b");
+        assert_eq!(to_wire("C:\\Users\\x"), "/c/Users/x");
+        assert_eq!(to_wire("\\\\?\\C:\\Users\\x\\"), "/c/Users/x");
+        assert_eq!(to_wire("C:\\"), "/c");
+    }
+
+    #[test]
+    fn refuses_what_windows_would_reinterpret() {
+        let bad = |s: &str| from_wire(s).unwrap_err();
+        assert!(matches!(bad("C:\\Users"), PathError::DriveLetter));
+        assert!(matches!(bad("c:/Users"), PathError::DriveLetter));
+        assert!(matches!(bad("\\\\?\\C:\\x"), PathError::Unc));
+        assert!(matches!(bad("\\\\server\\share"), PathError::Unc));
+        assert!(matches!(bad("//server/share"), PathError::Unc));
+        assert!(matches!(bad("/c/Users\\x"), PathError::Unc));
+        assert!(matches!(bad("/cc/x"), PathError::Relative));
+        assert!(matches!(bad("/c/proj/NUL"), PathError::Reserved(_)));
+        assert!(matches!(bad("/c/proj/con.txt"), PathError::Reserved(_)));
+        assert!(matches!(bad("/c/proj/COM1.log"), PathError::Reserved(_)));
+        assert!(matches!(bad("/c/proj/lpt\u{b9}"), PathError::Reserved(_)));
+        assert!(matches!(bad("/c/proj/aux /x"), PathError::BadComponent(_)));
+        assert!(matches!(
+            bad("/c/proj/a.txt:secret"),
+            PathError::BadComponent(_)
+        ));
+        assert!(matches!(
+            bad("/c/proj/a.txt::$DATA"),
+            PathError::BadComponent(_)
+        ));
+        assert!(matches!(bad("/c/proj/x."), PathError::BadComponent(_)));
+        assert!(matches!(bad("/c/proj/x "), PathError::BadComponent(_)));
+        assert!(matches!(bad("/c/proj/*.rs"), PathError::BadComponent(_)));
+        // Ordinary names that only look close are fine.
+        assert!(from_wire("/c/proj/console.log").is_ok());
+        assert!(from_wire("/c/proj/nulled").is_ok());
+        assert!(from_wire("/c/PROGRA~1/x").is_ok());
+    }
+
+    #[test]
+    fn within_ignores_case_and_verbatim_prefixes() {
+        assert!(within("C:\\Users\\X\\Proj\\a", "c:\\users\\x\\proj"));
+        assert!(within("\\\\?\\C:\\Users\\x\\proj", "C:\\Users\\x\\proj"));
+        assert!(!within("C:\\Users\\x\\project", "C:\\Users\\x\\proj"));
+        assert!(!within("D:\\Users\\x\\proj", "C:\\Users\\x\\proj"));
+        assert!(!within("C:\\Users", "C:\\Users\\x"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -134,7 +388,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_device_path("\\\\srv\\share"),
-            Err(PathError::DriveLetter)
+            Err(PathError::Unc)
         ));
         assert!(matches!(parse_device_path("/a\0b"), Err(PathError::Nul)));
         assert_eq!(

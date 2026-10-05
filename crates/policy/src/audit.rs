@@ -1,9 +1,8 @@
 //! The local audit log: append-only JSONL, one line per call and decision. It never
 //! holds file contents, only what was asked and what the device decided.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -45,8 +44,7 @@ pub struct AuditLog {
 impl AuditLog {
     pub fn open(path: &Path) -> io::Result<AuditLog> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            crate::private::private_dir(dir)?;
         }
         let f = Self::open_file(path)?;
         Ok(AuditLog {
@@ -56,10 +54,9 @@ impl AuditLog {
     }
 
     fn open_file(path: &Path) -> io::Result<File> {
-        OpenOptions::new()
+        crate::private::private_options()
             .append(true)
             .create(true)
-            .mode(0o600)
             .open(path)
     }
 
@@ -90,9 +87,10 @@ impl AuditLog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn appends_private_jsonl() {

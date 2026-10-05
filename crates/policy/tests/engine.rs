@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The device's own decisions: folders, path escapes, protected paths, approvals,
 //! taint, Full's expiry and pause. Every test here guards a fail-closed rule.
 

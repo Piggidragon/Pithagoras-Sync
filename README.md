@@ -6,7 +6,7 @@ Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) po
 
 ## Build
 
-Needs Rust (stable, 1.85 or newer).
+Needs Rust (stable, 1.88 or newer).
 
 ```sh
 cargo build --release -p pithagoras-sync

@@ -8,9 +8,10 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{FolderGrant, ProtectedOptions};
-use crate::paths::within;
+use crate::paths::{resolve, within};
 
 /// Relative to the home directory.
+#[cfg(not(windows))]
 const HOME: &[&str] = &[
     // keys and credentials
     ".ssh",
@@ -73,7 +74,47 @@ const HOME: &[&str] = &[
 /// it is harmless and tools need it (git's identity), so only writes prompt.
 const HOME_WRITE_ONLY: &[&str] = &[".gitconfig", ".config/git"];
 
+/// Relative to the user profile on Windows.
+#[cfg(windows)]
+const HOME: &[&str] = &[
+    // keys and credentials
+    ".ssh",
+    ".gnupg",
+    "AppData/Roaming/gnupg",
+    "AppData/Roaming/Microsoft/Credentials",
+    "AppData/Local/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Protect",
+    "AppData/Roaming/Microsoft/Vault",
+    "AppData/Local/Microsoft/Vault",
+    "AppData/Roaming/Microsoft/Crypto",
+    "AppData/Roaming/Microsoft/SystemCertificates",
+    "AppData/Roaming/Bitwarden",
+    "AppData/Roaming/KeePass",
+    "AppData/Roaming/KeePassXC",
+    "AppData/Local/1Password",
+    "AppData/Roaming/GitHub CLI",
+    ".git-credentials",
+    "_netrc",
+    ".aws",
+    ".kube",
+    ".docker",
+    // browser and mail profiles
+    "AppData/Local/Google/Chrome/User Data",
+    "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Local/BraveSoftware",
+    "AppData/Local/Vivaldi",
+    "AppData/Roaming/Mozilla",
+    "AppData/Roaming/Opera Software",
+    "AppData/Roaming/Thunderbird",
+    // start-up, shell profiles and history
+    "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
+    "AppData/Roaming/Microsoft/Windows/PowerShell",
+    "Documents/WindowsPowerShell",
+    "Documents/PowerShell",
+];
+
 /// System paths, for a client that runs as root (or reads what others may write).
+#[cfg(not(windows))]
 const SYSTEM: &[&str] = &[
     "/etc/shadow",
     "/etc/gshadow",
@@ -99,6 +140,14 @@ const SYSTEM: &[&str] = &[
     "/etc/xdg/autostart",
 ];
 
+/// System paths on Windows: machine-wide start-up and scheduled tasks.
+#[cfg(windows)]
+const SYSTEM: &[&str] = &[
+    "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp",
+    "C:/Windows/System32/Tasks",
+    "C:/Windows/System32/config",
+];
+
 /// Inside any folder: whose content the user's tools run. Writes there prompt.
 const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
 
@@ -117,21 +166,19 @@ fn expand(home: &Path, s: &str) -> Option<PathBuf> {
         Some(home.join(rest))
     } else if s == "~" {
         Some(home.to_path_buf())
-    } else if s.starts_with('/') {
+    } else if Path::new(s).is_absolute() {
         Some(PathBuf::from(s))
     } else {
         None
     }
 }
 
-/// Folds a list, adds the real location of entries behind a symlink (resolved paths
-/// are what gets checked) and drops what the owner released.
+/// Folds a list, adds each entry's resolved form (resolved paths are what gets
+/// checked, also when the home is a symlink and the entry does not exist yet) and
+/// drops what the owner released.
 fn finish(list: impl Iterator<Item = PathBuf>, allow: &[PathBuf]) -> Vec<PathBuf> {
     let mut all: Vec<PathBuf> = list.collect();
-    let real: Vec<PathBuf> = all
-        .iter()
-        .filter_map(|e| std::fs::canonicalize(e).ok())
-        .collect();
+    let real: Vec<PathBuf> = all.iter().filter_map(|e| resolve(e).ok()).collect();
     all.extend(real);
     let mut all: Vec<PathBuf> = all.iter().map(|e| fold(e)).collect();
     all.retain(|e| !allow.contains(e));
@@ -213,7 +260,7 @@ pub fn tool_config(path: &Path) -> Option<&'static str> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use sync_proto::methods::Access;
@@ -321,6 +368,20 @@ mod tests {
         );
         assert_eq!(tool_config(Path::new("/w/p/src/git.rs")), None);
         assert_eq!(tool_config(Path::new("/w/p/.github/x.yml")), None);
+    }
+
+    #[test]
+    fn a_missing_entry_under_a_symlinked_home_is_protected() {
+        let t = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(t.path()).unwrap();
+        std::fs::create_dir(real.join("realhome")).unwrap();
+        std::os::unix::fs::symlink(real.join("realhome"), real.join("home")).unwrap();
+        let p = Protected::new(&real.join("home"), &[], &ProtectedOptions::default());
+        // ~/.ssh does not exist yet; the path a write resolves to is the real one.
+        assert!(
+            p.check(&real.join("realhome/.ssh/authorized_keys"), true, &[])
+                .is_some()
+        );
     }
 
     #[test]
