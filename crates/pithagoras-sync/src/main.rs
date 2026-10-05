@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -29,6 +30,8 @@ fn main() -> ExitCode {
         .with_writer(pithagoras_sync::secrets::LogWriter)
         .with_max_level(level)
         .with_target(false)
+        // Colours only for a terminal: a log file or the journal gets plain text.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

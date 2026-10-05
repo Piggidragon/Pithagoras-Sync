@@ -326,6 +326,10 @@ async fn pair_run_exec_panic_unlock() {
 
     drop(dl);
     stop(daemon).await;
+    // The client's log, written to a file, is plain text: no terminal colours.
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    assert!(log.contains("started: profile"), "{log}");
+    assert!(!log.contains('\x1b'), "{log}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
