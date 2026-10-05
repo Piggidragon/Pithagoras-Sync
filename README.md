@@ -54,7 +54,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 ## Linux server
 
-Run the client as an unprivileged user, ideally a dedicated one. Root works too (Proxmox containers run as root by default) once you allow it with `pithagoras-sync config set policy.privilege.allow_root true`: the agent then acts with root's rights wherever the policy lets it.
+Run the client as an unprivileged user, ideally a dedicated one. The client refuses to run as root unless you allow it (`policy.privilege.allow_root`, off by default); Proxmox containers run as root by default, so there `pithagoras-sync config set policy.privilege.allow_root true` lets it start, and the agent then acts with root's rights wherever the policy lets it.
 
 ```sh
 sudo ./pithagoras-sync-x86_64 setup --create-user   # shows what it creates and asks first

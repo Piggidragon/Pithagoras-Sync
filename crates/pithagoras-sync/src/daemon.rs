@@ -251,15 +251,16 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     Ok(daemon.restarting.load(std::sync::atomic::Ordering::SeqCst))
 }
 
+/// Whether this process runs as root.
 #[cfg(unix)]
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     // SAFETY: geteuid cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
 
 /// Whether this process runs with an elevated administrator token.
 #[cfg(windows)]
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,

@@ -220,15 +220,34 @@ fn now_ms() -> i64 {
 /// The client's exit code when it stops to be restarted (EX_TEMPFAIL).
 pub const RESTART_EXIT: u8 = 75;
 
+/// Root on Linux, an elevated administrator on Windows: what the client refuses to
+/// run as until `policy.privilege.allow_root` is on.
 pub fn is_root() -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: geteuid cannot fail.
-        unsafe { libc::geteuid() == 0 }
-    }
-    #[cfg(windows)]
-    {
-        false
+    crate::daemon::is_root()
+}
+
+/// What `pair` says when it runs as root or elevated. The client itself refuses to
+/// run that way unless the owner allowed it, so the warning says so instead of
+/// leaving the owner with a client that does not start.
+pub fn root_warning(windows: bool, allow_root: bool) -> String {
+    let who = if windows {
+        "an elevated administrator"
+    } else {
+        "root"
+    };
+    let safer = if windows {
+        "the logon task from `pithagoras-sync install` runs it without elevation"
+    } else {
+        "a dedicated user is safer (see `pithagoras-sync setup --create-user`)"
+    };
+    if allow_root {
+        format!(
+            "warning: pairing as {who}. The portal's agent will act with these rights wherever the policy allows; {safer}."
+        )
+    } else {
+        format!(
+            "warning: pairing as {who}. The client refuses to run as {who} until you allow it with `pithagoras-sync config set policy.privilege.allow_root true` (off by default); {safer}."
+        )
     }
 }
 
@@ -520,7 +539,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             if is_root() {
                 eprintln!(
-                    "warning: pairing as root. The portal's agent will act with root's rights wherever the policy allows; a dedicated user is safer (see `pithagoras-sync setup --create-user`)."
+                    "{}",
+                    root_warning(cfg!(windows), cfg.policy.privilege.allow_root)
                 );
             }
             let paired = pair::pair(&uri, &name).await?;
@@ -937,3 +957,22 @@ fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
 }
 
 use crate::actions::Runner as _;
+
+#[cfg(test)]
+mod tests {
+    use super::root_warning;
+
+    #[test]
+    fn pairing_as_root_says_the_client_will_refuse_until_allowed() {
+        for windows in [false, true] {
+            let w = root_warning(windows, false);
+            assert!(w.contains("refuses to run"), "{w}");
+            assert!(w.contains("policy.privilege.allow_root true"), "{w}");
+            assert!(w.contains("off by default"), "{w}");
+            let w = root_warning(windows, true);
+            assert!(!w.contains("refuses"), "{w}");
+        }
+        assert!(root_warning(true, false).contains("elevated administrator"));
+        assert!(root_warning(false, false).contains("setup --create-user"));
+    }
+}
