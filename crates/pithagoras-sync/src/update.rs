@@ -20,8 +20,19 @@ use serde::Deserialize;
 /// A build without it cannot update itself.
 pub const PUBLIC_KEY: Option<&str> = option_env!("PITHAGORAS_SYNC_UPDATE_KEY");
 
-/// Where releases publish their manifest, set when a release is built.
-pub const DEFAULT_MANIFEST: Option<&str> = option_env!("PITHAGORAS_SYNC_UPDATE_URL");
+/// The stable release channel: the manifest of the newest GitHub release that is
+/// not a pre-release (`.github/workflows/release.yml` publishes it).
+pub const STABLE_MANIFEST: &str = concat!(
+    env!("CARGO_PKG_REPOSITORY"),
+    "/releases/latest/download/manifest.json"
+);
+
+/// Where `update` looks without `--manifest`: the stable channel, unless a build
+/// names another (`PITHAGORAS_SYNC_UPDATE_URL`).
+pub const DEFAULT_MANIFEST: &str = match option_env!("PITHAGORAS_SYNC_UPDATE_URL") {
+    Some(url) => url,
+    None => STABLE_MANIFEST,
+};
 
 /// The largest binary taken.
 const MAX_BINARY: u64 = 256 << 20;
@@ -266,6 +277,17 @@ pub fn old_path(exe: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updates_come_from_the_stable_release_channel() {
+        assert_eq!(
+            STABLE_MANIFEST,
+            "https://github.com/Piggidragon/Pithagoras-Sync/releases/latest/download/manifest.json"
+        );
+        if option_env!("PITHAGORAS_SYNC_UPDATE_URL").is_none() {
+            assert_eq!(DEFAULT_MANIFEST, STABLE_MANIFEST);
+        }
+    }
 
     #[test]
     fn versions_are_three_numbers() {

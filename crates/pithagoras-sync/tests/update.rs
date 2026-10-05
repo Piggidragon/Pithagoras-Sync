@@ -303,3 +303,46 @@ async fn this_build_updates_only_with_a_release_key_and_restarts_on_request() {
         Some(i32::from(pithagoras_sync::cli::RESTART_EXIT))
     );
 }
+
+/// A release made the way `.github/workflows/release.yml` makes it, with
+/// `sync-release manifest` and `sync-release sign`: the client takes it.
+#[tokio::test]
+async fn a_release_made_by_the_release_tool_updates_the_client() {
+    let r = Release::new();
+    let rel = r.dir.join("dist");
+    std::fs::create_dir_all(&rel).unwrap();
+    let binary = rel.join(format!("pithagoras-sync-{}", update::target()));
+    std::fs::write(&binary, program("0.3.0")).unwrap();
+    let other = rel.join("pithagoras-sync-x86_64-windows.exe");
+    std::fs::write(&other, b"not this one").unwrap();
+    let target = update::target();
+    let text = sync_release::manifest(
+        "0.3.0",
+        None,
+        &[
+            sync_release::Binary {
+                path: &binary,
+                target: &target,
+            },
+            sync_release::Binary {
+                path: &other,
+                target: "x86_64-windows",
+            },
+        ],
+    )
+    .unwrap();
+    let manifest = rel.join("manifest.json");
+    std::fs::write(&manifest, &text).unwrap();
+    std::fs::write(
+        rel.join("manifest.json.minisig"),
+        r.key.sign(text.as_bytes(), "file:manifest.json"),
+    )
+    .unwrap();
+    let exe = r.installed();
+    let plan = update::check(&manifest.to_string_lossy(), &r.pk(), "0.1.0")
+        .await
+        .unwrap()
+        .expect("0.3.0 is newer");
+    update::install(&plan, &exe).await.unwrap();
+    assert_eq!(std::fs::read(&exe).unwrap(), program("0.3.0"));
+}

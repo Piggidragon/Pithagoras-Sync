@@ -901,6 +901,7 @@ dependencies = [
  "sync-ops",
  "sync-policy",
  "sync-proto",
+ "sync-release",
  "sync-testkit",
  "tempfile",
  "tokio",
@@ -1360,6 +1361,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-release"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "minisign-verify",
+ "ring",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "sync-testkit"
 version = "0.1.0"
 dependencies = [
@@ -1372,6 +1384,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sync-proto",
+ "sync-release",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

@@ -4,6 +4,7 @@ description = "Pithagoras Sync: lets a Pithagoras portal's agent reach this comp
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 publish = false
 
@@ -34,4 +35,5 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 sync-testkit.workspace = true
+sync-release.workspace = true
 tempfile.workspace = true

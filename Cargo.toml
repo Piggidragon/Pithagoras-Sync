@@ -6,6 +6,7 @@ members = [
     "crates/ops",
     "crates/connector",
     "crates/testkit",
+    "crates/release",
     "crates/pithagoras-sync",
 ]
 
@@ -22,6 +23,7 @@ sync-policy = { path = "crates/policy" }
 sync-ops = { path = "crates/ops" }
 sync-connector = { path = "crates/connector" }
 sync-testkit = { path = "crates/testkit" }
+sync-release = { path = "crates/release" }
 
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

@@ -15,7 +15,7 @@ They use temp dirs, fake roots, fake `sudo` scripts and the mock portal in `crat
 Two programs in `crates/testkit` (built with `cargo build -p sync-testkit --bins`):
 
 - `sync-mock-portal [port]`: the mock portal on loopback. It prints `portal http://127.0.0.1:<port>`, then reads one command per line from stdin (`code <CODE>`, `wait`, `exec <cwd> <command>`, `approve once|deny|none`, `call <method> <json>`, `read <path>`, `close`, `closed`, `sleep`, `grep <text>`, `dump <file>`, `quit`; the source lists them). To drive it from another shell, feed it a file: `tail -f mock.cmds | sync-mock-portal 18080`, then `echo 'code ABC123' >> mock.cmds`.
-- `sync-test-sign keygen <keyfile>` writes a throwaway minisign key and prints its public key; `sync-test-sign sign <keyfile> <file>` writes `<file>.minisig` in minisign's format.
+- `sync-test-sign keygen <keyfile>` writes a throwaway key (the same format as `sync-release`, docs/releasing.md) and prints its public key; `sync-test-sign sign <keyfile> <file>` writes `<file>.minisig` in minisign's format.
 
 A build that can update itself needs a release key compiled in:
 
@@ -24,10 +24,10 @@ pub=$(sync-test-sign keygen test.key)
 PITHAGORAS_SYNC_UPDATE_KEY="$pub" cargo build --release -p pithagoras-sync
 ```
 
-`PITHAGORAS_SYNC_UPDATE_URL` sets the default manifest URL the same way; without it, `update --manifest <url or file>` names it. A release folder holds `manifest.json`:
+`PITHAGORAS_SYNC_UPDATE_URL` sets the default manifest URL the same way (without it, the default is the stable release channel on GitHub); `update --manifest <url or file>` names another. A release folder holds `manifest.json`, which `sync-release manifest --version 0.1.1 --out manifest.json pithagoras-sync-x86_64-linux=x86_64-linux` writes (docs/releasing.md):
 
 ```json
-{"version": "0.1.1", "artifacts": {"x86_64-linux": {"url": "pithagoras-sync-x86_64", "size": 11206656, "sha256": "<hex>"}}}
+{"version": "0.1.1", "artifacts": {"x86_64-linux": {"url": "pithagoras-sync-x86_64-linux", "size": 11206656, "sha256": "<hex>"}}}
 ```
 
 next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute.

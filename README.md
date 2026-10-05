@@ -6,7 +6,7 @@ Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) po
 
 ## Platforms
 
-- **Linux** (x86_64): one static binary, for desktops and servers, started as a systemd user or system unit.
+- **Linux** (x86_64; aarch64 from the release workflow, not tried on a machine yet): one static binary, for desktops and servers, started as a systemd user or system unit.
 - **Windows** (x86_64): the same remote access, started by a logon task. Tested on one Windows machine; see [docs/windows.md](docs/windows.md) for what differs and what was not tested.
 
 ## What the portal may do
@@ -23,23 +23,23 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 ## Linux laptop or desktop
 
-1. Download the binary and make it executable. There is no release yet; until there is, build it as described below and use `target/x86_64-unknown-linux-musl/release/pithagoras-sync`.
+1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); before the first one, build it as described below and use `target/x86_64-unknown-linux-musl/release/pithagoras-sync`.
 
    ```sh
-   curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/latest/download/pithagoras-sync-x86_64
-   chmod +x pithagoras-sync-x86_64
+   curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/latest/download/pithagoras-sync-x86_64-linux
+   chmod +x pithagoras-sync-x86_64-linux
    ```
 
 2. In the portal, open Settings, Devices, "Pair a device", and copy the pairing URI. Then pair. Quote the URI, since it contains `&`. On a desktop, this and every later policy change asks for your password in the terminal.
 
    ```sh
-   ./pithagoras-sync-x86_64 pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
+   ./pithagoras-sync-x86_64-linux pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
    ```
 
 3. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit.
 
    ```sh
-   ./pithagoras-sync-x86_64 install
+   ./pithagoras-sync-x86_64-linux install
    ```
 
 4. Check that it runs. To use Folders mode, grant folders first:
@@ -57,7 +57,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
 Run the client as an unprivileged user, ideally a dedicated one. The client refuses to run as root unless you allow it (`policy.privilege.allow_root`, off by default); Proxmox containers run as root by default, so there `pithagoras-sync config set policy.privilege.allow_root true` lets it start, and the agent then acts with root's rights wherever the policy lets it.
 
 ```sh
-sudo ./pithagoras-sync-x86_64 setup --create-user   # shows what it creates and asks first
+sudo ./pithagoras-sync-x86_64-linux setup --create-user   # shows what it creates and asks first
 sudo setfacl -R -m u:pithagoras-sync:rwX /srv/project
 sudo -H -u pithagoras-sync pithagoras-sync folder add /srv/project --rw --exec
 sudo -H -u pithagoras-sync pithagoras-sync mode folders
@@ -69,7 +69,7 @@ sudo systemctl start pithagoras-sync
 
 ## Windows
 
-Download `pithagoras-sync.exe`, then in PowerShell:
+Download `pithagoras-sync-x86_64-windows.exe` from the [latest release](https://github.com/Piggidragon/Pithagoras-Sync/releases/latest), save it as `pithagoras-sync.exe`, then in PowerShell:
 
 ```powershell
 .\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
@@ -96,7 +96,7 @@ pithagoras-sync update --check
 pithagoras-sync update
 ```
 
-`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. Your config and policy stay as they are. Until there are releases, builds have no release key and say so.
+`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. Your config and policy stay as they are. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 
@@ -135,6 +135,7 @@ The tests use temporary folders and a mock portal. They never touch your real co
 - [docs/protocol.md](docs/protocol.md): the wire protocol between portal and device, and the decisions still open.
 - [docs/testing.md](docs/testing.md): the tests, the tools for trying a client by hand, and the record of the test machine.
 - [docs/windows.md](docs/windows.md): how the Windows client differs, what was tested and what was not.
+- [docs/releasing.md](docs/releasing.md): the release workflow, the release key and its one-time setup.
 
 ## Licence
 

@@ -820,8 +820,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 .ok_or("this build has no update key; updates come with release builds")?;
             let source = manifest
                 .as_deref()
-                .or(crate::update::DEFAULT_MANIFEST)
-                .ok_or("this build names no release manifest; pass --manifest")?;
+                .unwrap_or(crate::update::DEFAULT_MANIFEST);
             let current = env!("CARGO_PKG_VERSION");
             let Some(plan) = crate::update::check(source, key, current).await? else {
                 println!("Up to date ({current}).");
