@@ -122,6 +122,14 @@ fn resolve(manifest: &str, url: &str) -> String {
     if is_url(url) || Path::new(url).is_absolute() {
         return url.to_string();
     }
+    // A local manifest: its folder as the platform reads paths, so `C:\rel\` too.
+    if !is_url(manifest) {
+        let path = manifest.strip_prefix("file://").unwrap_or(manifest);
+        return match Path::new(path).parent() {
+            Some(dir) => dir.join(url).to_string_lossy().into_owned(),
+            None => url.to_string(),
+        };
+    }
     match manifest.rfind('/') {
         Some(i) => format!("{}/{url}", &manifest[..i]),
         None => url.to_string(),
@@ -276,6 +284,16 @@ mod tests {
             "https://h/r/1/pithagoras-sync-x86_64"
         );
         assert_eq!(resolve("https://h/m.json", "https://o/x"), "https://o/x");
-        assert_eq!(resolve("/srv/rel/manifest.json", "bin"), "/srv/rel/bin");
+        assert_eq!(resolve("manifest.json", "bin"), "bin");
+        #[cfg(unix)]
+        {
+            assert_eq!(resolve("/srv/rel/manifest.json", "bin"), "/srv/rel/bin");
+            assert_eq!(
+                resolve("file:///srv/rel/manifest.json", "bin"),
+                "/srv/rel/bin"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(resolve(r"C:\rel\manifest.json", "bin"), r"C:\rel\bin");
     }
 }
