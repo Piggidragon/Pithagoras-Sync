@@ -140,13 +140,99 @@ const SYSTEM: &[&str] = &[
     "/etc/xdg/autostart",
 ];
 
-/// System paths on Windows: machine-wide start-up and scheduled tasks.
+/// System paths on Windows come from the known folders (`KnownFolders`), since
+/// Windows need not live in `C:\Windows`.
 #[cfg(windows)]
-const SYSTEM: &[&str] = &[
-    "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp",
-    "C:/Windows/System32/Tasks",
-    "C:/Windows/System32/config",
-];
+const SYSTEM: &[&str] = &[];
+
+/// Windows folders that need not be where the profile's defaults put them: a
+/// Documents folder moved to OneDrive or redirected by policy (the PowerShell
+/// profiles live in it), a redirected Startup folder, Windows on another drive.
+/// Windows says where they are; `Protected` protects what is in them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownFolders {
+    pub documents: Option<PathBuf>,
+    pub startup: Option<PathBuf>,
+    pub common_startup: Option<PathBuf>,
+    /// `System32`.
+    pub system: Option<PathBuf>,
+}
+
+impl KnownFolders {
+    /// The protected entries in these folders: the PowerShell profiles in
+    /// Documents, both Startup folders, and the scheduled tasks and registry hives
+    /// in System32.
+    pub fn entries(&self) -> Vec<PathBuf> {
+        let mut v = Vec::new();
+        if let Some(d) = &self.documents {
+            v.push(d.join("WindowsPowerShell"));
+            v.push(d.join("PowerShell"));
+        }
+        v.extend(self.startup.iter().cloned());
+        v.extend(self.common_startup.iter().cloned());
+        if let Some(s) = &self.system {
+            v.push(s.join("Tasks"));
+            v.push(s.join("config"));
+        }
+        v
+    }
+
+    /// Where Windows says they are (`SHGetKnownFolderPath`). Without an answer,
+    /// the machine-wide ones fall back to `%SystemRoot%` and `%ProgramData%`, and
+    /// only without those to `C:\Windows` and `C:\ProgramData`: a missing entry
+    /// would leave a path unprotected.
+    #[cfg(windows)]
+    pub fn current() -> KnownFolders {
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_CommonStartup, FOLDERID_Documents, FOLDERID_Startup, FOLDERID_System,
+        };
+        let env = |var: &str, fallback: &str, rest: &str| {
+            let base = std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| PathBuf::from(fallback));
+            Some(base.join(rest))
+        };
+        KnownFolders {
+            documents: known_folder(&FOLDERID_Documents),
+            startup: known_folder(&FOLDERID_Startup),
+            common_startup: known_folder(&FOLDERID_CommonStartup).or_else(|| {
+                env(
+                    "ProgramData",
+                    "C:\\ProgramData",
+                    "Microsoft\\Windows\\Start Menu\\Programs\\StartUp",
+                )
+            }),
+            system: known_folder(&FOLDERID_System)
+                .or_else(|| env("SystemRoot", "C:\\Windows", "System32")),
+        }
+    }
+}
+
+/// One known folder's path, `None` when Windows has none for this user.
+#[cfg(windows)]
+fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    let mut out: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a GUID in, a string out that the shell allocated and we free below,
+    // also when the call failed (it then sets it to null or a valid allocation).
+    let hr =
+        unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut out) };
+    let path = if hr >= 0 && !out.is_null() {
+        // SAFETY: a NUL-terminated wide string from the shell.
+        let len = (0..).take_while(|&i| unsafe { *out.add(i) } != 0).count();
+        // SAFETY: `len` units before the NUL are readable.
+        let wide = unsafe { std::slice::from_raw_parts(out, len) };
+        Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
+    } else {
+        None
+    };
+    // SAFETY: allocated by SHGetKnownFolderPath (null is allowed).
+    unsafe { CoTaskMemFree(out as *const _) };
+    path.filter(|p| p.is_absolute())
+}
 
 /// Inside any folder: whose content the user's tools run. Writes there prompt.
 pub(crate) const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
@@ -190,8 +276,23 @@ fn finish(list: impl Iterator<Item = PathBuf>, allow: &[PathBuf]) -> Vec<PathBuf
 }
 
 impl Protected {
-    /// `own` are the client's own config and state directories.
+    /// `own` are the client's own config and state directories. On Windows the
+    /// known folders are asked where they are.
     pub fn new(home: &Path, own: &[PathBuf], opts: &ProtectedOptions) -> Protected {
+        #[cfg(windows)]
+        let known = KnownFolders::current();
+        #[cfg(not(windows))]
+        let known = KnownFolders::default();
+        Protected::with_known(home, own, opts, &known)
+    }
+
+    /// `new`, with the known folders given (tests).
+    pub fn with_known(
+        home: &Path,
+        own: &[PathBuf],
+        opts: &ProtectedOptions,
+        known: &KnownFolders,
+    ) -> Protected {
         let allow: Vec<PathBuf> = opts
             .allow
             .iter()
@@ -202,6 +303,7 @@ impl Protected {
             .iter()
             .map(|r| home.join(r))
             .chain(SYSTEM.iter().map(PathBuf::from))
+            .chain(known.entries())
             .chain(own.iter().cloned())
             .chain(opts.extra.iter().filter_map(|s| expand(home, s)));
         let write_only = HOME_WRITE_ONLY.iter().map(|r| home.join(r));
@@ -401,6 +503,40 @@ mod tests {
         );
     }
 
+    /// Windows says where Documents and System32 are; a profile in a Documents
+    /// folder moved elsewhere (OneDrive) and Windows on another drive are protected
+    /// there. Unix paths stand in for Windows ones: the rule is the same.
+    #[test]
+    fn protects_profiles_and_system_paths_where_windows_has_them() {
+        let known = KnownFolders {
+            documents: Some("/d/OneDrive/Documents".into()),
+            startup: Some("/d/Redirected/Startup".into()),
+            common_startup: None,
+            system: Some("/e/Win/System32".into()),
+        };
+        let p = Protected::with_known(
+            Path::new("/home/u"),
+            &[],
+            &ProtectedOptions::default(),
+            &known,
+        );
+        for path in [
+            "/d/OneDrive/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
+            "/d/OneDrive/Documents/PowerShell/profile.ps1",
+            "/d/Redirected/Startup/run.lnk",
+            "/e/Win/System32/Tasks/x",
+            "/e/Win/System32/config/SAM",
+        ] {
+            assert!(p.check(Path::new(path), true, &[]).is_some(), "{path}");
+        }
+        for path in [
+            "/d/OneDrive/Documents/notes.txt",
+            "/e/Win/System32/drivers/etc/hosts",
+        ] {
+            assert!(p.check(Path::new(path), true, &[]).is_none(), "{path}");
+        }
+    }
+
     #[test]
     fn lists_entries_inside_a_folder() {
         let p = prot();
@@ -412,5 +548,29 @@ mod tests {
             p.inside(Path::new("/home/u"), true)
                 .contains(&Path::new("/home/u/.gitconfig"))
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The real known folders: Windows answers for each, and what is in them is
+    /// protected wherever they are.
+    #[test]
+    fn asks_windows_where_its_folders_are() {
+        let k = KnownFolders::current();
+        let docs = k.documents.clone().expect("a Documents folder");
+        let system = k.system.clone().expect("System32");
+        assert!(docs.is_absolute() && system.is_absolute(), "{k:?}");
+        let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        assert!(crate::paths::within(&system, &root), "{k:?}");
+        let p = Protected::new(Path::new(r"C:\nobody"), &[], &ProtectedOptions::default());
+        for e in [
+            docs.join(r"WindowsPowerShell\profile.ps1"),
+            system.join(r"Tasks\x"),
+        ] {
+            assert!(p.check(&e, true, &[]).is_some(), "{}", e.display());
+        }
     }
 }
