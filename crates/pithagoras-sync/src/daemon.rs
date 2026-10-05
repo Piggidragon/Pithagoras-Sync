@@ -205,7 +205,12 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     );
     if is_root() {
         warn!(
-            "running as root (privilege.allow_root): the portal's agent acts with its rights where the policy allows"
+            "running as {} (privilege.allow_root): the portal's agent acts with its rights where the policy allows",
+            if cfg!(windows) {
+                "an elevated administrator"
+            } else {
+                "root"
+            }
         );
     }
 

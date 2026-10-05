@@ -235,6 +235,13 @@ async fn windows_pair_run_exec_panic_unlock() {
     assert_eq!(e.code, sync_proto::code::BAD_PATH);
     drop(dl);
     stop(daemon).await;
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    assert!(!log.contains('\x1b'), "{log}");
+    assert_eq!(
+        log.contains("running as an elevated administrator"),
+        elevated(),
+        "{log}"
+    );
 
     // The owner lets the shell run unconfined.
     let cfg = std::fs::read_to_string(env.config()).unwrap();
