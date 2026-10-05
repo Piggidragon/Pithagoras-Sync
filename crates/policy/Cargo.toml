@@ -16,3 +16,9 @@ regex.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 libc.workspace = true
+zbus.workspace = true
+futures-util.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
