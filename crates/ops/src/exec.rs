@@ -493,25 +493,25 @@ fn default_shell() -> PathBuf {
     PathBuf::from("powershell.exe")
 }
 
-/// The arguments that make `shell` run `command`. PowerShell gets it base64-encoded
-/// (`-EncodedCommand`), which avoids every quoting problem.
+/// The arguments that make `shell` run `command`. PowerShell takes it as one
+/// argument after `-Command` (Rust quotes it for the Windows command line, and the
+/// .NET runtime parses it back the same way). Not `-EncodedCommand`: with it,
+/// Windows PowerShell writes errors and progress to a redirected stderr as CLIXML,
+/// which the model cannot read.
 pub fn shell_args(shell: &Path, command: &str) -> Vec<String> {
     let name = shell
         .file_stem()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     if name == "pwsh" || name == "powershell" {
-        use base64::Engine;
-        let utf16: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
         vec![
             "-NoLogo".into(),
             "-NoProfile".into(),
             "-NonInteractive".into(),
             "-ExecutionPolicy".into(),
             "Bypass".into(),
-            "-EncodedCommand".into(),
-            encoded,
+            "-Command".into(),
+            command.into(),
         ]
     } else {
         vec!["-c".into(), command.into()]
@@ -686,6 +686,7 @@ fn spawn(
 ) -> Result<Spawned, RpcError> {
     use std::io::Read;
     use tokio::io::AsyncWriteExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let io = |e: std::io::Error| RpcError::new(code::IO, format!("cannot start the command: {e}"));
     let job = win::Job::new().map_err(io)?;
     let (mut out_r, out_w) = std::io::pipe().map_err(io)?;
@@ -702,6 +703,10 @@ fn spawn(
         .stderr(std::process::Stdio::from(
             std::os::windows::io::OwnedHandle::from(out_w2),
         ))
+        // A console of its own without a window: the logon task's client has no
+        // console, and each command would otherwise open a window on the desktop.
+        // The shim sets this console to UTF-8 for the shell.
+        .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(false);
     let mut child = cmd.spawn().map_err(io)?;
     drop(cmd);
@@ -812,5 +817,21 @@ mod win {
             // SAFETY: closing our own handle; kill-on-close ends what is left.
             unsafe { CloseHandle(self.0) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powershell_takes_the_command_as_one_plain_argument() {
+        let cmd = "Write-Output 'a\"b' \"c\\\"; exit 3";
+        for shell in ["powershell.exe", "/usr/bin/pwsh"] {
+            let args = shell_args(Path::new(shell), cmd);
+            assert_eq!(args[args.len() - 2..], ["-Command", cmd], "{shell}");
+            assert!(!args.iter().any(|a| a == "-EncodedCommand"));
+        }
+        assert_eq!(shell_args(Path::new("/bin/bash"), cmd), ["-c", cmd]);
     }
 }

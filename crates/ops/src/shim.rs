@@ -436,6 +436,14 @@ mod imp {
         if std::io::stdin().read_exact(&mut go).is_err() {
             return 125;
         }
+        // The shim's own console (the client starts it without a window) in UTF-8,
+        // which the shell inherits: PowerShell and console programs then write UTF-8
+        // instead of the OEM code page (850 on a German Windows).
+        // SAFETY: plain calls without pointers; failing leaves the code page as it was.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+            windows_sys::Win32::System::Console::SetConsoleCP(65001);
+        }
         let child = Command::new(&spec.program)
             .args(&spec.args)
             .current_dir(&spec.cwd)

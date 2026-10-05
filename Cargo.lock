@@ -1314,7 +1314,6 @@ dependencies = [
 name = "sync-ops"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "globset",
  "grep-matcher",
  "grep-regex",

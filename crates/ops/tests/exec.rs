@@ -49,6 +49,7 @@ fn all() -> Vec<(&'static str, Test)> {
 fn all() -> Vec<(&'static str, Test)> {
     tests![
         windows_output_and_exit_code,
+        windows_output_is_plain_utf8_text,
         windows_no_portal_environment,
         windows_panic_kills_the_job,
     ]
@@ -520,6 +521,29 @@ async fn windows_output_and_exit_code() {
     let (out, o) = run(&e, 1, "Write-Output hello; exit 3", &permit(&f.dir), None).await;
     assert!(out.contains("hello"), "{out}");
     assert_eq!(o.code, Some(3));
+}
+
+/// Errors as text (not CLIXML), quotes and backslashes as written, UTF-8 from
+/// PowerShell and from console programs, and no console window of its own.
+#[cfg(windows)]
+async fn windows_output_is_plain_utf8_text() {
+    let f = fx();
+    let e = Execs::new(config(&f, own_env()));
+    let cmd = r#"Write-Output ('caf' + [char]0xE9 + ' ' + [char]0x20AC)
+Write-Output 'a"b' "c\d\" 'e\\f'
+Write-Error boom
+cmd /c echo native-%OS%
+Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'
+Write-Output "window=$([N.W]::GetConsoleWindow())"
+exit 4"#;
+    let (out, o) = run(&e, 1, cmd, &permit(&f.dir), None).await;
+    let out = out.replace("\r\n", "\n");
+    assert!(out.contains("caf\u{e9} \u{20ac}"), "{out}");
+    assert!(out.contains("a\"b\nc\\d\\\ne\\\\f"), "{out}");
+    assert!(out.contains("boom") && !out.contains("CLIXML"), "{out}");
+    assert!(out.contains("native-Windows_NT"), "{out}");
+    assert!(out.contains("window=0"), "{out}");
+    assert_eq!(o.code, Some(4));
 }
 
 #[cfg(windows)]
