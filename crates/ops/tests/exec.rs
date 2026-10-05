@@ -41,6 +41,7 @@ fn all() -> Vec<(&'static str, Test)> {
         landlock_keeps_the_shell_in_its_folders,
         commands_get_their_own_cgroup,
         the_shim_dies_with_the_client,
+        the_shim_takes_the_secret_only_untraced,
     ]
 }
 
@@ -121,6 +122,7 @@ fn permit(cwd: &Path) -> Permit {
         path: cwd.to_path_buf(),
         root: None,
         confine: Confine::None,
+        elevate: None,
     }
 }
 
@@ -340,6 +342,7 @@ async fn landlock_keeps_the_shell_in_its_folders() {
         path: home.join("proj"),
         root: Some(home.clone()),
         confine: Confine::Landlock(rules),
+        elevate: None,
     };
     let e = Execs::new(config(&f, own_env()));
     let me = std::process::id();
@@ -407,6 +410,7 @@ async fn the_shim_dies_with_the_client() {
         parent: 1,
         cgroup: None,
         landlock: None,
+        secret_fd: false,
     };
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .arg(SHIM_ARG)
@@ -415,6 +419,98 @@ async fn the_shim_dies_with_the_client() {
         .unwrap();
     assert_eq!(out.status.code(), Some(125));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
+}
+
+/// Runs the shim with `secret_fd`, the client's end of fd 4 answering as the client
+/// does; with `trace`, the test traces the shim (PTRACE_TRACEME). Returns the
+/// exit code, stdout and whether the shim said it was ready for the secret.
+#[cfg(target_os = "linux")]
+fn shim_with_secret(dir: &Path, trace: bool) -> (i32, String, bool) {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let spec = sync_ops::shim::ShimSpec {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf 'got:'; cat".into()],
+        cwd: dir.to_path_buf(),
+        env: vec![],
+        parent: std::process::id(),
+        cgroup: None,
+        landlock: None,
+        secret_fd: true,
+    };
+    let (mut mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let raw = theirs.as_raw_fd();
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.arg(SHIM_ARG)
+        .arg(serde_json::to_string(&spec).unwrap())
+        .stdout(std::process::Stdio::piped());
+    // SAFETY: dup2 and ptrace only, both async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if trace && libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    // Reaped below with waitpid, as its tracer must.
+    #[allow(clippy::zombie_processes)]
+    let mut child = cmd.spawn().unwrap();
+    drop(theirs);
+    let pid = child.id() as i32;
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let answer = std::thread::spawn(move || {
+        let mut r = [0u8; 1];
+        let ready = mine.read_exact(&mut r).is_ok() && r == *b"R";
+        if ready {
+            let _ = mine.write_all(b"pw-for-sudo");
+        }
+        ready
+    });
+    // As the tracer: let the shim go on after every stop, until it exits.
+    let code = loop {
+        let mut status = 0;
+        // SAFETY: waits for our own child.
+        if unsafe { libc::waitpid(pid, &mut status, libc::__WALL) } < 0 {
+            panic!("waitpid: {}", std::io::Error::last_os_error());
+        }
+        if libc::WIFEXITED(status) {
+            break libc::WEXITSTATUS(status);
+        }
+        if libc::WIFSIGNALED(status) {
+            break -libc::WTERMSIG(status);
+        }
+        if libc::WIFSTOPPED(status) {
+            let sig = match libc::WSTOPSIG(status) {
+                libc::SIGTRAP => 0,
+                s => s,
+            };
+            // SAFETY: the shim is our tracee.
+            unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, sig) };
+        }
+    };
+    let ready = answer.join().unwrap();
+    (code, reader.join().unwrap(), ready)
+}
+
+#[cfg(target_os = "linux")]
+async fn the_shim_takes_the_secret_only_untraced() {
+    // The secret reaches the command on stdin, in one line, through a fresh pipe.
+    let f = fx();
+    let (code, out, ready) = shim_with_secret(&f.dir, false);
+    assert_eq!((code, out.as_str(), ready), (0, "got:pw-for-sudo\n", true));
+    // A traced shim is never sent the secret, and runs nothing.
+    let (code, out, ready) = shim_with_secret(&f.dir, true);
+    assert_eq!((code, out.as_str(), ready), (126, "", false));
 }
 
 #[cfg(windows)]

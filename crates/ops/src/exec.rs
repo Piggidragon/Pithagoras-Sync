@@ -17,6 +17,7 @@ use sync_proto::{RpcError, code};
 use tokio::sync::{mpsc, watch};
 
 use crate::shim::{LandlockSpec, SHIM_ARG, ShimSpec};
+use sync_policy::secret::{Scrubber, Secret, SecretSlot};
 
 #[derive(Debug, Clone)]
 pub struct ExecConfig {
@@ -132,6 +133,8 @@ pub struct Execs {
     table: Arc<Mutex<Table>>,
     #[cfg(target_os = "linux")]
     cgroups: Option<crate::cgroup::CgroupBase>,
+    /// The elevation secret: injected for `sudo` commands, scrubbed from output.
+    secrets: std::sync::OnceLock<Arc<SecretSlot>>,
 }
 
 impl Execs {
@@ -141,7 +144,16 @@ impl Execs {
             table: Arc::new(Mutex::new(Table::default())),
             #[cfg(target_os = "linux")]
             cgroups: crate::cgroup::CgroupBase::detect(),
+            secrets: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn use_secrets(&self, slot: Arc<SecretSlot>) {
+        let _ = self.secrets.set(slot);
+    }
+
+    fn secret(&self) -> Option<Secret> {
+        self.secrets.get().and_then(|s| s.get())
     }
 
     /// Whether commands get a cgroup of their own here.
@@ -235,9 +247,13 @@ impl Execs {
             }
         };
         let shell = self.shell();
+        let (program, args, secret) = match &permit.elevate {
+            None => (shell.clone(), shell_args(&shell, command), None),
+            Some(sudo) => self.elevated(sudo, &shell, command)?,
+        };
         let spec = ShimSpec {
-            args: shell_args(&shell, command),
-            program: shell,
+            args,
+            program,
             cwd: permit.path.clone(),
             env,
             parent: std::process::id(),
@@ -246,10 +262,11 @@ impl Execs {
             #[cfg(not(target_os = "linux"))]
             cgroup: None,
             landlock,
+            secret_fd: secret.is_some(),
         };
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?;
-        let spawned = spawn(&cfg, &spec_json, &spec)?;
+        let spawned = spawn(&cfg, &spec_json, &spec, secret)?;
         let scope = spawned.scope;
         self.table
             .lock()
@@ -258,8 +275,9 @@ impl Execs {
             .insert(stream, scope.clone());
         let table = self.table.clone();
         let cap = cfg.output_cap;
+        let scrub = self.secret().map(|s| Scrubber::new(&s));
         let outcome = tokio::spawn(async move {
-            let reader = tokio::spawn(forward_output(spawned.output, out, cap));
+            let reader = tokio::spawn(forward_output(spawned.output, out, cap, scrub));
             let mut timed_out = false;
             let status = tokio::select! {
                 s = spawned.status => s.ok().flatten(),
@@ -287,6 +305,50 @@ impl Execs {
             o
         });
         Ok(Started { outcome })
+    }
+
+    /// sudo running the shell as root: `sudo -k -S` with the secret on stdin (the
+    /// shell's first line closes stdin, so with a sudoers rule that asks no
+    /// password the secret is not left for the command to read), or `sudo -n`
+    /// without one. Only with a cgroup of its own: `panic` cannot signal root's
+    /// processes, but it can kill their cgroup.
+    #[allow(unused_variables)]
+    fn elevated(
+        &self,
+        sudo: &Path,
+        shell: &Path,
+        command: &str,
+    ) -> Result<(PathBuf, Vec<String>, Option<Secret>), RpcError> {
+        #[cfg(not(target_os = "linux"))]
+        return Err(RpcError::denied(
+            "elevated commands are only built for Linux in this version",
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            let rest = sync_policy::engine::elevated_command(command)
+                .ok_or_else(|| RpcError::denied("not a sudo command"))?;
+            if self.cgroups.is_none() {
+                return Err(RpcError::denied(
+                    "elevated commands need a cgroup of their own (the systemd unit's Delegate=yes), or panic could not stop them",
+                ));
+            }
+            let secret = self.secret();
+            let sh = shell.to_string_lossy().into_owned();
+            let args: Vec<String> = match &secret {
+                Some(_) => vec![
+                    "-k".into(),
+                    "-S".into(),
+                    "-p".into(),
+                    String::new(),
+                    "--".into(),
+                    sh,
+                    "-c".into(),
+                    format!("exec </dev/null\n{rest}"),
+                ],
+                None => vec!["-n".into(), "--".into(), sh, "-c".into(), rest.to_string()],
+            };
+            Ok((sudo.to_path_buf(), args, secret))
+        }
     }
 
     /// A signal from the portal: SIGINT goes to the shell's process group,
@@ -361,11 +423,35 @@ fn signal_name(n: i32) -> String {
     .to_string()
 }
 
-/// Copies output to the channel in frames' worth, dropping what exceeds the cap.
-async fn forward_output(mut output: OutputReader, out: mpsc::Sender<Vec<u8>>, cap: u64) -> bool {
+/// Copies output to the channel in frames' worth, dropping what exceeds the cap
+/// and taking the elevation secret out.
+async fn forward_output(
+    mut output: OutputReader,
+    out: mpsc::Sender<Vec<u8>>,
+    cap: u64,
+    mut scrub: Option<Scrubber>,
+) -> bool {
     let mut sent = 0u64;
     let mut truncated = false;
-    while let Some(chunk) = output.next().await {
+    let mut ended = false;
+    loop {
+        let chunk = match output.next().await {
+            Some(c) => match &mut scrub {
+                Some(s) => s.push(&c),
+                None => c,
+            },
+            None if !ended => {
+                ended = true;
+                match scrub.as_mut().map(Scrubber::finish) {
+                    Some(rest) if !rest.is_empty() => rest,
+                    _ => break,
+                }
+            }
+            None => break,
+        };
+        if chunk.is_empty() {
+            continue;
+        }
         let room = cap.saturating_sub(sent) as usize;
         if room == 0 {
             truncated = true;
@@ -469,13 +555,25 @@ struct Spawned {
 }
 
 #[cfg(unix)]
-fn spawn(cfg: &ExecConfig, spec_json: &str, spec: &ShimSpec) -> Result<Spawned, RpcError> {
+fn spawn(
+    cfg: &ExecConfig,
+    spec_json: &str,
+    spec: &ShimSpec,
+    secret: Option<Secret>,
+) -> Result<Spawned, RpcError> {
     use std::os::fd::{AsRawFd, OwnedFd};
     let io = |e: std::io::Error| RpcError::new(code::IO, format!("cannot start the command: {e}"));
     let (out_r, out_w) = std::io::pipe().map_err(io)?;
     let out_w2 = out_w.try_clone().map_err(io)?;
     let (st_r, st_w) = std::io::pipe().map_err(io)?;
     let st_raw = st_w.as_raw_fd();
+    // A socket, not a pipe: a pipe could be reopened through /proc by any process
+    // of the user, a socket cannot.
+    let secret_pair = match &secret {
+        Some(_) => Some(std::os::unix::net::UnixStream::pair().map_err(io)?),
+        None => None,
+    };
+    let sk_raw = secret_pair.as_ref().map_or(-1, |(_, c)| c.as_raw_fd());
     let mut cmd = tokio::process::Command::new(&cfg.shim_program);
     cmd.args(&cfg.shim_args)
         .arg(SHIM_ARG)
@@ -488,10 +586,14 @@ fn spawn(cfg: &ExecConfig, spec_json: &str, spec: &ShimSpec) -> Result<Spawned, 
     // SAFETY: dup2 and fcntl only, both async-signal-safe.
     unsafe {
         cmd.pre_exec(move || {
-            if st_raw == 3 {
-                let flags = libc::fcntl(3, libc::F_GETFD);
-                libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-            } else if libc::dup2(st_raw, 3) < 0 {
+            // Out of the way first, so placing one cannot overwrite the other.
+            let high = |fd: i32| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+            let st = high(st_raw);
+            let sk = if sk_raw >= 0 { high(sk_raw) } else { -1 };
+            if st < 0 || (sk_raw >= 0 && sk < 0) || libc::dup2(st, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if sk >= 0 && libc::dup2(sk, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -500,6 +602,10 @@ fn spawn(cfg: &ExecConfig, spec_json: &str, spec: &ShimSpec) -> Result<Spawned, 
     let mut child = cmd.spawn().map_err(io)?;
     drop(cmd);
     drop(st_w);
+    if let (Some((mine, theirs)), Some(secret)) = (secret_pair, secret) {
+        drop(theirs);
+        send_secret(mine, secret);
+    }
     let pid = child
         .id()
         .ok_or_else(|| io(std::io::Error::other("no pid")))? as i32;
@@ -550,8 +656,34 @@ fn spawn(cfg: &ExecConfig, spec_json: &str, spec: &ShimSpec) -> Result<Spawned, 
     })
 }
 
+/// Hands the secret to the shim once it says it is ready (undumpable, untraced).
+/// Any failure leaves the shim without it, and it does not run the command.
+#[cfg(unix)]
+fn send_secret(sock: std::os::unix::net::UnixStream, secret: Secret) {
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(()) = sock.set_nonblocking(true) else {
+            return;
+        };
+        let Ok(mut s) = tokio::net::UnixStream::from_std(sock) else {
+            return;
+        };
+        let mut ready = [0u8; 1];
+        let got = tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut ready)).await;
+        if matches!(got, Ok(Ok(_))) && ready == *b"R" {
+            let _ = s.write_all(secret.expose().as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
+    });
+}
+
 #[cfg(windows)]
-fn spawn(cfg: &ExecConfig, spec_json: &str, _spec: &ShimSpec) -> Result<Spawned, RpcError> {
+fn spawn(
+    cfg: &ExecConfig,
+    spec_json: &str,
+    _spec: &ShimSpec,
+    _secret: Option<Secret>,
+) -> Result<Spawned, RpcError> {
     use std::io::Read;
     use tokio::io::AsyncWriteExt;
     let io = |e: std::io::Error| RpcError::new(code::IO, format!("cannot start the command: {e}"));

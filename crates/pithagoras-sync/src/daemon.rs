@@ -15,6 +15,8 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::control::{self, Reply, Request, Status};
+use sync_policy::config::{Elevation, SecretStorage};
+use sync_policy::secret::Secret;
 
 pub struct Daemon {
     dirs: Dirs,
@@ -88,6 +90,10 @@ fn now_ms() -> i64 {
 }
 
 pub async fn run(dirs: Dirs) -> Result<(), String> {
+    // Other processes of this user (the commands it runs among them) cannot read
+    // the client's memory, where the elevation secret lives.
+    #[cfg(target_os = "linux")]
+    sync_policy::secret::undumpable();
     let socket = dirs.socket();
     if let Ok(Some(_)) = control::send(&socket, Request::Status).await {
         return Err("pithagoras-sync is already running for this user".into());
@@ -176,6 +182,15 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
         Some(queue.clone()),
         Some(store.clone()),
     );
+    crate::secrets::scrub_log_with(device.secrets.clone());
+    device.engine.seal(vec![crate::secrets::file(&dirs)]);
+    if cfg.policy.privilege.secret_storage == SecretStorage::File {
+        match crate::secrets::load(&crate::secrets::file(&dirs)) {
+            Ok(Some(s)) => device.secrets.set(s),
+            Ok(None) => {}
+            Err(e) => warn!("elevation password not loaded: {e}"),
+        }
+    }
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
         cfg.profile,
@@ -353,6 +368,9 @@ impl Daemon {
                     warn!("cannot write the pause marker: {e}");
                 }
                 self.device.pause().await;
+                // Kept in memory only, the secret is gone until the owner types it
+                // again; a stored one comes back with unlock.
+                self.device.secrets.clear();
                 Reply::ok()
             }
             Request::Unlock => {
@@ -362,6 +380,7 @@ impl Daemon {
                     return Reply::err(format!("cannot remove the pause marker: {e}"));
                 }
                 self.device.unlock();
+                self.load_stored_secret();
                 Reply::ok()
             }
             Request::Reload => match self.reload() {
@@ -380,16 +399,66 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e.to_string()),
             },
-            Request::SecretSet { .. } | Request::SecretClear { .. } => {
-                Reply::err("this client keeps no secrets")
+            Request::SecretSet { name, value } => match self.set_secret(&name, value) {
+                Ok(()) => Reply::ok(),
+                Err(e) => Reply::err(e),
+            },
+            Request::SecretClear { name } => {
+                if name != crate::secrets::ELEVATION {
+                    return Reply::err(format!("there is no secret {name}"));
+                }
+                self.device.secrets.clear();
+                if let Err(e) = crate::secrets::remove(&crate::secrets::file(&self.dirs)) {
+                    return Reply::err(e);
+                }
+                info!("elevation password cleared");
+                Reply::ok()
             }
         }
     }
 
+    fn set_secret(&self, name: &str, value: Secret) -> Result<(), String> {
+        if name != crate::secrets::ELEVATION {
+            return Err(format!("there is no secret {name}"));
+        }
+        if !cfg!(target_os = "linux") {
+            return Err("elevation is built for Linux (sudo) only in this version".into());
+        }
+        #[cfg(target_os = "linux")]
+        if sync_policy::secret::traced() {
+            return Err("the client is being traced; it does not take the password now".into());
+        }
+        crate::secrets::check(value.expose())?;
+        let storage = self.store.config().policy.privilege.secret_storage;
+        if storage == SecretStorage::File {
+            crate::secrets::save(&crate::secrets::file(&self.dirs), &value)?;
+        }
+        self.device.secrets.set(value);
+        info!("elevation password set (kept in {})", storage.as_str());
+        Ok(())
+    }
+
+    fn load_stored_secret(&self) {
+        if self.store.config().policy.privilege.secret_storage != SecretStorage::File {
+            return;
+        }
+        match crate::secrets::load(&crate::secrets::file(&self.dirs)) {
+            Ok(Some(s)) => self.device.secrets.set(s),
+            Ok(None) => {}
+            Err(e) => warn!("elevation password not loaded: {e}"),
+        }
+    }
+
     fn elevation_status(&self, cfg: &DeviceConfig) -> String {
-        match cfg.policy.privilege.elevation {
-            sync_policy::config::Elevation::Off => "off".into(),
-            sync_policy::config::Elevation::Sudo => "sudo".into(),
+        let p = &cfg.policy.privilege;
+        match p.elevation {
+            Elevation::Off => "off".into(),
+            Elevation::Sudo if self.device.secrets.is_set() => {
+                format!("sudo, password set (kept in {})", p.secret_storage.as_str())
+            }
+            Elevation::Sudo => {
+                "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
+            }
         }
     }
 }

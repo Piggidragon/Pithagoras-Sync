@@ -34,6 +34,7 @@ fn permit(path: PathBuf, root: Option<&Path>) -> Permit {
         path,
         root: root.map(Path::to_path_buf),
         confine: Confine::None,
+        elevate: None,
     }
 }
 

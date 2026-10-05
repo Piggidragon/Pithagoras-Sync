@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use sync_connector::pair;
 use sync_ops::info;
+use sync_policy::config::{Elevation, SecretStorage};
 use sync_policy::{Access, DeviceConfig, Dirs, FolderGrant, Mode, Policy, Profile};
 
 use crate::actions::{self, Action};
@@ -92,6 +93,12 @@ pub enum Cmd {
     },
     /// Refuse a waiting call.
     Deny { id: u64 },
+    /// The password sudo needs for elevated commands, typed here and never sent
+    /// to the portal.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
     /// Start the client with the machine (systemd unit, or a logon task on Windows).
     Install {
         /// A system unit instead of a user unit (run as root).
@@ -160,6 +167,25 @@ pub enum ConfigCmd {
     Add { key: String, value: String },
     /// Take an entry out of a list.
     Remove { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+pub enum SecretCmd {
+    /// Type the password in this terminal (it is not echoed).
+    Set {
+        #[arg(value_parser = ["elevation"])]
+        name: String,
+        /// Read it from stdin instead, for a script piping it in.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Forget it, in the running client and on disk.
+    Clear {
+        #[arg(value_parser = ["elevation"])]
+        name: String,
+    },
+    /// Whether one is set.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -380,6 +406,76 @@ fn apply_plan(plan: &[Action]) -> Result<(), String> {
     let hints = actions::apply(plan, Path::new("/"), &actions::System)?;
     for h in hints {
         eprintln!("note: {h}");
+    }
+    Ok(())
+}
+
+async fn secret_cmd(dirs: &Dirs, cmd: SecretCmd) -> Result<(), String> {
+    use crate::secrets;
+    match cmd {
+        SecretCmd::Status => match control::send(&dirs.socket(), Request::Status).await? {
+            Some(r) => println!(
+                "Elevation: {}",
+                r.status.map(|s| s.elevation).unwrap_or_default()
+            ),
+            None => {
+                let stored = secrets::file(dirs).exists();
+                println!(
+                    "The client is not running; {}.",
+                    if stored {
+                        "a password is stored for it"
+                    } else {
+                        "no password is stored"
+                    }
+                );
+            }
+        },
+        SecretCmd::Set { name, stdin } => {
+            let cfg = owner_edit(dirs).await?;
+            let value = if stdin {
+                secrets::read_from_stdin()?
+            } else {
+                secrets::read_from_tty(&format!(
+                    "Password sudo asks {} for (not shown): ",
+                    info::user().0
+                ))?
+            };
+            match control::send(
+                &dirs.socket(),
+                Request::SecretSet {
+                    name,
+                    value: value.clone(),
+                },
+            )
+            .await?
+            {
+                Some(r) if r.ok => println!("Set. Elevated commands get it through sudo."),
+                Some(r) => return Err(r.error.unwrap_or_default()),
+                None if cfg.policy.privilege.secret_storage == SecretStorage::File => {
+                    secrets::save(&secrets::file(dirs), &value)?;
+                    println!("Stored for the client's next start.");
+                }
+                None => {
+                    return Err(
+                        "the client is not running, and it keeps the password in memory only (policy.privilege.secret_storage = memory); start it first".into(),
+                    );
+                }
+            }
+            if cfg.policy.privilege.elevation == Elevation::Off {
+                println!(
+                    "Elevation is off; `pithagoras-sync config set policy.privilege.elevation sudo` switches it on."
+                );
+            }
+        }
+        SecretCmd::Clear { name } => {
+            owner::not_from_own_command(dirs).await?;
+            match control::send(&dirs.socket(), Request::SecretClear { name }).await? {
+                Some(r) if !r.ok => return Err(r.error.unwrap_or_default()),
+                Some(_) => {}
+                None => secrets::remove(&secrets::file(dirs))?,
+            }
+            println!("Cleared.");
+        }
     }
     Ok(())
 }
@@ -661,6 +757,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             .await?;
             println!("Denied #{id}.");
         }
+        Cmd::Secret { cmd } => secret_cmd(&dirs, cmd).await?,
         Cmd::Install {
             system,
             user,

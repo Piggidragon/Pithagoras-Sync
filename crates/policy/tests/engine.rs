@@ -954,3 +954,123 @@ async fn the_tool_config_list_is_the_owners() {
     write(&e, &f.p("home/proj/.git/config")).await.unwrap();
     denied(write(&e, &f.p("home/proj/Makefile")).await);
 }
+
+#[tokio::test]
+async fn elevation_is_the_owners_choice_and_root_always_asks() {
+    let f = Fixture::new();
+    let cwd = f.p("home/proj");
+    let open = |f: &Fixture| {
+        with(full(f), |p| {
+            p.full.pattern_prompts = false;
+            p.full.protected_paths = false;
+        })
+    };
+    // Off (the default): `sudo` is a word like any other, nothing is elevated.
+    let yes = scripted(Answer::Once);
+    let e = f.engine(open(&f), Profile::Headless, yes.clone());
+    assert_eq!(
+        exec(&e, "sudo apt update", &cwd).await.unwrap().elevate,
+        None
+    );
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+
+    // On: the device runs it through its sudo, after asking, in Full mode too.
+    let on = |f: &Fixture| {
+        with(open(f), |p| {
+            p.privilege.elevation = config::Elevation::Sudo;
+            p.privilege.sudo_path = "/opt/sudo".into();
+        })
+    };
+    let e = f.engine(on(&f), Profile::Headless, yes.clone());
+    let p = exec(&e, "sudo apt update", &cwd).await.unwrap();
+    assert_eq!(p.elevate, Some(PathBuf::from("/opt/sudo")));
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+    let last = yes.last.lock().unwrap().clone().unwrap();
+    assert!(last.reasons.iter().any(|r| r.contains("root")), "{last:?}");
+    assert_eq!(exec(&e, "true", &cwd).await.unwrap().elevate, None);
+    // sudo's own options (another user, a shell, a preserved environment) are not
+    // taken; nor is a bare sudo.
+    for c in ["sudo -u nobody id", "sudo -E env", "sudo -s", "sudo  "] {
+        denied(exec(&e, c, &cwd).await);
+    }
+    // Nobody to ask: refused.
+    let e = f.engine(on(&f), Profile::Headless, none());
+    denied(exec(&e, "sudo apt update", &cwd).await);
+    // The owner's never-ask list lifts the question, command by command.
+    let policy = with(on(&f), |p| {
+        p.commands.never_ask = vec![rule("sudo apt update")]
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    exec(&e, "sudo apt update", &cwd).await.unwrap();
+    denied(exec(&e, "sudo apt upgrade", &cwd).await);
+
+    // sudo cannot work under Landlock (no_new_privs): refused, not run confined.
+    let policy = with(f.folders(&[("home/proj", Access::Rw)]), |p| {
+        p.privilege.elevation = config::Elevation::Sudo;
+    });
+    let e = f.engine(policy, Profile::Headless, yes.clone());
+    let m = denied(exec(&e, "sudo true", &cwd).await);
+    assert!(m.contains("Landlock"), "{m}");
+}
+
+#[tokio::test]
+async fn the_stored_secret_is_sealed_and_scrubbed_from_the_audit_log() {
+    let f = Fixture::new();
+    let secret_file = f.home.join(".config/pithagoras-sync/elevation.secret");
+    fs::create_dir_all(secret_file.parent().unwrap()).unwrap();
+    fs::write(&secret_file, "pw-xyz").unwrap();
+    let policy = with(full(&f), |p| p.full.protected_paths = false);
+    let e = f.engine(policy, Profile::Headless, none());
+    read(&e, &secret_file.to_string_lossy()).await.unwrap();
+    e.seal(vec![secret_file.clone()]);
+    let m = denied(read(&e, &secret_file.to_string_lossy()).await);
+    assert!(m.contains("own secret"), "{m}");
+    denied(write(&e, &secret_file.to_string_lossy()).await);
+    assert!(!e.walk_filter()(&secret_file));
+    assert!(e.walk_filter()(
+        &f.home.join(".config/pithagoras-sync/config.toml")
+    ));
+
+    let slot = Arc::new(secret::SecretSlot::default());
+    slot.set(secret::Secret::new("pw-xyz".into()));
+    e.scrub_with(slot);
+    exec(&e, "echo pw-xyz", &f.p("home/proj")).await.unwrap();
+    e.record_exit(
+        Some("chat pw-xyz"),
+        "exit",
+        "echo pw-xyz",
+        "ran",
+        Some("said pw-xyz".into()),
+        Some(0),
+    );
+    let log = fs::read_to_string(f.root.join("state/audit.jsonl")).unwrap();
+    assert!(!log.contains("pw-xyz"), "{log}");
+    assert!(log.contains("echo [redacted]"), "{log}");
+}
+
+#[tokio::test]
+async fn landlock_carves_the_stored_secret_out_even_of_a_named_grant() {
+    let f = Fixture::new();
+    let own = f.home.join(".config/pithagoras-sync");
+    let secret_file = own.join("elevation.secret");
+    fs::create_dir_all(&own).unwrap();
+    fs::write(&secret_file, "pw").unwrap();
+    fs::write(own.join("config.toml"), "").unwrap();
+    // Granting the client's own folder by name lifts its protection, not the seal.
+    let mut policy = f.folders(&[("home/.config/pithagoras-sync", Access::Rw)]);
+    policy.folders[0].execute = true;
+    let e = f.engine(policy, Profile::Headless, none());
+    e.seal(vec![secret_file.clone()]);
+    let p = exec(&e, "true", &own.to_string_lossy()).await.unwrap();
+    let Confine::Landlock(rules) = p.confine else {
+        panic!("{:?}", p.confine)
+    };
+    for list in [&rules.read, &rules.write, &rules.exec] {
+        assert!(!list.iter().any(|d| secret_file.starts_with(d)), "{list:?}");
+    }
+    assert!(
+        rules.write.iter().any(|d| d.ends_with("config.toml")),
+        "{:?}",
+        rules.write
+    );
+}

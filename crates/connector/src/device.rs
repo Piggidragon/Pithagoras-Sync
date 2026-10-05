@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use sync_ops::{Execs, info};
 use sync_policy::config::PortalPolicy;
 use sync_policy::paths::to_wire;
+use sync_policy::secret::SecretSlot;
 use sync_policy::{ApprovalQueue, Engine, FoldersShell, Mode};
 use sync_proto::methods::{
     CAP_APPROVALS, CAP_POLICY, CAPABILITIES, DeviceInfo, FolderInfo, Hello, PiTool,
@@ -26,6 +27,9 @@ pub struct Device {
     pub approvals: Option<Arc<ApprovalQueue>>,
     /// The config, when the portal may see it (`policy.get`, `policy.set`).
     pub store: Option<Arc<ConfigStore>>,
+    /// The elevation secret: commands get it through sudo, and the engine's audit
+    /// log, the commands' output and every text frame to the portal leave it out.
+    pub secrets: Arc<SecretSlot>,
 }
 
 impl Device {
@@ -42,6 +46,9 @@ impl Device {
         store: Option<Arc<ConfigStore>>,
     ) -> Arc<Device> {
         let (paused, _) = watch::channel(engine.is_paused());
+        let secrets = Arc::new(SecretSlot::default());
+        engine.scrub_with(secrets.clone());
+        execs.use_secrets(secrets.clone());
         Arc::new(Device {
             engine,
             execs,
@@ -50,6 +57,7 @@ impl Device {
             paused,
             approvals,
             store,
+            secrets,
         })
     }
 

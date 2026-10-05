@@ -19,7 +19,7 @@ fn main() -> ExitCode {
         tracing::Level::WARN
     };
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(pithagoras_sync::secrets::LogWriter)
         .with_max_level(level)
         .with_target(false)
         .init();

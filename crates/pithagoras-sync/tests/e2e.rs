@@ -484,3 +484,392 @@ async fn the_first_change_on_a_desktop_makes_a_desktop_config() {
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("ask"));
 }
+
+/// Starts a command, answers its approval as the portal (Allow once), and waits for
+/// its end.
+async fn exec_approved(dl: &DeviceLink, stream: u32, command: &str, cwd: &str) -> (String, Value) {
+    let pending = dl
+        .start_call(
+            "exec.start",
+            json!({"stream": stream, "command": command, "cwd": cwd, "ctx": {"chat": "c1"}}),
+        )
+        .await;
+    let asked = dl
+        .notification("approval.requested", WAIT)
+        .await
+        .unwrap_or_else(|| panic!("no approval asked for {command:?}"));
+    dl.call(
+        "approval.answer",
+        json!({"id": asked["id"], "answer": "once"}),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(WAIT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("{command}: {e}"));
+    let exit = dl.notification("exec.exit", WAIT).await.unwrap();
+    assert_eq!(exit["stream"], stream);
+    (
+        String::from_utf8_lossy(&dl.stream_data(stream)).into_owned(),
+        exit,
+    )
+}
+
+/// The password the fake sudo takes: with a quote, a backslash and a space, so it
+/// looks different inside JSON and a shell would split it.
+const PW: &str = "Elev8-pw \"q\\z";
+
+/// A stand-in for sudo: takes the password from stdin like `sudo -S`, compares
+/// its hash, then runs the command as is (the test machine is never touched as
+/// root).
+fn fake_sudo(env: &Env) -> PathBuf {
+    let mut c = std::process::Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    c.stdin.take().unwrap().write_all(PW.as_bytes()).unwrap();
+    let out = c.wait_with_output().unwrap();
+    let hash = String::from_utf8_lossy(&out.stdout)
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_string();
+    let path = env.root.join("fakesudo");
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+case "$1" in -n) echo "sudo: a password is required" >&2; exit 1;; esac
+while [ "$1" != "--" ]; do shift; done; shift
+# A sudoers rule without a password: sudo leaves stdin alone.
+[ -e "$0.nopasswd" ] && FAKE_ROOT=1 exec "$@"
+IFS= read -r pw || {{ echo "sudo: no password" >&2; exit 1; }}
+h=$(printf '%s' "$pw" | sha256sum); pw=
+[ "${{h%% *}}" = "{hash}" ] || {{ echo "sudo: 1 incorrect password attempt" >&2; exit 1; }}
+FAKE_ROOT=1 exec "$@"
+"#
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Whether any process's command line or environment holds `needle`.
+fn in_proc(needle: &[u8]) -> Option<String> {
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        for f in ["cmdline", "environ"] {
+            if let Ok(b) = std::fs::read(e.path().join(f))
+                && b.windows(needle.len()).any(|w| w == needle)
+            {
+                return Some(format!("{}/{f}", e.path().display()));
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_elevation_password_reaches_sudo_and_nothing_else() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "elev"])
+        .await;
+    let sudo = fake_sudo(&env);
+    env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
+        .await;
+    env.ok(&["config", "set", "policy.privilege.elevation", "sudo"])
+        .await;
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.sudo_path",
+        &sudo.to_string_lossy(),
+    ])
+    .await;
+    env.ok(&["mode", "full"]).await;
+    // Without the patterns' questions, only root's own question asks.
+    env.ok(&["config", "set", "policy.full.pattern_prompts", "false"])
+        .await;
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.expect("the client connects");
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    let proj = env.p("home/proj");
+
+    if status["cgroups"] != true {
+        // Without a cgroup panic could not stop root's commands: refused.
+        let e = dl
+            .call(
+                "exec.start",
+                json!({"stream": 1, "command": "sudo true", "cwd": proj, "ctx": {"chat": "c1"}}),
+            )
+            .await;
+        eprintln!("  (no delegated cgroup here: {e:?})");
+        drop(dl);
+        stop(daemon).await;
+        return;
+    }
+    assert!(
+        status["elevation"]
+            .as_str()
+            .unwrap()
+            .starts_with("sudo, no password"),
+        "{status}"
+    );
+
+    // Not on a command line: `--stdin` (or the terminal) only.
+    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    set.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut i = child.stdin.take().unwrap();
+        i.write_all(format!("{PW}\n").as_bytes()).await.unwrap();
+    }
+    let out = child.wait_with_output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert!(
+        status["elevation"]
+            .as_str()
+            .unwrap()
+            .starts_with("sudo, password set (kept in memory)"),
+        "{status}"
+    );
+
+    // Watch every process's argv and environment while elevated commands run.
+    let stop_watch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let stop_watch = stop_watch.clone();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while !stop_watch.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(w) = in_proc(PW.as_bytes()) {
+                    seen.push(w);
+                }
+            }
+            seen
+        })
+    };
+
+    // Root's command asks even in Full mode; it runs through sudo once allowed.
+    // What it can see (environment, stdin, ps, every /proc/*/cmdline and environ)
+    // goes to files, which the scrubbing of output cannot hide.
+    let dump = env.root.join("home/proj/dump");
+    std::fs::create_dir_all(&dump).unwrap();
+    let cmd = format!(
+        "sudo env > {d}/env; cat > {d}/stdin; ps -eo args > {d}/ps; \
+         cat /proc/[0-9]*/cmdline > {d}/cmdline 2>/dev/null; \
+         cat /proc/[0-9]*/environ > {d}/environ 2>/dev/null; echo ran-as-$FAKE_ROOT",
+        d = dump.display()
+    );
+    let (out, exit) = exec_approved(&dl, 2, &cmd, &proj).await;
+    assert_eq!(exit["code"], 0, "{out}");
+    assert!(out.contains("ran-as-1"), "it ran through sudo: {out}");
+    assert!(
+        std::fs::read_to_string(dump.join("env"))
+            .unwrap()
+            .contains("FAKE_ROOT=1")
+    );
+    assert!(
+        std::fs::read_to_string(dump.join("ps"))
+            .unwrap()
+            .lines()
+            .count()
+            > 2
+    );
+    for f in ["env", "stdin", "ps", "cmdline", "environ"] {
+        let b = std::fs::read(dump.join(f)).unwrap();
+        assert!(
+            !b.windows(PW.len()).any(|w| w == PW.as_bytes()),
+            "{f} holds the password"
+        );
+    }
+    assert_eq!(std::fs::read(dump.join("stdin")).unwrap(), b"");
+
+    // A file holding the password: its output is scrubbed, elevated or not.
+    std::fs::write(env.root.join("home/proj/pw.txt"), format!("x{PW}y\n")).unwrap();
+    let (out, _) = exec_approved(&dl, 3, "sudo cat pw.txt", &proj).await;
+    assert_eq!(out, "x[redacted]y\n");
+    let (out, _) = exec(&dl, 4, "cat pw.txt; echo; cat pw.txt", &proj).await;
+    assert_eq!(out, "x[redacted]y\n\nx[redacted]y\n");
+    // Where sudo asks no password, the command still finds nothing on stdin.
+    let nopasswd = env.root.join("fakesudo.nopasswd");
+    std::fs::write(&nopasswd, "").unwrap();
+    let cmd = format!("sudo cat > {}/stdin2", dump.display());
+    exec_approved(&dl, 11, &cmd, &proj).await;
+    std::fs::remove_file(&nopasswd).unwrap();
+    assert_eq!(std::fs::read(dump.join("stdin2")).unwrap(), b"");
+    // sudo's own options are not taken.
+    let e = dl
+        .call(
+            "exec.start",
+            json!({"stream": 6, "command": "sudo -u nobody true", "cwd": proj, "ctx": {"chat": "c1"}}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, sync_proto::code::DENIED);
+
+    stop_watch.store(true, std::sync::atomic::Ordering::Relaxed);
+    let seen = watcher.join().unwrap();
+    assert!(seen.is_empty(), "the password showed in {seen:?}");
+
+    // Nor does a command naming it carry it back to the portal (in the approval
+    // request) or into the audit log. (The portal sent it in the command, so it
+    // is in that command's argv; the watch above has ended.)
+    let (out, _) = exec_approved(&dl, 5, &format!("sudo printf %s '{PW}' | wc -c"), &proj).await;
+    assert_eq!(out.trim(), PW.len().to_string());
+
+    // A wrong password: sudo refuses, the command does not run.
+    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    set.stdin(Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut i = child.stdin.take().unwrap();
+        i.write_all(b"wrong one\n").await.unwrap();
+    }
+    assert!(child.wait().await.unwrap().success());
+    let (out, exit) = exec_approved(&dl, 7, "sudo touch wrong-ran", &proj).await;
+    assert_ne!(exit["code"], 0, "{out}");
+    assert!(out.contains("incorrect password"), "{out}");
+    assert!(!env.root.join("home/proj/wrong-ran").exists());
+
+    // panic forgets a password kept in memory.
+    env.ok(&["panic"]).await;
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert!(
+        status["elevation"]
+            .as_str()
+            .unwrap()
+            .contains("no password"),
+        "{status}"
+    );
+    env.ok(&["unlock"]).await;
+    let dl = mock.next_device(WAIT).await.unwrap();
+
+    // Kept in a file: 0600, and no tool reaches it, whatever the mode.
+    env.ok(&["config", "set", "policy.privilege.secret_storage", "file"])
+        .await;
+    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    set.stdin(Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut i = child.stdin.take().unwrap();
+        i.write_all(format!("{PW}\n").as_bytes()).await.unwrap();
+    }
+    assert!(child.wait().await.unwrap().success());
+    let stored = env.home.join(".config/pithagoras-sync/elevation.secret");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let e = dl
+        .call(
+            "fs.read",
+            json!({"stream": 8, "path": stored.to_string_lossy(), "ctx": {"chat": "c1"}}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, sync_proto::code::DENIED);
+    let (out, _) = exec_approved(&dl, 9, "sudo cat pw.txt", &proj).await;
+    assert_eq!(out, "x[redacted]y\n");
+    drop(dl);
+    stop(daemon).await;
+
+    // It comes back with the client.
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.unwrap();
+    let (out, exit) = exec_approved(&dl, 10, "sudo echo back-$FAKE_ROOT", &proj).await;
+    assert_eq!((out.as_str(), &exit["code"]), ("back-1\n", &json!(0)));
+    env.ok(&["secret", "clear", "elevation"]).await;
+    assert!(!stored.exists());
+    drop(dl);
+    stop(daemon).await;
+
+    // Never in the audit log, the client's log or anything the portal received,
+    // as written or as JSON escapes it.
+    let escaped = serde_json::to_string(PW).unwrap();
+    let escaped = &escaped[1..escaped.len() - 1];
+    let audit =
+        std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/audit.jsonl")).unwrap();
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    let transcript = mock.transcript();
+    assert!(audit.contains("[redacted]"), "{audit}");
+    for (what, text) in [
+        ("audit", audit.as_bytes()),
+        ("log", log.as_bytes()),
+        ("portal", &transcript[..]),
+    ] {
+        for needle in [PW, escaped] {
+            assert!(
+                !text.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "the {what} holds the password"
+            );
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&transcript).contains("approval.requested"),
+        "the transcript has the traffic"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn elevated_commands_are_refused_under_landlock() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "elev"])
+        .await;
+    let sudo = fake_sudo(&env);
+    env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
+        .await;
+    env.ok(&["config", "set", "policy.privilege.elevation", "sudo"])
+        .await;
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.sudo_path",
+        &sudo.to_string_lossy(),
+    ])
+    .await;
+    env.ok(&["mode", "folders"]).await;
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.unwrap();
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    if status["landlock"] == true {
+        let e = dl
+            .call(
+                "exec.start",
+                json!({"stream": 1, "command": "sudo true", "cwd": env.p("home/proj"), "ctx": {"chat": "c1"}}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, sync_proto::code::DENIED);
+        assert!(e.message.contains("Landlock"), "{}", e.message);
+    }
+    drop(dl);
+    stop(daemon).await;
+}

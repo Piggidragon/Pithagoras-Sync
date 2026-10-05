@@ -84,6 +84,7 @@ pub async fn run(
 ) -> End {
     let (mut sink, mut stream) = ws.split();
     let (out, mut out_rx) = mpsc::channel::<Message>(OUT_QUEUE);
+    let secrets = device.secrets.clone();
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_EVERY);
         ping.tick().await;
@@ -91,6 +92,13 @@ pub async fn run(
             tokio::select! {
                 m = out_rx.recv() => {
                     let Some(m) = m else { break };
+                    // The last stop before the wire: no text the device sends (an
+                    // error, a notification, a path) carries the elevation secret.
+                    // Command output was scrubbed as it streamed.
+                    let m = match m {
+                        Message::Text(t) if secrets.is_set() => Message::text(secrets.scrub(t.as_str())),
+                        m => m,
+                    };
                     let close = matches!(m, Message::Close(_));
                     if sink.send(m).await.is_err() || close {
                         break;

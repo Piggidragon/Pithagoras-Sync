@@ -54,6 +54,16 @@ struct State {
     pairs: Mutex<Vec<PairRequest>>,
     devices: mpsc::UnboundedSender<DeviceLink>,
     next: AtomicUsize,
+    /// Every byte devices sent: request heads and bodies, and each message.
+    transcript: Mutex<Vec<u8>>,
+}
+
+impl State {
+    fn record(&self, data: &[u8]) {
+        let mut t = self.transcript.lock().unwrap();
+        t.extend_from_slice(data);
+        t.push(b'\n');
+    }
 }
 
 fn random_token() -> String {
@@ -82,6 +92,7 @@ impl MockPortal {
             pairs: Mutex::new(Vec::new()),
             devices: tx,
             next: AtomicUsize::new(1),
+            transcript: Mutex::new(Vec::new()),
         });
         let (acceptor, spki, cert_der) = if opts.tls {
             let ck = rcgen::generate_simple_self_signed(vec![
@@ -205,6 +216,11 @@ impl MockPortal {
     pub fn pairs(&self) -> Vec<PairRequest> {
         self.state.pairs.lock().unwrap().clone()
     }
+
+    /// Everything any device sent to this portal so far, as received.
+    pub fn transcript(&self) -> Vec<u8> {
+        self.state.transcript.lock().unwrap().clone()
+    }
 }
 
 fn close(code: u16, reason: &str) -> Message {
@@ -269,6 +285,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(st: Arc<State
     let Some(head) = read_head(&mut io).await else {
         return;
     };
+    st.record(format!("{} {} {:?}", head.method, head.path, head.headers).as_bytes());
     match (head.method.as_str(), head.path.as_str()) {
         ("POST", sync_proto::PAIR_PATH) => pair(st, io, head).await,
         ("GET", sync_proto::CONNECT_PATH) => upgrade(st, io, head).await,
@@ -290,6 +307,7 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(st: Arc<State>, mut io: S, head
             Ok(n) => body.extend_from_slice(&chunk[..n]),
         }
     }
+    st.record(&body);
     let Ok(req) = serde_json::from_slice::<PairRequest>(&body) else {
         return respond(&mut io, "400 Bad Request", &json!({"error": "bad body"})).await;
     };
@@ -398,6 +416,7 @@ async fn link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // The first frame must be `hello`.
     let hello = match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => {
+            st.record(t.as_bytes());
             let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);
             if v["method"] != "hello" {
                 let _ = out.send(close(1008, "hello expected")).await;
@@ -429,6 +448,12 @@ async fn link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tokio::spawn(async move {
         let mut why = (1006u16, String::from("connection lost"));
         while let Some(Ok(m)) = stream.next().await {
+            match &m {
+                Message::Text(t) => st.record(t.as_bytes()),
+                Message::Binary(b) => st.record(b),
+                Message::Close(Some(f)) => st.record(f.reason.as_bytes()),
+                _ => {}
+            }
             match m {
                 Message::Text(t) => {
                     let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);

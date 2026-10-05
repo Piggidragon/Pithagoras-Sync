@@ -37,6 +37,9 @@ pub struct ShimSpec {
     pub parent: u32,
     pub cgroup: Option<PathBuf>,
     pub landlock: Option<LandlockSpec>,
+    /// The client passes the elevation secret on fd 4 for sudo's stdin.
+    #[serde(default)]
+    pub secret_fd: bool,
 }
 
 /// Runs the shim and returns its exit code. Must be called before any thread or
@@ -62,6 +65,50 @@ mod imp {
 
     /// fd 3: the client reads the main shell's exit status from it.
     const STATUS_FD: i32 = 3;
+    /// fd 4: a socket the client sends the elevation secret over.
+    const SECRET_FD: i32 = 4;
+    /// Longest secret taken.
+    const MAX_SECRET: usize = 1024;
+
+    /// Takes the secret from the client and returns a pipe holding it, for sudo's
+    /// stdin. The shim first makes itself undumpable and checks nobody traces it,
+    /// so no other process of the user can read the secret out of its memory, then
+    /// tells the client it is ready; the client sends the secret only then.
+    fn take_secret() -> Result<std::os::fd::OwnedFd, String> {
+        use std::io::{Read, Write as _};
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        // SAFETY: fd 4 is the client's socket, passed to us alone.
+        if unsafe { libc::fcntl(SECRET_FD, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err("no secret channel".into());
+        }
+        // SAFETY: as above; nothing else owns fd 4.
+        let mut sock = unsafe { UnixStream::from_raw_fd(SECRET_FD) };
+        sync_policy::secret::undumpable();
+        if sync_policy::secret::traced() {
+            return Err("the shim is being traced; the secret stays with the client".into());
+        }
+        sock.write_all(b"R").map_err(|e| e.to_string())?;
+        let mut secret = Vec::with_capacity(MAX_SECRET);
+        let r = (&mut sock)
+            .take(MAX_SECRET as u64 + 1)
+            .read_to_end(&mut secret);
+        drop(sock);
+        let result = (|| {
+            r.map_err(|e| e.to_string())?;
+            if secret.is_empty() || secret.len() > MAX_SECRET || secret.contains(&b'\n') {
+                return Err("no usable secret".to_string());
+            }
+            let (rd, wr) = std::io::pipe().map_err(|e| e.to_string())?;
+            let mut wr = File::from(OwnedFd::from(wr));
+            // Far below a pipe's buffer, so this never blocks.
+            wr.write_all(&secret).map_err(|e| e.to_string())?;
+            wr.write_all(b"\n").map_err(|e| e.to_string())?;
+            Ok(OwnedFd::from(rd))
+        })();
+        secret.fill(0);
+        result
+    }
 
     fn status_file() -> Option<File> {
         // SAFETY: fcntl on a possibly unused fd only reports EBADF.
@@ -242,12 +289,23 @@ mod imp {
             },
             None => None,
         };
+        let stdin = if spec.secret_fd {
+            match take_secret() {
+                Ok(fd) => Stdio::from(fd),
+                Err(e) => {
+                    report(&mut status, &format!("error elevation: {e}"));
+                    return 126;
+                }
+            }
+        } else {
+            Stdio::null()
+        };
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
             .env_clear()
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null());
+            .stdin(stdin);
         // SAFETY: the shim is single-threaded, so the child may allocate after fork;
         // everything here is setsid, the signal mask and Landlock.
         unsafe {

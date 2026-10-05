@@ -169,6 +169,15 @@ pub enum SecretStorage {
     File,
 }
 
+impl SecretStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretStorage::Memory => "memory",
+            SecretStorage::File => "file",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PrivilegeOptions {

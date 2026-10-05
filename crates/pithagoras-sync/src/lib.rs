@@ -7,4 +7,5 @@ pub mod control;
 pub mod daemon;
 pub mod install;
 pub mod owner;
+pub mod secrets;
 pub mod setup;

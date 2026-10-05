@@ -18,11 +18,12 @@ use tokio::sync::broadcast;
 
 use crate::approve::{Answer, ApprovalRequest, Approver};
 use crate::audit::{AuditLog, AuditRecord};
-use crate::config::{FolderGrant, FoldersShell, Mode, Policy, Profile, TimeoutAnswer};
+use crate::config::{Elevation, FolderGrant, FoldersShell, Mode, Policy, Profile, TimeoutAnswer};
 use crate::paths::{PathError, parse_device_path, resolve, within};
 use crate::patterns::{command_prompts, names_protected};
 use crate::protected::{Protected, fold};
 use crate::rules::{Compiled, Rights};
+use crate::secret::SecretSlot;
 use sync_proto::methods::{Access, PiTool};
 
 /// System directories the Landlock-confined shell may read and execute from.
@@ -109,6 +110,8 @@ pub struct Permit {
     /// Open beneath this folder (`openat2(RESOLVE_BENEATH)`) in Folders mode.
     pub root: Option<PathBuf>,
     pub confine: Confine,
+    /// A `sudo ...` command the device runs elevated, through this sudo.
+    pub elevate: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,6 +206,9 @@ pub struct Engine {
     paused: AtomicBool,
     clock: Clock,
     landlock: bool,
+    secrets: std::sync::OnceLock<Arc<SecretSlot>>,
+    /// Files no tool reaches in any mode (the stored elevation secret).
+    sealed: std::sync::OnceLock<Vec<PathBuf>>,
 }
 
 impl Engine {
@@ -220,7 +226,29 @@ impl Engine {
             paused: AtomicBool::new(false),
             clock: opts.clock,
             landlock: opts.landlock,
+            secrets: std::sync::OnceLock::new(),
+            sealed: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Files the file tools never reach and Landlock carves out, whatever the
+    /// policy says: the secret the device keeps for itself.
+    pub fn seal(&self, paths: Vec<PathBuf>) {
+        // As named and as resolved, so a symlinked config folder is sealed too.
+        let resolved: Vec<PathBuf> = paths.iter().filter_map(|p| resolve(p).ok()).collect();
+        let _ = self.sealed.set(paths.into_iter().chain(resolved).collect());
+    }
+
+    fn sealed(&self, path: &Path) -> bool {
+        let folded = fold(path);
+        self.sealed
+            .get()
+            .is_some_and(|s| s.iter().any(|e| within(&folded, &fold(e))))
+    }
+
+    /// The elevation secret to keep out of the audit log.
+    pub fn scrub_with(&self, slot: Arc<SecretSlot>) {
+        let _ = self.secrets.set(slot);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -338,13 +366,18 @@ impl Engine {
         reason: Option<String>,
         exit_code: Option<i32>,
     ) {
+        // Whatever a command or the owner wrote, the elevation secret stays out.
+        let scrub = |t: &str| match self.secrets.get() {
+            Some(s) => s.scrub(t),
+            None => t.to_string(),
+        };
         let rec = AuditRecord {
             time_ms: self.now(),
-            chat: chat.map(str::to_string),
+            chat: chat.map(scrub),
             tool: tool.to_string(),
-            target: target.to_string(),
+            target: scrub(target),
             decision: decision.to_string(),
-            reason,
+            reason: reason.as_deref().map(scrub),
             exit_code,
         };
         self.audit.append(&rec);
@@ -490,10 +523,15 @@ impl Engine {
         let protections = mode != Mode::Full || snap.policy.full.protected_paths;
         let folders = mode == Mode::Folders;
         let grants = resolved_grants(&snap.policy.folders);
+        let sealed = self.sealed.get().cloned().unwrap_or_default();
         Box::new(move |p: &Path| {
             let Ok(rules) = &snap.rules else {
                 return false;
             };
+            let folded = fold(p);
+            if sealed.iter().any(|e| within(&folded, &fold(e))) {
+                return false;
+            }
             if rules.denied(p, Rights::READ).is_some() {
                 return false;
             }
@@ -551,6 +589,12 @@ impl Engine {
                 let write = matches!(req, Request::Write { .. });
                 let path = resolve(&parse_device_path(p)?)?;
                 let right = if write { Rights::WRITE } else { Rights::READ };
+                if self.sealed(&path) {
+                    return Ok(Verdict::Deny(format!(
+                        "{} holds the device's own secret and stays on the device",
+                        path.display()
+                    )));
+                }
                 if let Some(r) = rules.denied(&path, right) {
                     return Ok(Verdict::Deny(format!(
                         "{} is denied on this device (rule {} {})",
@@ -607,6 +651,7 @@ impl Engine {
                     path,
                     root,
                     confine: Confine::None,
+                    elevate: None,
                 }
             }
             Request::Exec { command, cwd } => {
@@ -623,6 +668,15 @@ impl Engine {
                     return Ok(Verdict::Deny(why));
                 }
                 let never_ask = rules.never_ask(command);
+                let elevate = match (policy.privilege.elevation, elevated_command(command)) {
+                    (Elevation::Sudo, Some(rest)) if rest.starts_with('-') || rest.is_empty() => {
+                        return Ok(Verdict::Deny(
+                            "elevated commands are `sudo <command>`, run as root; sudo's own options are not taken".into(),
+                        ));
+                    }
+                    (Elevation::Sudo, Some(_)) => Some(policy.privilege.sudo_path.clone()),
+                    _ => None,
+                };
                 let mut asks = Vec::new();
                 let mut confine = Confine::None;
                 match mode {
@@ -642,10 +696,18 @@ impl Engine {
                         }
                         match policy.folders_shell {
                             FoldersShell::Landlock if self.landlock => {
+                                let mut denied = rules.denied_paths();
+                                denied.extend(
+                                    self.sealed
+                                        .get()
+                                        .into_iter()
+                                        .flatten()
+                                        .map(|p| (p.clone(), Rights::ALL)),
+                                );
                                 confine = Confine::Landlock(landlock_rules(
                                     &grants,
                                     &snap.protected,
-                                    &rules.denied_paths(),
+                                    &denied,
                                 ));
                             }
                             FoldersShell::Landlock => asks.push(
@@ -669,6 +731,11 @@ impl Engine {
                         }
                     }
                 }
+                // Root's commands ask in every mode; only the owner's never-ask list
+                // lifts that, command by command.
+                if elevate.is_some() {
+                    asks.push("the command runs as root through sudo".to_string());
+                }
                 // The owner's never-ask list skips the mode's and the patterns'
                 // questions; the confinement above and the taint question stay.
                 if !never_ask {
@@ -680,10 +747,16 @@ impl Engine {
                 if taint_prompts {
                     reasons.push("this chat has seen untrusted content".to_string());
                 }
+                if elevate.is_some() && confine != Confine::None {
+                    return Ok(Verdict::Deny(
+                        "sudo cannot run under Landlock (no_new_privs); elevated commands need folders_shell = unconfined or Full mode".into(),
+                    ));
+                }
                 Permit {
                     path: cwd,
                     root: None,
                     confine,
+                    elevate,
                 }
             }
         };
@@ -697,6 +770,14 @@ impl Engine {
             }
         })
     }
+}
+
+/// The command after a leading `sudo `, which the device runs elevated.
+pub fn elevated_command(command: &str) -> Option<&str> {
+    let c = command.trim_start();
+    c.strip_prefix("sudo")
+        .filter(|r| r.starts_with([' ', '\t']))
+        .map(str::trim_start)
 }
 
 /// Grants with their paths resolved; a folder that does not exist grants nothing.

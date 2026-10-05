@@ -78,6 +78,7 @@ fn sub_permit(base: &Permit, path: PathBuf) -> Permit {
         path,
         root: base.root.clone(),
         confine: base.confine.clone(),
+        elevate: None,
     }
 }
 

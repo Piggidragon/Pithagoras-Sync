@@ -39,6 +39,78 @@ impl Drop for Secret {
     }
 }
 
+/// Where the running client keeps the elevation secret, shared by everything that
+/// injects it or scrubs it out.
+#[derive(Default)]
+pub struct SecretSlot(std::sync::RwLock<Option<Secret>>);
+
+impl SecretSlot {
+    pub fn get(&self) -> Option<Secret> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub fn set(&self, s: Secret) {
+        *self.0.write().unwrap() = (!s.is_empty()).then_some(s);
+    }
+
+    pub fn clear(&self) {
+        *self.0.write().unwrap() = None;
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.read().unwrap().is_some()
+    }
+
+    /// `text` with the secret taken out (unchanged when none is set).
+    pub fn scrub(&self, text: &str) -> String {
+        match &*self.0.read().unwrap() {
+            Some(s) => scrub_text(text, s),
+            None => text.to_string(),
+        }
+    }
+
+    /// Bytes with the secret taken out.
+    pub fn scrub_bytes(&self, data: &[u8]) -> Vec<u8> {
+        match &*self.0.read().unwrap() {
+            Some(s) => {
+                let mut sc = Scrubber::new(s);
+                let mut out = sc.push(data);
+                out.extend(sc.finish());
+                out
+            }
+            None => data.to_vec(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretSlot(set: {})", self.is_set())
+    }
+}
+
+/// Whether a debugger (or anything else) traces this process. The secret is only
+/// taken in by a process nobody traces, after it made itself undumpable.
+#[cfg(target_os = "linux")]
+pub fn traced() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("TracerPid:"))
+                .map(|v| v.trim() != "0")
+        })
+        .unwrap_or(true)
+}
+
+/// Makes this process undumpable: other processes of the same user can no longer
+/// read its memory, attach to it or open its files through /proc.
+#[cfg(target_os = "linux")]
+pub fn undumpable() {
+    // SAFETY: prctl with integer arguments.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+}
+
 /// What replaces the secret in text that leaves the device.
 pub const REDACTED: &str = "[redacted]";
 

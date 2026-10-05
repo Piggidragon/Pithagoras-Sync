@@ -125,7 +125,15 @@ pub async fn read_request<S: AsyncRead + Unpin>(s: S) -> Result<Request, String>
         .await
         .map_err(|_| "timed out".to_string())?
         .map_err(|e| e.to_string())?;
-    serde_json::from_str(line.trim()).map_err(|e| format!("bad request: {e}"))
+    let req = serde_json::from_str(line.trim()).map_err(|e| format!("bad request: {e}"));
+    // The line may have carried the elevation secret.
+    wipe(line);
+    req
+}
+
+fn wipe(s: String) {
+    let mut b = s.into_bytes();
+    b.fill(0);
 }
 
 pub async fn write_reply<S: AsyncWrite + Unpin>(mut s: S, reply: &Reply) {
@@ -142,6 +150,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Resu
     w.write_all(text.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
+    wipe(text);
     w.flush().await.map_err(|e| e.to_string())?;
     let mut line = String::new();
     let mut r = BufReader::new(r).take(1 << 20);
