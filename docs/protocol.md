@@ -320,12 +320,12 @@ Params:
 - `id`: the approval's id from `approval.requested`.
 - `answer`: one of the request's `choices`:
   - `once`: this call only.
-  - `chat`: this call and further calls of the same kind (read, write or command) from the same chat, until the chat's grant ends or `policy.approvals.remember_minutes` run out.
+  - `chat`: this call and further calls of the same kind (reads or writes) from the same chat, until the chat's grant ends or `policy.approvals.remember_minutes` run out.
   - `time`: the same for `minutes`, from 1 to the request's `max_minutes`.
   - `deny`: refuse it; the waiting call answers `DENIED`.
 - `minutes`: only with `time`.
 
-`chat` and `time` are offered only in Ask mode, where a whole kind of call asks; a question raised by a protected path, a pattern, taint or an elevated command offers only `once` and `deny`.
+`chat` and `time` are offered only in Ask mode, for a read or a write, where a whole kind of call asks. A command offers only `once` and `deny` in every mode (a standing approval of the shell would cover any command), and so does a question raised by a protected path, a pattern, taint or an elevated command.
 
 Result: `{}`. An approval that is not waiting (answered, timed out, withdrawn, unknown) is `NOT_FOUND`; an answer not in `choices`, or wrong `minutes`, is `INVALID_PARAMS`. The first answer wins, from wherever it comes (the portal, the local `approve` and `deny`, a desktop notification); the waiting call's response follows.
 

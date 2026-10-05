@@ -13,7 +13,7 @@ Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) po
 
 You decide on the device, never the portal:
 
-- **Ask** (the default everywhere): every call asks for your approval. The question shows up in the portal's Devices tab, where you answer Allow once, Allow for this chat, Allow for a time, or Deny; or on the device with `pithagoras-sync approvals`, `approve <id>` and `deny <id>`. Nobody answering within 2 minutes is a denial.
+- **Ask** (the default everywhere): every call asks for your approval. The question shows up in the portal's Devices tab, where you answer Allow once, Allow for this chat, Allow for a time, or Deny (the last two only for reads and writes: a command asks each time); or on the device with `pithagoras-sync approvals`, `approve <id>` and `deny <id>`. Nobody answering within 2 minutes is a denial.
 - **Folders**: files only inside the folders you grant, read-only unless you add `--rw`; commands only in folders you grant `--exec`. Commands run under Landlock (Linux 5.13 or newer) and can write only inside your read-write folders; without Landlock each command asks.
 - **Full**: everything your user can do. It falls back after 8 hours by default. Protected paths (`~/.ssh`, keyrings, browser profiles, shell start-up files and more) and prompts for risky commands stay on unless you turn them off.
 

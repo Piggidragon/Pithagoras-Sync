@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt;
 use zbus::zvariant::Value;
 
-use crate::approve::{Answer, ApprovalRequest, Approver, BoxFuture};
+use crate::approve::{Answer, ApprovalRequest, Approver, BoxFuture, visible};
 
 #[zbus::proxy(
     interface = "org.freedesktop.Notifications",
@@ -63,27 +63,49 @@ impl NotifyApprover {
     }
 
     fn body(&self, req: &ApprovalRequest) -> String {
+        // Control characters as visible escapes first (the text comes from the
+        // portal), then markup where the server reads it.
         let esc = |s: &str| {
+            let s = visible(s);
             if self.markup {
                 s.replace('&', "&amp;")
                     .replace('<', "&lt;")
                     .replace('>', "&gt;")
             } else {
-                s.to_string()
+                s
             }
         };
+        let target = if fits(&req.target) {
+            esc(&req.target)
+        } else {
+            format!(
+                "{}\n(too long to show here: answer with `pithagoras-sync approvals` or in the portal)",
+                esc(&clip(&req.target, MAX_TARGET))
+            )
+        };
         let mut body = format!(
-            "Chat {}\n{}\n{}",
-            esc(&req.chat),
-            esc(&clip(&req.target, 400)),
+            "Chat {}\n{target}\n{}",
+            esc(&clip(&req.chat, MAX_CHAT)),
             esc(&req.reasons.join("; "))
         );
         if let Some(p) = &req.preview {
             body.push_str("\n\n");
-            body.push_str(&esc(&clip(p, 800)));
+            // Line by line, so the preview keeps its lines but nothing else.
+            let lines: Vec<String> = clip(p, 800).lines().map(esc).collect();
+            body.push_str(&lines.join("\n"));
         }
         body
     }
+}
+
+/// Longest target a notification shows whole; a longer one offers no Allow, since
+/// the owner could not read what they allow.
+const MAX_TARGET: usize = 400;
+/// Longest chat id shown.
+const MAX_CHAT: usize = 64;
+
+fn fits(target: &str) -> bool {
+    target.chars().count() <= MAX_TARGET
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -127,9 +149,13 @@ impl Approver for NotifyApprover {
             let Ok(mut closed) = self.proxy.receive_notification_closed().await else {
                 return Answer::Deny;
             };
-            let mut keys = vec!["allow", "Allow once"];
-            if req.offer_chat {
-                keys.extend(["allow-chat", "Allow for this chat"]);
+            let allow = fits(&req.target);
+            let mut keys = Vec::new();
+            if allow {
+                keys.extend(["allow", "Allow once"]);
+                if req.offer_chat {
+                    keys.extend(["allow-chat", "Allow for this chat"]);
+                }
             }
             keys.extend(["deny", "Deny"]);
             let mut hints = HashMap::new();
@@ -165,8 +191,8 @@ impl Approver for NotifyApprover {
                             continue;
                         }
                         return match args.action_key.as_str() {
-                            "allow" => Answer::Once,
-                            "allow-chat" if req.offer_chat => Answer::ForChat,
+                            "allow" if allow => Answer::Once,
+                            "allow-chat" if allow && req.offer_chat => Answer::ForChat,
                             _ => Answer::Deny,
                         };
                     }

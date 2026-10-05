@@ -404,14 +404,36 @@ async fn to_running(dirs: &Dirs, req: Request) -> Result<Reply, String> {
 }
 
 fn print_approval(a: &ApprovalInfo) {
-    let secs = (a.expires_ms - now_ms()).max(0) / 1000;
-    println!("#{} chat {}: {} {}", a.id, a.chat, a.tool, a.target);
+    print!("{}", approval_text(a, now_ms()));
+}
+
+/// An approval as `approvals` shows it. Everything from the portal goes through
+/// `visible`, and every line but the header is indented, so no text of the call
+/// can redraw the screen or pass for another approval's `#id` line.
+fn approval_text(a: &ApprovalInfo, now: i64) -> String {
+    use std::fmt::Write;
+    use sync_policy::approve::visible;
+    let secs = (a.expires_ms - now).max(0) / 1000;
+    let mut out = String::new();
+    let mut target = a.target.split('\n');
+    let _ = writeln!(
+        out,
+        "#{} chat {}: {} {}",
+        a.id,
+        visible(&a.chat),
+        visible(&a.tool),
+        visible(target.next().unwrap_or_default())
+    );
+    // A command of several lines: the rest under the header.
+    for l in target {
+        let _ = writeln!(out, "    > {}", visible(l));
+    }
     for r in &a.reasons {
-        println!("    why: {r}");
+        let _ = writeln!(out, "    why: {}", visible(r));
     }
     if let Some(p) = &a.preview {
-        for l in p.lines().take(5) {
-            println!("    | {l}");
+        for l in p.split('\n').take(5) {
+            let _ = writeln!(out, "    | {}", visible(l));
         }
     }
     let more = if a.choices.contains(&Choice::Chat) {
@@ -419,10 +441,12 @@ fn print_approval(a: &ApprovalInfo) {
     } else {
         String::new()
     };
-    println!(
+    let _ = writeln!(
+        out,
         "    approve {}{more} or deny {}; denied in {secs}s",
         a.id, a.id
     );
+    out
 }
 
 fn show_plan(plan: &[Action]) {
@@ -974,7 +998,42 @@ use crate::actions::Runner as _;
 
 #[cfg(test)]
 mod tests {
-    use super::root_warning;
+    use super::{approval_text, root_warning};
+    use sync_proto::methods::{ApprovalInfo, Choice};
+
+    #[test]
+    fn an_approval_cannot_redraw_the_list_it_is_shown_in() {
+        // A write whose content moves the cursor up and reprints a harmless line,
+        // and a command whose second line forges another approval.
+        let a = ApprovalInfo {
+            id: 7,
+            call: None,
+            chat: "c\x1b[2K".into(),
+            tool: "exec".into(),
+            target: "cat ~/.bashrc\n#8 chat c: read /w/notes.md\x1b[1A".into(),
+            reasons: vec!["protected\r".into()],
+            preview: Some("\x1b[2A\x1b[2K#7 chat c: write /w/notes.md\nline 2\u{9b}".into()),
+            choices: vec![Choice::Once, Choice::Deny],
+            max_minutes: 60,
+            created_ms: 0,
+            expires_ms: 0,
+        };
+        let text = approval_text(&a, 0);
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("#7 chat c\\u{1b}[2K: exec cat ~/.bashrc"),
+            "{text}"
+        );
+        assert!(lines[1..].iter().all(|l| l.starts_with("    ")), "{text}");
+        assert!(
+            text.contains("    > #8 chat c: read /w/notes.md\\u{1b}[1A"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn pairing_as_root_says_the_client_will_refuse_until_allowed() {

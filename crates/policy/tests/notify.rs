@@ -16,6 +16,7 @@ use zbus::zvariant::OwnedValue;
 #[derive(Default)]
 struct Seen {
     actions: Vec<String>,
+    body: String,
     closed: Vec<u32>,
 }
 
@@ -36,12 +37,13 @@ impl FakeServer {
         _replaces_id: u32,
         _app_icon: String,
         _summary: String,
-        _body: String,
+        body: String,
         actions: Vec<String>,
         _hints: HashMap<String, OwnedValue>,
         _expire_timeout: i32,
     ) -> u32 {
         self.seen.lock().unwrap().actions = actions;
+        self.seen.lock().unwrap().body = body;
         let id = 42;
         if let Some(click) = self.click {
             let emitter = emitter.to_owned();
@@ -207,6 +209,46 @@ async fn clicks_become_answers() {
         assert_eq!(actions.contains(&"allow-chat".to_string()), offer);
         assert!(actions.contains(&"deny".to_string()));
         drop(_server);
+    }
+}
+
+#[tokio::test]
+async fn portal_text_cannot_redraw_the_notification() {
+    // Control characters arrive as visible escapes, and a target too long to show
+    // whole offers no Allow: the owner cannot allow what they cannot read.
+    let Some(bus) = private_bus() else { return };
+    for (target, allow) in [
+        ("cat x\x1b[1A\x1b[2K\u{202e}harmless".to_string(), true),
+        (format!("echo {}; rm -rf ~", "a".repeat(500)), false),
+    ] {
+        let (_server, seen) = serve(&bus, Some("allow"), &["actions", "body"]).await;
+        let conn = client(&bus).await;
+        let approver = NotifyApprover::with_connection(&conn).await.unwrap();
+        let mut req = request(false);
+        req.chat = format!("chat\x1b]0;x\x07{}", "c".repeat(200));
+        req.target = target;
+        req.preview = Some("line 1\r\x1b[2Aline 2\nline 3".into());
+        let answer = tokio::time::timeout(Duration::from_secs(5), approver.ask(&req))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen
+                .body
+                .chars()
+                .any(|c| c.is_control() && c != '\n' || c == '\u{202e}'),
+            "{:?}",
+            seen.body
+        );
+        assert!(seen.body.contains("line 2\nline 3"), "{:?}", seen.body);
+        assert!(
+            !seen.body.contains(&"c".repeat(100)),
+            "the chat id is not cut"
+        );
+        assert_eq!(seen.actions.contains(&"allow".to_string()), allow);
+        // Clicking an Allow that was not offered denies.
+        let want = if allow { Answer::Once } else { Answer::Deny };
+        assert_eq!(answer, want);
     }
 }
 
