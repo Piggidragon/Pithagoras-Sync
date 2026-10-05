@@ -212,6 +212,71 @@ pub fn utf16_with_bom(s: &str) -> Vec<u8> {
     out
 }
 
+/// A SID in its string form, `S-1-5-21-...`, from its parts.
+pub fn sid_string(authority: [u8; 6], sub_authorities: &[u32]) -> String {
+    // The authority is a 48-bit big-endian number; in practice it fits in a byte.
+    let auth = authority
+        .iter()
+        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    let mut s = format!("S-1-{auth}");
+    for sub in sub_authorities {
+        s.push_str(&format!("-{sub}"));
+    }
+    s
+}
+
+/// The SID of the user this process runs as: the logon task names its user by SID.
+/// `USERDOMAIN\USERNAME` from the environment is wrong in an ssh session, where
+/// `USERDOMAIN` is `WORKGROUP`, and Task Scheduler then refuses the task.
+#[cfg(windows)]
+pub fn current_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetSidIdentifierAuthority, GetSidSubAuthority, GetSidSubAuthorityCount,
+        GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo handle needs no closing; the token handle is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(format!(
+            "no process token: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // u64s keep the buffer aligned for TOKEN_USER.
+    let mut buf = vec![0u64; 64];
+    let mut len = 0u32;
+    // SAFETY: the buffer holds `buf.len() * 8` bytes and outlives the call.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut len,
+        )
+    };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: the token handle is ours.
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(format!("cannot read the token's user: {err}"));
+    }
+    // SAFETY: GetTokenInformation filled the buffer with a TOKEN_USER whose SID
+    // points into the same buffer; the SID functions only read it.
+    unsafe {
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let sid = user.User.Sid;
+        let auth = (*GetSidIdentifierAuthority(sid)).Value;
+        let count = *GetSidSubAuthorityCount(sid);
+        let subs: Vec<u32> = (0..u32::from(count))
+            .map(|i| *GetSidSubAuthority(sid, i))
+            .collect();
+        Ok(sid_string(auth, &subs))
+    }
+}
+
 /// `local_app_data` is `%LOCALAPPDATA%`; paths are built with `\` so the plan is the
 /// same whichever platform computes it (tests run it on Linux).
 pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Action> {
@@ -364,6 +429,18 @@ mod tests {
         let ran = fake.ran.lock().unwrap().clone();
         assert!(ran.contains(&argv(&["systemctl", "enable", "--now", UNIT_NAME])));
         assert!(ran.contains(&argv(&["systemctl", "disable", "--now", UNIT_NAME])));
+    }
+
+    #[test]
+    fn sids_in_string_form() {
+        assert_eq!(
+            sid_string(
+                [0, 0, 0, 0, 0, 5],
+                &[21, 1111111111, 2222222222, 3333333333, 1001]
+            ),
+            "S-1-5-21-1111111111-2222222222-3333333333-1001"
+        );
+        assert_eq!(sid_string([0, 0, 0, 0, 0, 16], &[12288]), "S-1-16-12288");
     }
 
     #[test]

@@ -887,11 +887,10 @@ fn install_plan(
             return Err("on Windows the client runs as a logon task of the current user; there is no --system".into());
         }
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
-        let user_id = format!(
-            "{}\\{}",
-            std::env::var("USERDOMAIN").unwrap_or_default(),
-            std::env::var("USERNAME").unwrap_or_default()
-        );
+        #[cfg(windows)]
+        let user_id = install::current_user_sid()?;
+        #[cfg(not(windows))]
+        let user_id = String::new();
         return Ok(install::windows_plan(&local, exe, &user_id));
     }
     if system {
