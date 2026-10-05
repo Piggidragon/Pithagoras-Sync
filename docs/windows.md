@@ -20,11 +20,19 @@ Phase 1 on Windows gives the same remote access as on Linux: the agent's file, s
 
 ## Folders mode: file tools only
 
-Windows has no Landlock. The default Folders shell setting (`landlock`) falls back to `prompt`, and since nobody can answer a prompt (below), **commands are denied in Folders mode**. The owner can choose `folders_shell = "unconfined"` in the config: then commands run with all of the user's rights, and Folders mode confines the file tools only. Full mode runs commands as on Linux.
+Windows has no Landlock. The default Folders shell setting (`landlock`) falls back to `prompt`: **every command in Folders mode asks for approval** (below). The owner can choose `folders_shell = "unconfined"` in the config: then commands run with all of the user's rights, and Folders mode confines the file tools only. Full mode runs commands as on Linux.
 
-## Approvals: denied
+## Approvals: through the portal and the CLI
 
-The Windows client always runs with the headless profile: Ask mode does not exist, and anything that would prompt is denied. A toast notification with Allow and Deny buttons that reports the click back to a plain `.exe` needs an app identity (an AppUserModelID with a registered COM activator, or a packaged app). That was not attempted in phase 1, so it is not known whether it can work without packaging. The phase 2 GUI will have its own approval window.
+As on Linux, Ask is the default mode, and approvals go to the portal (`approval.requested`), which answers with `approval.answer`; the owner can also answer in a terminal with `pithagoras-sync approvals`, `approve <id>` and `deny <id>`, over the named pipe. The Windows client runs with the headless profile, so there are no desktop notifications: a toast with Allow and Deny buttons that reports the click back to a plain `.exe` needs an app identity (an AppUserModelID with a registered COM activator, or a packaged app), which was not attempted. The phase 2 desktop app will have its own approval window. **Unverified on Windows.**
+
+## Elevation: not built
+
+`policy.privilege.elevation = "sudo"` is Linux only. On Windows, with elevation set to `sudo`, a `sudo ...` command is denied (with it off, `sudo` is just a word of the command), and `secret set elevation` is refused; there is no UAC counterpart in phase 1. `policy.privilege.allow_root` (off by default) also covers an elevated administrator: the client refuses to start in an elevated session unless it is on.
+
+## Updates
+
+`pithagoras-sync update` works as on Linux (signed manifest, checks, version check of the new binary), except that a running `.exe` cannot be replaced: the old program is renamed to `pithagoras-sync.exe.old` first, the new one takes its name, and the `.old` file is removed by the next update. The logon task's restart on failure (every minute) starts the new version. **Unverified on Windows.**
 
 ## Who may change the policy
 
@@ -65,7 +73,8 @@ The task: a logon trigger for this user, `InteractiveToken` (runs only while the
 
 ## Not on Windows in phase 1
 
-- Ask mode and approvals (above).
+- Desktop notifications for approvals (above); approvals work through the portal and the CLI.
+- Elevation (`sudo`).
 - A sandbox for the Folders shell.
 - The ancestry check on the control channel (above).
 - A password check before policy changes.

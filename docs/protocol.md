@@ -116,6 +116,7 @@ Text frames carry one JSON-RPC 2.0 object each. No batches.
 - A frame that is not valid JSON, or that has a top-level field other than `jsonrpc`, `id`, `method` and `params`, is answered with `PARSE_ERROR` and `"id": null`. That includes a response from the portal: the device never sends requests in phase 1, so the portal never answers one.
 - A bad `id` is `INVALID_REQUEST` with `"id": null`. A `jsonrpc` other than `"2.0"` or a missing `method` is `INVALID_REQUEST` on the frame's `id` (or `null` for a notification); `params` that are not an object are `INVALID_PARAMS`.
 - The portal picks the ids. It must not reuse an id while that call is still pending.
+- When the owner stored an elevation password (section 7, `exec.start`), every text frame the device sends is scrubbed of it before it leaves: as it is and in its JSON-escaped form, replaced by `[redacted]`. So are the command output frames.
 
 ### Error codes
 
@@ -145,11 +146,12 @@ Every path is absolute and in one form on every platform: `/home/alice/x` on Lin
 Calls on behalf of a chat carry a context:
 
 ```json
-"ctx": {"chat": "<chat id>", "tainted": false}
+"ctx": {"chat": "<chat id>", "tainted": false, "tool": "edit"}
 ```
 
 - `chat`: which chat the call is for. Approvals ("for this chat") and the device's own taint are kept per chat.
 - `tainted`: the portal guard's taint flag for that chat. The device only ever adds it to its own taint; `false` cannot clear anything.
+- `tool` (optional): the pi tool the call is for, `read`, `write`, `edit`, `bash`, `grep`, `find` or `ls`. The owner can switch each tool off (`policy.tools`, see permissions.md); a call for a tool that is off is `DENIED`. The label can only narrow: it has to fit the method (`fs.read` serves `read` and `edit`, `fs.write` serves `write` and `edit`, `fs.stat` serves every tool but `bash`, `fs.list` serves `ls`, `fs.grep` serves `grep`, `fs.find` serves `find`, `exec.start` serves `bash`), and another label is `DENIED`. Without it, a call passes when any tool its method serves is on.
 - Any other field in `ctx` is refused. There is no way to send "approved", a mode, folders or protections; those exist only on the device.
 
 ## 7. Methods, portal to device
@@ -168,8 +170,9 @@ Params: `{}`. Result:
   "shell": "bash",
   "session": "wayland",
   "mode": "ask", "mode_expires_ms": null,
-  "folders": [{"path": "/home/alice/src", "access": "rw"}],
+  "folders": [{"path": "/home/alice/src", "access": "rw", "execute": true}],
   "folders_shell": "landlock",
+  "tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
   "mcp_tools": [],
   "client_version": "0.1.0"
 }
@@ -179,7 +182,9 @@ Params: `{}`. Result:
 - `session`: `headless`, `wayland`, `x11` or `windows`.
 - `mode`: the mode in force now, `ask`, `folders` or `full` (after Full's expiry, the restricted default).
 - `mode_expires_ms`: when Full ends (Unix ms); `null` when not Full or set to never.
-- `folders_shell`: how the shell runs in Folders mode: `landlock`, `prompt` (every command asks; denied headless; also what `landlock` falls back to without kernel support) or `unconfined`.
+- `folders[].execute`: commands may run in that folder in Folders mode (`folder add --exec`).
+- `folders_shell`: how the shell runs in Folders mode: `landlock`, `prompt` (every command asks; also what `landlock` falls back to without kernel support) or `unconfined`.
+- `tools`: the pi tools switched on. The portal offers the device to these tools only.
 - `mcp_tools`: always empty in phase 1.
 
 ### `device.probe`
@@ -288,11 +293,79 @@ Params:
 - Each command runs in its own process scope. On Linux a small shim between client and shell is a child subreaper, so everything the command starts stays below it; when the client runs in a systemd unit with `Delegate=yes` the command also gets its own cgroup. On Windows the scope is a Job Object. Timeout, `exec.signal`, pause and the end of the connection kill the whole scope, `setsid` and `nohup` children included.
 - At most 16 commands at once by default (`BUSY`); a `stream` already running is `INVALID_PARAMS`.
 
+Elevated commands (Linux only, and only when the owner set `policy.privilege.elevation = "sudo"`):
+
+- A command that starts with the word `sudo` runs as root: the device runs `sudo` itself and the shell under it with the rest of the command. `sudo` with options of its own (`sudo -u nobody ...`) or alone is `DENIED`; only `sudo <command>`, as root, is taken. With elevation off, `sudo` is an ordinary word of the command and runs as the user would type it.
+- The password is the one the owner typed on the device (`pithagoras-sync secret set elevation`). The device hands it to `sudo -S` on a private channel; it never appears in the command line, the environment, the command's stdin (closed before the command starts) or anything sent to the portal. Without a stored password the device runs `sudo -n`, which works with a sudoers rule that asks none and fails otherwise.
+- An elevated command always asks for approval, in every mode, unless it matches the owner's `policy.commands.never_ask` list. It needs a cgroup of its own (the systemd unit's `Delegate=yes`), so that `panic` can kill root's processes, and it is `DENIED` where the shell runs under Landlock (sudo cannot gain rights under `no_new_privs`): in Folders mode it needs `folders_shell = "unconfined"`.
+
 ### `exec.signal`
 
 Params: `{"stream": <u32>, "signal": "SIGINT" | "SIGTERM" | "SIGKILL"}`. Result: `{}`.
 
 `SIGINT` goes to the shell's process group (a Ctrl-C); `SIGTERM` reaches the whole scope, followed by `SIGKILL` after 3 s; `SIGKILL` kills it at once. On Windows every signal ends the Job Object. Other signal names are `INVALID_PARAMS`; a stream that is not running is `NOT_FOUND`.
+
+### `approval.answer`
+
+The owner's answer to an approval the device asked for (`approval.requested`, section 9), from the portal's Devices tab. Only when `hello` announced `approvals`; otherwise `METHOD_NOT_FOUND`.
+
+Params:
+
+```json
+{"id": 12, "answer": "time", "minutes": 30}
+```
+
+- `id`: the approval's id from `approval.requested`.
+- `answer`: one of the request's `choices`:
+  - `once`: this call only.
+  - `chat`: this call and further calls of the same kind (read, write or command) from the same chat, until the chat's grant ends or `policy.approvals.remember_minutes` run out.
+  - `time`: the same for `minutes`, from 1 to the request's `max_minutes`.
+  - `deny`: refuse it; the waiting call answers `DENIED`.
+- `minutes`: only with `time`.
+
+`chat` and `time` are offered only in Ask mode, where a whole kind of call asks; a question raised by a protected path, a pattern, taint or an elevated command offers only `once` and `deny`.
+
+Result: `{}`. An approval that is not waiting (answered, timed out, withdrawn, unknown) is `NOT_FOUND`; an answer not in `choices`, or wrong `minutes`, is `INVALID_PARAMS`. The first answer wins, from wherever it comes (the portal, the local `approve` and `deny`, a desktop notification); the waiting call's response follows.
+
+### `approval.list`
+
+The approvals waiting now, for a Devices tab opened after they were asked. Approvals belong to the calls of the current connection: when it ends, the calls end and their approvals are withdrawn (`approval.resolved` with `by: "withdrawn"` goes nowhere then, so the portal drops them itself). Only with `approvals` in `hello`. Params: `{}`. Result: `{"approvals": [<ApprovalInfo>...]}`, each as in `approval.requested`.
+
+### `policy.get`
+
+The device's settings, for the portal's Devices tab. `hello` announces `policy` when the owner's `portal_policy` is `read` or `write`; with `off` the call is `DENIED` (a device without settings to share, such as a test device, answers `METHOD_NOT_FOUND`). Params: `{}`. Result, a PolicyDocument:
+
+```json
+{
+  "portal_policy": "read",
+  "version": "9c1f0a2b3d4e5f60",
+  "settings": {"policy": {...}, "exec": {...}},
+  "device_only": ["exec.shell", "policy.privilege.sudo_path", "policy.privilege.secret_storage"]
+}
+```
+
+- `settings`: the config file's `[policy]` and `[exec]` tables, every setting with its value, in the form of docs/permissions.md. Never in it: the pairing, the profile, `portal_policy` and the elevation password.
+- `version`: a hash of `settings`; it changes whenever they do.
+- `device_only`: settings in the document that only the device changes.
+
+### `policy.set`
+
+Replaces the settings. Only with `portal_policy = "write"`, which only the owner sets, on the device.
+
+Params:
+
+```json
+{"settings": {"policy": {...}, "exec": {...}}, "if_version": "9c1f0a2b3d4e5f60"}
+```
+
+- `settings`: the whole document as `policy.get` returned it, changed. Every setting is checked as in the config file; an unknown field or a bad value is `INVALID_PARAMS`.
+- `if_version` (optional): the `version` the change is based on. When the settings changed on the device meanwhile, the answer is `CONFLICT` and nothing changes. Left out, the change replaces whatever is there.
+- With `portal_policy` `read` or `off`, `DENIED`. A change to a `device_only` setting is `DENIED` as a whole.
+- The device keeps Full mode's end time itself: switching to Full dates it from now (`policy.full.until_ms` in the document is ignored).
+
+Result: the new PolicyDocument. The device saves the config file, applies it at once and audits each changed setting with its old and new value (`"by the portal: true -> false"`); `policy.changed` follows.
+
+A portal with write access can widen everything the document holds, Full mode included. That is the owner's choice when they set `write`; the default is `read`.
 
 ### Not in phase 1
 
@@ -323,10 +396,12 @@ Backpressure: the device has a send queue of 64 frames. When the portal reads sl
 `hello`, the first frame on every connection:
 
 ```json
-{"proto": 1, "device_id": "<id>", "client_version": "0.1.0", "os": "linux", "user": "alice", "shell": "bash", "capabilities": ["fs", "grep", "find", "exec", "probe"]}
+{"proto": 1, "device_id": "<id>", "client_version": "0.1.0", "os": "linux", "user": "alice", "shell": "bash", "capabilities": ["fs", "grep", "find", "exec", "probe", "approvals", "policy"]}
 ```
 
 There is no answer to `hello`. A portal that does not speak `proto` closes with 4003.
+
+`capabilities` always holds `fs`, `grep`, `find`, `exec` and `probe`. `approvals`: the device asks the portal for approvals (`approval.requested`) and takes answers (`approval.answer`, `approval.list`); the client always announces it. `policy`: the device shares its settings (`policy.get`, `policy.changed`, and `policy.set` when `portal_policy` is `write`); absent when the owner set `portal_policy = "off"`.
 
 `exec.exit`, after the last `ExecOutput` frame of a stream:
 
@@ -342,13 +417,38 @@ There is no answer to `hello`. A portal that does not speak `proto` closes with 
 {"time_ms": 1760000000000, "chat": "<id or null>", "tool": "write", "target": "/abs/path", "decision": "denied", "reason": "protected path"}
 ```
 
-`approval.waiting`: a call waits for the owner's answer on the device, so the portal can show "waiting for approval on <device>":
+A settings change is one event per setting: `"tool": "policy"`, the setting's name in `target` (`policy.tools.bash`), `"decision": "changed"` and the old and new value in `reason` (`by the portal: true -> false`, `by the device owner: ...`).
+
+`approval.requested`: a call waits for the owner's approval. The portal shows it in the Devices tab (and next to the chat) with the choices it offers, and sends the owner's answer with `approval.answer`. The owner can also answer on the device (`pithagoras-sync approvals`, `approve <id>`, `deny <id>`).
 
 ```json
-{"id": <the call's id>, "chat": "<chat id>"}
+{
+  "id": 12, "call": 41, "chat": "<chat id>",
+  "tool": "write", "target": "/home/alice/src/app/main.rs",
+  "reasons": ["Ask mode: every call asks"],
+  "preview": "fn main() {...",
+  "choices": ["once", "chat", "time", "deny"], "max_minutes": 480,
+  "created_ms": 1760000000000, "expires_ms": 1760000120000
+}
 ```
 
-The call's response follows when the owner answers, or `DENIED` when the approval times out (120 s by default).
+- `id`: the device's number for this approval; answers name it.
+- `call`: the JSON-RPC id of the waiting call (`null` for a question that did not come from a portal call).
+- `tool`, `target`: the method's tool (`read`, `write`, `ls`, `exec`, ...) and the path or command, with the elevation password scrubbed out.
+- `reasons`: why it asks (the mode, a protected path, a command pattern, taint, an always-ask rule, an elevated command).
+- `preview`: for a write, the first 2000 characters of the new content, or "binary content, N bytes".
+- `choices`: the answers the device takes for this call (section 7, `approval.answer`). `max_minutes`: the longest `time` answer.
+- `expires_ms`: when the device stops waiting. Nobody answering by then is a denial (`DENIED`, "no answer to the approval within 120s"), unless the owner set `policy.approvals.on_timeout = "allow"`.
+
+`approval.resolved`: an approval ended, however it ended, so every view of it can close.
+
+```json
+{"id": 12, "chat": "<chat id>", "answer": "once", "minutes": null, "by": "portal"}
+```
+
+`by` is `portal` (an `approval.answer`), `device` (the local CLI), `notification` (a desktop notification), `timeout`, `pause` (`panic` denied it) or `withdrawn` (the call ended first, for instance because the portal's chat stopped it). `answer` is what the call got: `deny` for `pause` and `withdrawn`, and for `timeout` `deny` or, with `on_timeout = "allow"`, `once`.
+
+`policy.changed`: the device's settings changed, by the owner on the device or through `policy.set`. Params: the new PolicyDocument (section 7, `policy.get`). Sent only while `portal_policy` is `read` or `write`.
 
 ### Portal to device
 
@@ -375,7 +475,7 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | Command output | 16 MiB (config `exec.output_cap_bytes`) |
 | `fs.list` entries | 20 000 |
 | grep / find results | 100 / 1000 by default, 10 000 at most |
-| Approval timeout | 120 s (config `policy.approval_timeout_secs`, 1 to 3600) |
+| Approval timeout | 120 s (config `policy.approvals.timeout_secs`, 1 to 3600) |
 | Ping / dead | 20 s / 45 s |
 | Backoff | 1 s to 60 s |
 
@@ -392,10 +492,14 @@ What the architecture left open and how phase 1 decided it. Each can still chang
 7. **`unpair` does not tell the portal.** It deletes the local token and portal entry; the device stays listed in the portal until removed there. There is no revoke endpoint for the device to call.
 8. **`mcp.list` and `mcp.call` are not in phase 1.** They answer `METHOD_NOT_FOUND`; `capabilities` will announce `mcp` when they exist.
 9. **Folder access for the dedicated user** is granted with POSIX ACLs (`setfacl`); `setup --create-user` prints the commands instead of running them, since it cannot know the folders.
-10. **New folder grants are read-only** unless the owner passes `--rw`.
+10. **New folder grants are read-only, and run no commands,** unless the owner passes `--rw` and `--exec`.
 11. **The control socket lives in the state folder** (`~/.local/state/pithagoras-sync/run/control.sock`), not in `$XDG_RUNTIME_DIR`: a system unit has no runtime dir, and the CLI in the same user's login shell has to find the same socket.
 12. **Output after the shell exits is dropped.** Background processes a command leaves behind keep running until the scope is killed (timeout, signal, pause, disconnect) but their output is not forwarded.
-13. **The updater is not built.** The architecture's signed manifest (minisign) needs a release channel and a key; neither exists yet.
+13. **Updates come from a signed manifest** (`pithagoras-sync update`): `manifest.json` names the version and per target the binary's URL, size and sha256, and `manifest.json.minisig` signs it with the release key compiled into the build (`PITHAGORAS_SYNC_UPDATE_KEY`). Only a newer version is taken; the new binary must report that version before it replaces the old one in one rename, and the client restarts through its unit. An update never touches the config or the policy. There is no release channel yet: the manifest URL (`PITHAGORAS_SYNC_UPDATE_URL`) and the key are set when a release is built, and a build without a key cannot update itself. The client does not check for updates on its own.
 14. **The portal's `tainted` flag** is only ever added to the device's own taint. Taint ends with `grant.end`, or when the client restarts (taint is not persisted; the portal's flag brings it back on the next call).
-15. **"Let the portal approve" is not built.** The architecture keeps it as an opt-in per device; it needs a portal-to-device answer to `approval.waiting`, which this version does not define. Approvals happen on the device only.
-16. **The root password for `sudo`** (asked in a device dialog, handed over through `SUDO_ASKPASS`) needs the phase 2 GUI. In phase 1, root works by running the client as root or through a sudoers rule the owner writes; pattern prompts still catch `sudo` outside Full mode's settings.
+15. **Approvals go through the portal** (`approval.requested`, `approval.answer`), and through the local CLI, on every device and every platform. A portal that answers approvals can allow what Ask mode asks for, so a compromised portal on an Ask device is as strong as Full mode: it can allow every question, protected paths included. There is no switch yet that keeps approvals on the device only; it can come with the phase 2 window. Desktop notifications with Allow and Deny are in the code but off by default (`policy.approvals.desktop_notifications`); the device's own approval window comes back with the phase 2 GUI.
+16. **The root password for `sudo`** is typed on the device only (`pithagoras-sync secret set elevation`, a terminal prompt without echo, never an argument) and kept in the client's memory, or in a 0600 file when the owner chooses `secret_storage = "file"`. The OS keyring is not used: unlocked, it gives the password to every process of the user, as the file does, and a server has none. sudo gets it on stdin through the exec shim, which takes it from a private file descriptor only when nothing traces it. It is scrubbed from command output, every text frame, the audit log and the client's log. Not caught: base64 or other re-encodings a command prints, and the content of a file `fs.read` sends (binary frames are not scrubbed; the stored secret file itself is sealed, see 19). Elevation is Linux only; Windows has no UAC equivalent in phase 1.
+17. **Root's commands always ask.** An elevated command asks for approval in every mode, Full included, unless the owner put it on the never-ask list.
+18. **What the portal can change** is the owner's choice, `portal_policy = off | read | write`, set on the device only (default `read`). `exec.shell`, `policy.privilege.sudo_path` and `policy.privilege.secret_storage` are device-only even with `write`: a portal that could change them could make the device hand the password to a program of its choosing.
+19. **The secret file is sealed off.** The file tools refuse it in every mode, grep and find skip it, and Landlock leaves it out; an unconfined command (Full mode, or `folders_shell = "unconfined"`) of the same user can still read it, and only the output scrubbing stands between it and the portal. That is why memory is the default.
+20. **Legacy minisign signatures are accepted** besides prehashed ones: the manifest is small, and Ed25519 over the whole of it is as strong.

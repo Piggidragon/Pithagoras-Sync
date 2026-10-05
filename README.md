@@ -13,11 +13,13 @@ Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) po
 
 You decide on the device, never the portal:
 
-- **Ask** (the default on a desktop): every call asks you, through a system notification with Allow and Deny. Without a notification service, the call is denied.
-- **Folders** (the default on a server): files only inside the folders you grant, read-only unless you add `--rw`. Commands run under Landlock (Linux 5.13 or newer) and can write only inside your read-write folders.
+- **Ask** (the default everywhere): every call asks for your approval. The question shows up in the portal's Devices tab, where you answer Allow once, Allow for this chat, Allow for a time, or Deny; or on the device with `pithagoras-sync approvals`, `approve <id>` and `deny <id>`. Nobody answering within 2 minutes is a denial.
+- **Folders**: files only inside the folders you grant, read-only unless you add `--rw`; commands only in folders you grant `--exec`. Commands run under Landlock (Linux 5.13 or newer) and can write only inside your read-write folders; without Landlock each command asks.
 - **Full**: everything your user can do. It falls back after 8 hours by default. Protected paths (`~/.ssh`, keyrings, browser profiles, shell start-up files and more) and prompts for risky commands stay on unless you turn them off.
 
-`pithagoras-sync panic` stops everything at once: it closes the link and kills every command until you run `pithagoras-sync unlock`. Every decision goes to a local audit log, `~/.local/state/pithagoras-sync/audit.jsonl`.
+Every other permission is a setting too: which pi tools the device serves, paths and commands to deny, hours, approval timeouts, whether the client may run as root, whether `sudo` commands may run, and whether the portal may only read these settings (the default), change them, or not see them at all. `pithagoras-sync config get` shows them, `config set <name> <value>` changes one; [docs/permissions.md](docs/permissions.md) lists them all.
+
+`pithagoras-sync panic` stops everything at once: it closes the link and kills every command until you run `pithagoras-sync unlock`. Every decision goes to a local audit log, `~/.local/state/pithagoras-sync/audit.jsonl`, and every settings change with its old and new value.
 
 ## Linux laptop or desktop
 
@@ -44,7 +46,7 @@ You decide on the device, never the portal:
 
    ```sh
    pithagoras-sync status
-   pithagoras-sync folder add ~/src/myproject --rw
+   pithagoras-sync folder add ~/src/myproject --rw --exec
    pithagoras-sync mode folders
    ```
 
@@ -52,17 +54,18 @@ You decide on the device, never the portal:
 
 ## Linux server
 
-Run the client as an unprivileged user, ideally a dedicated one. Root works too (Proxmox containers run as root by default), and `pair` warns about it: the agent then acts with root's rights wherever the policy lets it.
+Run the client as an unprivileged user, ideally a dedicated one. Root works too (Proxmox containers run as root by default) once you allow it with `pithagoras-sync config set policy.privilege.allow_root true`: the agent then acts with root's rights wherever the policy lets it.
 
 ```sh
 sudo ./pithagoras-sync-x86_64 setup --create-user   # shows what it creates and asks first
 sudo setfacl -R -m u:pithagoras-sync:rwX /srv/project
-sudo -H -u pithagoras-sync pithagoras-sync folder add /srv/project --rw
+sudo -H -u pithagoras-sync pithagoras-sync folder add /srv/project --rw --exec
+sudo -H -u pithagoras-sync pithagoras-sync mode folders
 sudo -H -u pithagoras-sync pithagoras-sync pair '<uri from the portal>'
 sudo systemctl start pithagoras-sync
 ```
 
-`setup --create-user` creates the user with a locked password and installs the program to `/usr/local/bin` with a system unit; `sudo pithagoras-sync setup --remove` undoes it. For an existing user, use `sudo pithagoras-sync install --system --user <name>`; as your own user without root, use `pithagoras-sync install`, which turns on lingering so the unit runs without a login. Nobody can answer a prompt on a server, so there is no Ask mode there: anything that would prompt is denied.
+`setup --create-user` creates the user with a locked password and installs the program to `/usr/local/bin` with a system unit; `sudo pithagoras-sync setup --remove` undoes it. For an existing user, use `sudo pithagoras-sync install --system --user <name>`; as your own user without root, use `pithagoras-sync install`, which turns on lingering so the unit runs without a login. Approvals work on a server as anywhere else, through the portal or `pithagoras-sync approve` over ssh.
 
 ## Windows
 
@@ -73,7 +76,27 @@ Download `pithagoras-sync.exe`, then in PowerShell:
 .\pithagoras-sync.exe install
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task; it needs no admin rights. Commands run in PowerShell. Windows has no Ask mode and no shell sandbox yet, so in Folders mode only the file tools work unless you allow an unconfined shell. Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task; it needs no admin rights. Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Details are in [docs/windows.md](docs/windows.md).
+
+## Commands as root (sudo)
+
+On Linux, the agent can run `sudo <command>` if you allow it and type your password on the device, never in the portal:
+
+```sh
+pithagoras-sync config set policy.privilege.elevation sudo
+pithagoras-sync secret set elevation    # typed here, not echoed
+```
+
+The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. Details in [docs/permissions.md](docs/permissions.md).
+
+## Updates
+
+```sh
+pithagoras-sync update --check
+pithagoras-sync update
+```
+
+`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. Your config and policy stay as they are. Until there are releases, builds have no release key and say so.
 
 ## Self-signed certificates
 
@@ -108,7 +131,9 @@ The tests use temporary folders and a mock portal. They never touch your real co
 
 ## Documentation
 
+- [docs/permissions.md](docs/permissions.md): every setting, its default, and who may change it.
 - [docs/protocol.md](docs/protocol.md): the wire protocol between portal and device, and the decisions still open.
+- [docs/testing.md](docs/testing.md): the tests, the tools for trying a client by hand, and the record of the test machine.
 - [docs/windows.md](docs/windows.md): how the Windows client differs, and what is unverified.
 
 ## Licence
