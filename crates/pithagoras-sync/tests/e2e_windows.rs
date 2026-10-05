@@ -100,6 +100,16 @@ impl Env {
     }
 }
 
+/// Whether this test runs elevated: an administrator's ssh session on Windows always
+/// is (the High mandatory level, S-1-16-12288).
+fn elevated() -> bool {
+    let out = std::process::Command::new("whoami")
+        .arg("/groups")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288")
+}
+
 async fn stop(mut child: Child) {
     child.kill().await.unwrap();
 }
@@ -139,11 +149,23 @@ async fn windows_pair_run_exec_panic_unlock() {
     let cfg = std::fs::read_to_string(env.config()).unwrap();
     assert!(cfg.contains("profile = \"headless\""), "{cfg}");
     let folder = env.root.join("home/proj");
-    env.ok(&["folder", "add", &folder.to_string_lossy(), "--rw"])
+    env.ok(&["folder", "add", &folder.to_string_lossy(), "--rw", "--exec"])
         .await;
+    env.ok(&["mode", "folders"]).await;
+    env.ok(&["config", "set", "policy.approvals.timeout_secs", "2"])
+        .await;
+    if elevated() {
+        // The client refuses an elevated session until the owner allows it.
+        let out = env.cmd(&["run"]).output().await.unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("elevated administrator"), "{err}");
+        env.ok(&["config", "set", "policy.privilege.allow_root", "true"])
+            .await;
+    }
 
-    // The default Folders shell has no Landlock on Windows, so it would prompt, and
-    // nobody can answer: commands are denied, files in the folder work.
+    // The default Folders shell has no Landlock on Windows, so it prompts, and
+    // nobody answers: commands are denied after the timeout, files in the folder work.
     let daemon = env.start();
     let dl = mock.next_device(WAIT).await.expect("the client connects");
     let shell = dl.hello["shell"].as_str().unwrap().to_string();
@@ -158,7 +180,7 @@ async fn windows_pair_run_exec_panic_unlock() {
         )
         .await
         .unwrap_err();
-    assert_eq!(e.code, sync_proto::code::DENIED);
+    assert_eq!(e.code, sync_proto::code::DENIED, "{e:?}");
     std::fs::write(env.root.join("home/proj/a.txt"), "alpha").unwrap();
     dl.call(
         "fs.read",
