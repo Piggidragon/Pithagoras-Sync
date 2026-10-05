@@ -20,6 +20,19 @@ pub const CONNECT_PATH: &str = "/sync/v1/connect";
 /// Pairing endpoint, relative to the portal's base URL.
 pub const PAIR_PATH: &str = "/sync/v1/pair";
 
+/// WebSocket close codes the portal uses to end a device's connection.
+pub mod close {
+    /// The device was removed or its token revoked: the client stops until paired
+    /// again.
+    pub const REVOKED: u16 = 4001;
+    /// Another connection of the same device took over (or this one lost the race):
+    /// the client retries with backoff.
+    pub const REPLACED: u16 = 4002;
+    /// The portal does not speak the `proto` version from `hello`: the client stops
+    /// and asks for an update.
+    pub const UNSUPPORTED: u16 = 4003;
+}
+
 /// JSON-RPC error codes. The standard ones plus the device's own range.
 pub mod code {
     pub const PARSE_ERROR: i64 = -32700;
