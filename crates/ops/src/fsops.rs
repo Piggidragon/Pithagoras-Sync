@@ -185,7 +185,9 @@ mod imp {
                 o.read(true);
             }
             OpenMode::Write => {
-                o.write(true).create(true).truncate(true);
+                // Not truncated on open: a junction swapped in would have emptied
+                // the file outside before the check below could refuse it.
+                o.write(true).create(true).truncate(false);
             }
         }
         let f = o.open(path)?;
@@ -199,6 +201,9 @@ mod imp {
             return Err(io::Error::other(
                 "the path changed under the call (a link or a way out of the folder)",
             ));
+        }
+        if mode == OpenMode::Write {
+            f.set_len(0)?;
         }
         Ok(f)
     }
