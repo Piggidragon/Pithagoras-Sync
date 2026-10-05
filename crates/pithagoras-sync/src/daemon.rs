@@ -613,11 +613,95 @@ type ControlListener = tokio::net::windows::named_pipe::NamedPipeServer;
 /// what the owner's CLI sends to it.
 #[cfg(windows)]
 fn open_control(socket: &Path) -> Result<ControlListener, String> {
-    tokio::net::windows::named_pipe::ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .create(socket)
+    let security = pipe_security::PipeSecurity::for_this_user()?;
+    let mut opts = tokio::net::windows::named_pipe::ServerOptions::new();
+    opts.first_pipe_instance(true).reject_remote_clients(true);
+    security
+        .create(&opts, socket)
         .map_err(|e| format!("no control pipe at {}: {e}", socket.display()))
+}
+
+#[cfg(windows)]
+mod pipe_security {
+    //! Who may open the control pipe. The default security of a named pipe lets
+    //! every user, anonymous logons included, open it for reading, and a reader
+    //! holding every free instance kept the owner's `panic` from getting through
+    //! ("all pipe instances are busy"). The pipe is the user's and SYSTEM's only,
+    //! and its Medium label keeps the user's own low-integrity processes (sandboxes)
+    //! from reading or writing it.
+
+    use std::ffi::c_void;
+    use std::path::Path;
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    pub struct PipeSecurity(*mut c_void);
+
+    // SAFETY: the descriptor is only read after it was built.
+    unsafe impl Send for PipeSecurity {}
+    unsafe impl Sync for PipeSecurity {}
+
+    impl PipeSecurity {
+        pub fn for_this_user() -> Result<PipeSecurity, String> {
+            let sid = crate::install::current_user_sid()?;
+            let sddl = super::control_pipe_sddl(&sid);
+            let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut sd: *mut c_void = std::ptr::null_mut();
+            // SAFETY: a NUL-terminated string in, a descriptor out that we free in Drop.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(format!(
+                    "control pipe security: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(PipeSecurity(sd))
+        }
+
+        pub fn create(
+            &self,
+            opts: &ServerOptions,
+            name: &Path,
+        ) -> std::io::Result<NamedPipeServer> {
+            let mut sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.0,
+                bInheritHandle: 0,
+            };
+            // SAFETY: `sa` and the descriptor it points to outlive the call.
+            unsafe {
+                opts.create_with_security_attributes_raw(
+                    name,
+                    (&mut sa as *mut SECURITY_ATTRIBUTES).cast(),
+                )
+            }
+        }
+    }
+
+    impl Drop for PipeSecurity {
+        fn drop(&mut self) {
+            // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+/// The control pipe's security: full access for SYSTEM and the user only (no
+/// inherited entries), and a Medium label that refuses lower integrity levels
+/// reading and writing.
+pub fn control_pipe_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})S:(ML;;NRNW;;;ME)")
 }
 
 #[cfg(windows)]
@@ -628,6 +712,12 @@ async fn serve_control(
     mut shutdown: watch::Receiver<bool>,
 ) {
     use tokio::net::windows::named_pipe::ServerOptions;
+    let security = match pipe_security::PipeSecurity::for_this_user() {
+        Ok(s) => s,
+        Err(e) => return warn!("control pipe: {e}"),
+    };
+    let mut opts = ServerOptions::new();
+    opts.reject_remote_clients(true);
     let mut server = listener;
     loop {
         tokio::select! {
@@ -635,7 +725,7 @@ async fn serve_control(
                 if r.is_err() {
                     continue;
                 }
-                let next = match ServerOptions::new().reject_remote_clients(true).create(&socket) {
+                let next = match security.create(&opts, &socket) {
                     Ok(n) => n,
                     Err(e) => return warn!("control pipe: {e}"),
                 };
@@ -646,5 +736,18 @@ async fn serve_control(
             }
             _ = until(&mut shutdown) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_control_pipe_is_the_users_alone() {
+        let sddl = super::control_pipe_sddl("S-1-5-21-1-2-3-1001");
+        // Protected (nothing inherited), no Everyone (WD) or anonymous (AN) entry.
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        assert!(!sddl.contains(";WD)") && !sddl.contains(";AN)"), "{sddl}");
+        assert!(sddl.contains("(A;;GA;;;S-1-5-21-1-2-3-1001)"), "{sddl}");
+        assert!(sddl.ends_with("S:(ML;;NRNW;;;ME)"), "{sddl}");
     }
 }

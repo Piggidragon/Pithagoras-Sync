@@ -185,10 +185,21 @@ pub async fn send(socket: &Path, req: Request) -> Result<Option<Reply>, String> 
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
-        let s = match ClientOptions::new().open(socket) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("{}: {e}", socket.display())),
+        /// Every instance is taken: the client is busy with other connections.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let s = loop {
+            match ClientOptions::new().open(socket) {
+                Ok(s) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(format!("{}: {e}", socket.display())),
+            }
         };
         exchange(s, req).await.map(Some)
     }

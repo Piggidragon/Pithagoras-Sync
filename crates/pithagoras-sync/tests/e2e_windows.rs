@@ -173,6 +173,30 @@ async fn windows_pair_run_exec_panic_unlock() {
     let status = env.status().await;
     assert_eq!(status["link"]["state"], "connected");
     assert_eq!(status["folders_shell"], "prompt");
+    // The control pipe is this user's and SYSTEM's alone: no Everyone or anonymous
+    // entry that would let another user hold its instances.
+    // Built as the client builds it from APPDATA, which the name is a hash of.
+    let pipe = sync_policy::config::Dirs {
+        config: env.home.join("AppData/Roaming").join("pithagoras-sync"),
+        state: PathBuf::new(),
+        runtime: PathBuf::new(),
+    }
+    .socket();
+    let name = pipe.file_name().unwrap().to_string_lossy().into_owned();
+    let probe = format!(
+        "$c = New-Object System.IO.Pipes.NamedPipeClientStream('.', '{name}', 'InOut'); $c.Connect(5000); $c.GetAccessControl().Sddl"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &probe])
+        .output()
+        .unwrap();
+    let sddl = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        sddl.contains("D:P(A;;FA;;;SY)"),
+        "{sddl} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!sddl.contains(";WD)") && !sddl.contains(";AN)"), "{sddl}");
     let e = dl
         .call(
             "exec.start",
