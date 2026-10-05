@@ -44,21 +44,26 @@ pub fn command_prompts(command: &str, cwd: &Path, home: &Path) -> Vec<String> {
 /// A command that names a protected path (a hint only: the shell is not confined by
 /// it, only Landlock confines the shell).
 pub fn names_protected(command: &str, protected: &Protected, home: &Path) -> Option<String> {
-    let lower = command.to_lowercase();
-    let home_l = home.to_string_lossy().to_lowercase();
-    for e in protected.entries() {
-        let e = e.to_string_lossy();
-        if lower.contains(e.as_ref()) {
-            return Some(format!("names the protected path {e}"));
+    // Windows takes either separator, so everything is compared with `/` only.
+    let norm = |s: &str| s.to_lowercase().replace('\\', "/");
+    let lower = norm(command);
+    let home_l = norm(&home.to_string_lossy());
+    for entry in protected.entries() {
+        let e = norm(&entry.to_string_lossy());
+        if lower.contains(&e) {
+            return Some(format!("names the protected path {}", entry.display()));
         }
         if let Some(rel) = e.strip_prefix(&format!("{home_l}/")) {
-            for spelled in [
-                format!("~/{rel}"),
-                format!("$home/{rel}"),
-                format!("${{home}}/{rel}"),
+            for home_var in [
+                "~",
+                "$home",
+                "${home}",
+                "$env:userprofile",
+                "${env:userprofile}",
+                "%userprofile%",
             ] {
-                if lower.contains(&spelled) {
-                    return Some(format!("names the protected path {e}"));
+                if lower.contains(&format!("{home_var}/{rel}")) {
+                    return Some(format!("names the protected path {}", entry.display()));
                 }
             }
         }
@@ -173,7 +178,27 @@ mod tests {
         let prot = Protected::new(home, &[], &ProtectedOptions::default());
         assert!(names_protected("cat ~/.ssh/id_rsa", &prot, home).is_some());
         assert!(names_protected("cat /home/u/.SSH/id_rsa", &prot, home).is_some());
-        assert!(names_protected("echo x >> $HOME/.bashrc", &prot, home).is_some());
+        assert!(names_protected("echo x >> $HOME/.gnupg/x", &prot, home).is_some());
         assert!(names_protected("cat README.md", &prot, home).is_none());
+    }
+
+    #[test]
+    fn notices_protected_paths_in_powershell_spellings() {
+        for home in ["/home/u", r"C:\Users\u"] {
+            let home = Path::new(home);
+            let prot = Protected::new(home, &[], &ProtectedOptions::default());
+            for cmd in [
+                r"Get-Content ~\.ssh\id_ed25519",
+                r"type $env:USERPROFILE\.ssh\id_rsa",
+                r"Get-Content ${env:UserProfile}/.ssh/config",
+                r"type %USERPROFILE%\.ssh\id_rsa",
+                r"cat $HOME\.SSH\id_rsa",
+            ] {
+                assert!(names_protected(cmd, &prot, home).is_some(), "{cmd}");
+            }
+            let full = format!(r"type {}\.ssh\id_rsa", home.display());
+            assert!(names_protected(&full, &prot, home).is_some(), "{full}");
+            assert!(names_protected(r"type .\README.md", &prot, home).is_none());
+        }
     }
 }
