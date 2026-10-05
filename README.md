@@ -7,7 +7,7 @@ Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) po
 ## Platforms
 
 - **Linux** (x86_64): one static binary, for desktops and servers, started as a systemd user or system unit.
-- **Windows** (x86_64): the same remote access, started by a logon task. It builds and passes its checks, but has not run on Windows yet; see [docs/windows.md](docs/windows.md).
+- **Windows** (x86_64): the same remote access, started by a logon task. Tested on one Windows machine; see [docs/windows.md](docs/windows.md) for what differs and what was not tested.
 
 ## What the portal may do
 
@@ -76,7 +76,7 @@ Download `pithagoras-sync.exe`, then in PowerShell:
 .\pithagoras-sync.exe install
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task; it needs no admin rights. Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 
@@ -134,7 +134,7 @@ The tests use temporary folders and a mock portal. They never touch your real co
 - [docs/permissions.md](docs/permissions.md): every setting, its default, and who may change it.
 - [docs/protocol.md](docs/protocol.md): the wire protocol between portal and device, and the decisions still open.
 - [docs/testing.md](docs/testing.md): the tests, the tools for trying a client by hand, and the record of the test machine.
-- [docs/windows.md](docs/windows.md): how the Windows client differs, and what is unverified.
+- [docs/windows.md](docs/windows.md): how the Windows client differs, what was tested and what was not.
 
 ## Licence
 

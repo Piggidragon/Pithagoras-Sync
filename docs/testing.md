@@ -104,3 +104,46 @@ pithagoras-sync install --system
 ### Cleanup
 
 The units were uninstalled, `elevtest` and its sudoers file removed, the mock stopped, and `/opt/pst`, root's test files and configs deleted.
+
+## Windows
+
+A Windows test VM (Windows 10.0.26300, Windows PowerShell 5.1, no `pwsh`, OpenSSH server, an administrator account, so every ssh session was elevated). Nothing was installed on it: no Rust, no build tools. Everything was cross-built on Linux with `cargo-xwin` and copied over. Run on 2026-10-05, phase 1.
+
+### The test suite
+
+```sh
+scripts/windows-vm-test.sh <user>@<windows host>
+```
+
+It builds the client and every test program for `x86_64-pc-windows-msvc`, copies them to a fresh folder in the user's home, runs each there and removes the folder. All 19 test programs passed. The Windows-only ones:
+
+- `crates/ops/tests/files_windows.rs`: a junction swapped in under a granted folder fails read, stat, write and list, and the file outside is not truncated; short names and case reach the same file.
+- `crates/ops/tests/exec.rs`: PowerShell output is plain UTF-8 text (no CLIXML, no OEM code page), the command has no console window, the exit code arrives.
+- `crates/pithagoras-sync/tests/e2e_windows.rs`: the real client against the mock portal: refused when elevated until `allow_root`, the control pipe's security, Folders mode prompting, the file tools, an unconfined shell, `panic` and a killed client both ending a `Start-Process` child, `unlock`.
+- `crates/pithagoras-sync/tests/update_windows.rs`: a release from a `C:\` manifest path replaces a running program, which goes aside to `.old`.
+
+Found this way and fixed: the program needed `VCRUNTIME140.dll`, which a fresh Windows lacks (it now links the C runtime statically, `.cargo/config.toml`; the script refuses a build that imports it); every config failed validation on Windows (`sudo_path` judged as a Windows path); a junction swapped in after the check could empty a file outside the folder; PowerShell errors arrived as CLIXML and non-ASCII output in code page 850; the protected-path check missed `\` and the PowerShell home variables; `update` looked for a local release's binary in the working directory.
+
+### By hand, against the mock portal
+
+The client ran with its own profile (`USERPROFILE`, `APPDATA` and `LOCALAPPDATA` pointed to a test folder), the mock portal ran on the Linux machine, and the VM reached it through `ssh -N -R 18080:127.0.0.1:18080 <vm>`, so the portal URL was `http://127.0.0.1:18080` there.
+
+- Paths sent as the portal sends them: case-insensitive matches, an 8.3 name and `sub/../a.txt` inside the folder worked. `C:\`, `c:/`, `//localhost/c$`, `//?/C:`, `a.txt:hidden`, `a.txt::$DATA`, `CON`, `nul.txt` and a trailing dot were `BAD_PATH`; paths outside the folder, a junction and a symlink to outside were `DENIED`; a symlink to `\\localhost\c$` was `BAD_PATH`.
+- Commands: Folders mode asked for each; approved, they ran. Timeout, `exec.signal`, the mock's `close` and `panic` each ended a hidden `Start-Process` child. The mock's `close` was followed by a reconnect within a second; `panic` closed the link with 1000 and `unlock` reconnected.
+- A process started through WMI (`Win32_Process.Create`) survived `panic`: the job does not reach it.
+- With `folders_shell = "unconfined"`, a command read `~\.ssh\id_ed25519` and wrote outside the folder once approved: Folders mode does not confine commands on Windows.
+- The control pipe: before the fix, a Low-integrity copy of PowerShell (`icacls /setintegritylevel low`) could connect for reading and held every instance, so `panic` failed with "all pipe instances are busy". After it, that process was refused in every direction. A second Windows user was not available, so another account was not tried.
+
+### Start at logon
+
+`pithagoras-sync install` (the real task name, "Pithagoras Sync"; there was none before):
+
+- The task was created and started; the client ran in the user's session (2), at Medium integrity, without a console window, and the CLI in the elevated ssh session reached it over the pipe.
+- `install` again while it ran: it ended the task's client, replaced the program (the running copy went to `.old`) and started it again.
+- Killed with `taskkill /f`, the client stayed down with Task Scheduler's restart on failure alone (more than 2 minutes); with the minute trigger it was back after 10 seconds.
+- `uninstall` ended the client and deleted the task and its definition.
+- Not tested: a real logoff and logon, since the VM offers no way to log on again without its password, and whether a console window flashes then.
+
+### Cleanup
+
+The task was deleted, the client stopped, and the test folders, the client's folders under `%APPDATA%` and `%LOCALAPPDATA%` and the installed program removed from the VM.
