@@ -376,3 +376,30 @@ async fn refuses_to_run_without_its_control_socket() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_change_on_a_desktop_makes_a_desktop_config() {
+    // `folder add` before `pair` on a desktop must not write a headless config,
+    // and on a desktop it needs the owner's password in a terminal (none here).
+    let env = Env::new();
+    let out = env
+        .cmd(&["folder", "add", &env.p("home/proj")])
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("terminal"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!env.config().exists());
+    let out = env
+        .cmd(&["mode"])
+        .env("WAYLAND_DISPLAY", "wayland-0")
+        .output()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("ask"));
+}

@@ -82,8 +82,8 @@ pub fn next_steps(name: &str) -> String {
   1. Grant folders (ACLs; the user needs x on every parent folder too):
        sudo setfacl -R -m u:{name}:rwX /path/to/project
        sudo setfacl -R -d -m u:{name}:rwX /path/to/project
-       sudo -u {name} pithagoras-sync folder add /path/to/project --rw
-  2. Pair:  sudo -u {name} pithagoras-sync pair '<uri from the portal>'
+       sudo -H -u {name} pithagoras-sync folder add /path/to/project --rw
+  2. Pair:  sudo -H -u {name} pithagoras-sync pair '<uri from the portal>'
   3. Start: sudo systemctl start {UNIT_NAME}
 "
     )

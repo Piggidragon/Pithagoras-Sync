@@ -176,11 +176,26 @@ async fn reload_running(dirs: &Dirs) {
     }
 }
 
+/// The config file, or a new config for this machine when there is none yet. The
+/// profile is detected once, by whichever command writes the file first, so a
+/// `folder add` before `pair` on a desktop does not make it headless.
+fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
+    if dirs.config_file().exists() {
+        return DeviceConfig::load(&dirs.config_file());
+    }
+    let mut cfg = DeviceConfig {
+        profile: detect_profile(),
+        ..DeviceConfig::default()
+    };
+    cfg.policy.mode = Policy::default_mode(cfg.profile);
+    Ok(cfg)
+}
+
 /// Checks that the owner makes a policy change, from outside the client's own
 /// commands; returns the config to edit.
 async fn owner_edit(dirs: &Dirs) -> Result<DeviceConfig, String> {
     owner::not_from_own_command(dirs).await?;
-    let cfg = DeviceConfig::load(&dirs.config_file())?;
+    let cfg = load_config(dirs)?;
     owner::confirm(cfg.profile)?;
     Ok(cfg)
 }
@@ -292,14 +307,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             crate::daemon::run(dirs).await?;
         }
         Cmd::Pair { uri, name } => {
-            owner::not_from_own_command(&dirs).await?;
-            let existed = dirs.config_file().exists();
-            let mut cfg = DeviceConfig::load(&dirs.config_file())?;
-            if !existed {
-                cfg.profile = detect_profile();
-                cfg.policy.mode = Policy::default_mode(cfg.profile);
-            }
-            owner::confirm(cfg.profile)?;
+            let mut cfg = owner_edit(&dirs).await?;
             let name = name
                 .or_else(|| cfg.portal.as_ref().map(|p| p.name.clone()))
                 .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
@@ -411,7 +419,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Mode { mode, expiry_hours } => {
             let Some(mode) = mode else {
-                let cfg = DeviceConfig::load(&dirs.config_file())?;
+                let cfg = load_config(&dirs)?;
                 println!(
                     "{}",
                     mode_text(
