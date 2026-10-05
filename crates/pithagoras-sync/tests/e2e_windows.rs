@@ -12,7 +12,17 @@ use serde_json::{Value, json};
 use sync_testkit::{DeviceLink, MockOptions, MockPortal};
 use tokio::process::{Child, Command};
 
-const BIN: &str = env!("CARGO_BIN_EXE_pithagoras-sync");
+/// The program: next to this test when the test was copied to the VM on its own
+/// (`scripts/windows-vm-test.sh`), else where cargo built it.
+fn bin() -> PathBuf {
+    let here = std::env::current_exe().unwrap();
+    let copied = here.with_file_name("pithagoras-sync.exe");
+    if copied.exists() {
+        copied
+    } else {
+        PathBuf::from(env!("CARGO_BIN_EXE_pithagoras-sync"))
+    }
+}
 const WAIT: Duration = Duration::from_secs(20);
 
 struct Env {
@@ -44,7 +54,7 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        let mut c = Command::new(bin());
         // Not env_clear: PowerShell needs SystemRoot, PATHEXT and friends.
         c.args(args)
             .env("USERPROFILE", &self.home)

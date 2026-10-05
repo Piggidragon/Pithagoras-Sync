@@ -11,6 +11,7 @@ This file applies to every agent in this repo.
 - `crates/ops`: what a call does on the device (files, grep, find, exec with its isolation, probe, info).
 - `crates/connector`: TLS and pinning, pairing, token storage, the WebSocket client and the dispatcher that runs every call through the policy.
 - `crates/pithagoras-sync`: the binary: CLI, daemon, control socket, `install` and `setup`.
+- `docs/windows.md`: what differs on Windows and what is unverified there.
 - `crates/testkit`: the mock portal the tests talk to. The real portal side does not exist yet.
 
 The cargo feature `overlay` (phase 2: GUI, audio, hotkeys, computer use) is off; phase 1 builds without it.
@@ -38,7 +39,7 @@ All three must be clean before a commit:
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test`
 
-Release artefact: `cargo build --release --target x86_64-unknown-linux-musl -p pithagoras-sync`.
+Release artefact: `CC_x86_64_unknown_linux_musl=clang cargo build --release --target x86_64-unknown-linux-musl -p pithagoras-sync` (ring needs a C compiler for musl; clang works, so does `musl-gcc`). Windows: `cargo xwin build --release --target x86_64-pc-windows-msvc -p pithagoras-sync`, and `cargo xwin clippy --workspace --target x86_64-pc-windows-msvc --all-targets -- -D warnings` must be clean too. The Windows tests run only on a Windows machine: `scripts/windows-vm-test.sh <host>`.
 
 ## Git
 

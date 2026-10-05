@@ -94,6 +94,8 @@ cargo build --release --target x86_64-unknown-linux-musl -p pithagoras-sync    #
 cargo xwin build --release --target x86_64-pc-windows-msvc -p pithagoras-sync  # Windows, with cargo-xwin
 ```
 
+The musl build compiles ring's C parts and needs a C compiler for musl: `musl-gcc` (Debian's `musl-tools`), or clang with `CC_x86_64_unknown_linux_musl=clang`.
+
 ## Test
 
 ```sh
