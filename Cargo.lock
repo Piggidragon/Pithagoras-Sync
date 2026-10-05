@@ -893,9 +893,12 @@ dependencies = [
  "sync-ops",
  "sync-policy",
  "sync-proto",
+ "sync-testkit",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

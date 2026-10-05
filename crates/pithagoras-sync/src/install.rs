@@ -1,0 +1,411 @@
+//! `install` and `uninstall`: start the client with the machine.
+//!
+//! Linux: a systemd user unit (desktop, or a server user with lingering), or with
+//! `--system` a system unit (`User=`, or the root variant without it). Windows: a
+//! per-user logon task in Task Scheduler, not a service (session 0 has no desktop).
+
+use std::path::{Path, PathBuf};
+
+use crate::actions::{Action, argv};
+
+pub const UNIT_NAME: &str = "pithagoras-sync.service";
+pub const TASK_NAME: &str = "Pithagoras Sync";
+pub const SYSTEM_BIN: &str = "/usr/local/bin/pithagoras-sync";
+const DESCRIPTION: &str = "Pithagoras Sync: lets a Pithagoras portal's agent reach this computer";
+const DOCS: &str = "https://github.com/Piggidragon/Pithagoras-Sync";
+
+const SERVICE_BODY: &str = "Type=simple
+Restart=on-failure
+RestartSec=5
+# Each command the portal runs gets its own cgroup below this unit's, so a
+# timeout, panic or disconnect can kill all of it.
+Delegate=yes
+KillMode=control-group
+UMask=0077
+";
+
+/// The user unit. The program lives in `~/.local/bin`.
+pub fn user_unit() -> String {
+    format!(
+        "[Unit]
+Description={DESCRIPTION}
+Documentation={DOCS}
+
+[Service]
+ExecStart=%h/.local/bin/pithagoras-sync run
+{SERVICE_BODY}
+[Install]
+WantedBy=default.target
+"
+    )
+}
+
+/// The system unit, running as `user`, or as root when `user` is `None`.
+pub fn system_unit(user: Option<&str>) -> String {
+    let user_line = match user {
+        Some(u) => format!("User={u}\n"),
+        None => String::new(),
+    };
+    format!(
+        "[Unit]
+Description={DESCRIPTION}
+Documentation={DOCS}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+{user_line}ExecStart={SYSTEM_BIN} run
+{SERVICE_BODY}
+[Install]
+WantedBy=multi-user.target
+"
+    )
+}
+
+pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Action> {
+    let mut v = vec![
+        Action::Copy {
+            from: exe.to_path_buf(),
+            to: home.join(".local/bin/pithagoras-sync"),
+            mode: 0o755,
+        },
+        Action::Write {
+            path: home.join(".config/systemd/user").join(UNIT_NAME),
+            content: user_unit().into_bytes(),
+            mode: 0o644,
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "--user", "daemon-reload"]),
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "--user", "enable", "--now", UNIT_NAME]),
+        },
+    ];
+    if linger {
+        v.push(Action::Try {
+            argv: argv(&["loginctl", "enable-linger", user]),
+            hint: format!(
+                "run `sudo loginctl enable-linger {user}` so the client also runs while {user} is not logged in"
+            ),
+        });
+    }
+    v
+}
+
+pub fn user_uninstall_plan(home: &Path) -> Vec<Action> {
+    vec![
+        Action::Try {
+            argv: argv(&["systemctl", "--user", "disable", "--now", UNIT_NAME]),
+            hint: "the unit was not enabled".into(),
+        },
+        Action::Remove {
+            path: home.join(".config/systemd/user").join(UNIT_NAME),
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "--user", "daemon-reload"]),
+        },
+    ]
+}
+
+pub fn system_plan(exe: &Path, user: Option<&str>) -> Vec<Action> {
+    vec![
+        Action::Copy {
+            from: exe.to_path_buf(),
+            to: PathBuf::from(SYSTEM_BIN),
+            mode: 0o755,
+        },
+        Action::Write {
+            path: Path::new("/etc/systemd/system").join(UNIT_NAME),
+            content: system_unit(user).into_bytes(),
+            mode: 0o644,
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "daemon-reload"]),
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "enable", "--now", UNIT_NAME]),
+        },
+    ]
+}
+
+pub fn system_uninstall_plan() -> Vec<Action> {
+    vec![
+        Action::Try {
+            argv: argv(&["systemctl", "disable", "--now", UNIT_NAME]),
+            hint: "the unit was not enabled".into(),
+        },
+        Action::Remove {
+            path: Path::new("/etc/systemd/system").join(UNIT_NAME),
+        },
+        Action::Run {
+            argv: argv(&["systemctl", "daemon-reload"]),
+        },
+    ]
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// The logon task for `user_id` (`DOMAIN\user`): starts `exe run --detach` at logon
+/// with the user's normal rights, restarts it when it fails, never stops it.
+pub fn task_xml(user_id: &str, exe: &str) -> String {
+    let user = xml_escape(user_id);
+    let exe = xml_escape(exe);
+    let desc = xml_escape(DESCRIPTION);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{desc}</Description>
+    <URI>\{TASK_NAME}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>run --detach</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// schtasks reads task XML reliably as UTF-16 with a byte order mark.
+pub fn utf16_with_bom(s: &str) -> Vec<u8> {
+    let mut out = vec![0xff, 0xfe];
+    for u in s.replace('\n', "\r\n").encode_utf16() {
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
+}
+
+/// `local_app_data` is `%LOCALAPPDATA%`; paths are built with `\` so the plan is the
+/// same whichever platform computes it (tests run it on Linux).
+pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Action> {
+    let base = local_app_data.trim_end_matches('\\');
+    let target = format!(r"{base}\Programs\pithagoras-sync\pithagoras-sync.exe");
+    let xml_path = format!(r"{base}\pithagoras-sync\logon-task.xml");
+    vec![
+        Action::Copy {
+            from: exe.to_path_buf(),
+            to: PathBuf::from(&target),
+            mode: 0o755,
+        },
+        Action::Write {
+            path: PathBuf::from(&xml_path),
+            content: utf16_with_bom(&task_xml(user_id, &target)),
+            mode: 0o600,
+        },
+        Action::Run {
+            argv: argv(&[
+                "schtasks", "/Create", "/TN", TASK_NAME, "/XML", &xml_path, "/F",
+            ]),
+        },
+        Action::Try {
+            argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
+            hint: "it starts at the next logon".into(),
+        },
+    ]
+}
+
+pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
+    let base = local_app_data.trim_end_matches('\\');
+    vec![
+        Action::Try {
+            argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
+            hint: "it was not running".into(),
+        },
+        Action::Run {
+            argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
+        },
+        Action::Remove {
+            path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::{Fake, apply};
+
+    #[test]
+    fn units_run_the_client_with_delegation() {
+        let u = user_unit();
+        assert!(u.contains("ExecStart=%h/.local/bin/pithagoras-sync run"));
+        assert!(u.contains("Delegate=yes"));
+        assert!(u.contains("WantedBy=default.target"));
+        assert!(!u.contains("User="));
+        let s = system_unit(Some("pithagoras-sync"));
+        assert!(s.contains("User=pithagoras-sync\nExecStart=/usr/local/bin/pithagoras-sync run"));
+        assert!(s.contains("WantedBy=multi-user.target"));
+        // The root variant has no User= line.
+        assert!(!system_unit(None).contains("User="));
+    }
+
+    #[test]
+    fn user_install_under_a_fake_root() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("download/pithagoras-sync");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"binary").unwrap();
+        let home = Path::new("/home/someone");
+        let fake = Fake::default();
+        let plan = user_plan(home, &exe, "someone", true);
+        let hints = apply(&plan, root.path(), &fake).unwrap();
+        assert!(hints.is_empty());
+        let r = root.path();
+        assert_eq!(
+            std::fs::read(r.join("home/someone/.local/bin/pithagoras-sync")).unwrap(),
+            b"binary"
+        );
+        let unit = std::fs::read_to_string(
+            r.join("home/someone/.config/systemd/user/pithagoras-sync.service"),
+        )
+        .unwrap();
+        assert_eq!(unit, user_unit());
+        let ran = fake.ran.lock().unwrap().clone();
+        assert_eq!(ran[0], argv(&["systemctl", "--user", "daemon-reload"]));
+        assert_eq!(
+            ran[1],
+            argv(&["systemctl", "--user", "enable", "--now", UNIT_NAME])
+        );
+        assert_eq!(ran[2], argv(&["loginctl", "enable-linger", "someone"]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(r.join("home/someone/.local/bin/pithagoras-sync"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(m & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn a_failing_linger_only_gives_a_hint() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let fake = Fake {
+            answers: vec![("loginctl enable-linger".into(), Err("denied".into()))],
+            ..Fake::default()
+        };
+        let hints = apply(
+            &user_plan(Path::new("/home/u"), &exe, "u", true),
+            root.path(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("sudo loginctl enable-linger u"));
+        // A failing systemctl stops the install.
+        let fake = Fake {
+            answers: vec![("systemctl --user".into(), Err("no user manager".into()))],
+            ..Fake::default()
+        };
+        assert!(
+            apply(
+                &user_plan(Path::new("/home/u"), &exe, "u", false),
+                root.path(),
+                &fake
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn system_install_and_uninstall_under_a_fake_root() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let fake = Fake::default();
+        apply(&system_plan(&exe, Some("svc")), root.path(), &fake).unwrap();
+        let unit = root
+            .path()
+            .join("etc/systemd/system/pithagoras-sync.service");
+        assert!(std::fs::read_to_string(&unit).unwrap().contains("User=svc"));
+        assert!(root.path().join("usr/local/bin/pithagoras-sync").exists());
+        apply(&system_uninstall_plan(), root.path(), &fake).unwrap();
+        assert!(!unit.exists());
+        let ran = fake.ran.lock().unwrap().clone();
+        assert!(ran.contains(&argv(&["systemctl", "enable", "--now", UNIT_NAME])));
+        assert!(ran.contains(&argv(&["systemctl", "disable", "--now", UNIT_NAME])));
+    }
+
+    #[test]
+    fn windows_logon_task() {
+        let x = task_xml(
+            r"PC\Ann & Bob",
+            r"C:\Users\ann\AppData\Local\Programs\pithagoras-sync\pithagoras-sync.exe",
+        );
+        assert!(x.contains(r"<UserId>PC\Ann &amp; Bob</UserId>"));
+        assert!(x.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(x.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(x.contains("<Arguments>run --detach</Arguments>"));
+        assert!(x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        let bytes = utf16_with_bom("a\nb");
+        assert_eq!(
+            bytes,
+            vec![0xff, 0xfe, b'a', 0, b'\r', 0, b'\n', 0, b'b', 0]
+        );
+        let plan = windows_plan(
+            r"C:\Users\ann\AppData\Local\",
+            Path::new("pithagoras-sync.exe"),
+            r"PC\ann",
+        );
+        let Action::Run { argv: create } = &plan[2] else {
+            panic!("{plan:?}")
+        };
+        assert_eq!(
+            create,
+            &argv(&[
+                "schtasks",
+                "/Create",
+                "/TN",
+                TASK_NAME,
+                "/XML",
+                r"C:\Users\ann\AppData\Local\pithagoras-sync\logon-task.xml",
+                "/F"
+            ])
+        );
+        let Action::Copy { to, .. } = &plan[0] else {
+            panic!()
+        };
+        assert_eq!(
+            to,
+            Path::new(r"C:\Users\ann\AppData\Local\Programs\pithagoras-sync\pithagoras-sync.exe")
+        );
+    }
+}

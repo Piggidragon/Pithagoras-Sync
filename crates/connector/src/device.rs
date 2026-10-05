@@ -1,7 +1,7 @@
 //! The device as the connector serves it: policy engine, commands, and its facts.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sync_ops::{Execs, info};
 use sync_policy::paths::to_wire;
@@ -14,7 +14,7 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Device {
     pub engine: Arc<Engine>,
     pub execs: Arc<Execs>,
-    pub name: String,
+    name: RwLock<String>,
     pub home: PathBuf,
     paused: watch::Sender<bool>,
 }
@@ -25,10 +25,19 @@ impl Device {
         Arc::new(Device {
             engine,
             execs,
-            name,
+            name: RwLock::new(name),
             home,
             paused,
         })
+    }
+
+    pub fn name(&self) -> String {
+        self.name.read().unwrap().clone()
+    }
+
+    /// The owner paired again under another name.
+    pub fn set_name(&self, name: String) {
+        *self.name.write().unwrap() = name;
     }
 
     /// Panic: the engine denies everything, the link closes, and every command and
@@ -67,7 +76,7 @@ impl Device {
         let mode = self.engine.effective_mode();
         let (user, uid) = info::user();
         DeviceInfo {
-            name: self.name.clone(),
+            name: self.name(),
             os: info::os().into(),
             arch: info::arch().into(),
             os_release: info::os_release(),

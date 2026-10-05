@@ -199,6 +199,9 @@ pub struct ExecOptions {
     pub output_cap_bytes: u64,
     /// Most commands running at once.
     pub max_running: u32,
+    /// The shell the `bash` tool runs. Absent: bash (else sh) on Linux, pwsh (else
+    /// Windows PowerShell) on Windows.
+    pub shell: Option<PathBuf>,
 }
 
 impl Default for ExecOptions {
@@ -208,6 +211,7 @@ impl Default for ExecOptions {
             max_timeout_secs: 4 * 3600,
             output_cap_bytes: 16 * 1024 * 1024,
             max_running: 16,
+            shell: None,
         }
     }
 }
@@ -295,15 +299,12 @@ impl Dirs {
                 .unwrap_or_else(|| home.join(fallback))
         };
         let state = xdg("XDG_STATE_HOME", ".local/state").join("pithagoras-sync");
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .map(|p| p.join("pithagoras-sync"))
-            .unwrap_or_else(|| state.join("run"));
+        // Not under XDG_RUNTIME_DIR: a system unit has none, while the same user's
+        // login shell does, and both must find the same control socket.
         Ok(Dirs {
             config: xdg("XDG_CONFIG_HOME", ".config").join("pithagoras-sync"),
+            runtime: state.join("run"),
             state,
-            runtime,
         })
     }
 

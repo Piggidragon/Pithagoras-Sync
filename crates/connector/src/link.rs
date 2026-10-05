@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sync_policy::PortalConfig;
 use sync_proto::{CONNECT_PATH, close};
 use tokio::sync::watch;
@@ -26,7 +26,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A connection that lasted this long resets the backoff.
 const STABLE: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkState {
     Connecting,
@@ -39,7 +39,7 @@ pub enum LinkState {
     Stopped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkStatus {
     pub state: LinkState,
     pub detail: Option<String>,
