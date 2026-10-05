@@ -189,11 +189,23 @@ fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
 
 /// The new program must start and name the version the manifest promised.
 fn check_runs(path: &Path, version: &str) -> Result<(), String> {
-    let out = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("the new program does not start: {e}"))?;
+    let mut tries = 0;
+    let out = loop {
+        match std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            // A process forked by another thread while the file was open for
+            // writing holds it open until it execs: try again shortly.
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => break r.map_err(|e| format!("the new program does not start: {e}"))?,
+        }
+    };
     let said = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() || said.trim() != format!("pithagoras-sync {version}") {
         return Err(format!(

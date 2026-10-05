@@ -83,7 +83,12 @@ impl Drop for MockPortal {
 
 impl MockPortal {
     pub async fn start(opts: MockOptions) -> MockPortal {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        MockPortal::start_on(opts, 0).await
+    }
+
+    /// On a fixed loopback port (0: any free one).
+    pub async fn start_on(opts: MockOptions, port: u16) -> MockPortal {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(State {

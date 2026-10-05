@@ -1,7 +1,7 @@
 //! `install` and `uninstall`: start the client with the machine.
 //!
 //! Linux: a systemd user unit (desktop, or a server user with lingering), or with
-//! `--system` a system unit (`User=`, or the root variant without it). Windows: a
+//! `--system` a system unit (`User=` a dedicated user, or root). Windows: a
 //! per-user logon task in Task Scheduler, not a service (session 0 has no desktop).
 
 use std::path::{Path, PathBuf};
@@ -44,7 +44,9 @@ WantedBy=default.target
 pub fn system_unit(user: Option<&str>) -> String {
     let user_line = match user {
         Some(u) => format!("User={u}\n"),
-        None => String::new(),
+        // Named all the same: only with a User= line does systemd set HOME, which
+        // the client needs to find its config.
+        None => "User=root\n".to_string(),
     };
     format!(
         "[Unit]
@@ -270,8 +272,8 @@ mod tests {
         let s = system_unit(Some("pithagoras-sync"));
         assert!(s.contains("User=pithagoras-sync\nExecStart=/usr/local/bin/pithagoras-sync run"));
         assert!(s.contains("WantedBy=multi-user.target"));
-        // The root variant has no User= line.
-        assert!(!system_unit(None).contains("User="));
+        // The root variant names root, so systemd sets HOME.
+        assert!(system_unit(None).contains("User=root\nExecStart="));
     }
 
     #[test]

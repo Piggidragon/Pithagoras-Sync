@@ -331,7 +331,8 @@ fn print_status(s: &Status) {
         println!("Folders:   none");
     }
     for f in &s.folders {
-        println!("Folder:    {} ({:?})", f.path, f.access);
+        let x = if f.execute { ", exec" } else { "" };
+        println!("Folder:    {} ({:?}{x})", f.path, f.access);
     }
     println!(
         "Shell:     {} ({} in Folders mode)",
@@ -531,9 +532,13 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 paired.portal.url, paired.portal.name, paired.portal.device_id
             );
             println!("Mode: {:?}.", cfg.policy.mode);
-            if cfg.policy.mode == Mode::Folders && cfg.policy.folders.is_empty() {
+            if cfg.policy.mode == Mode::Ask {
                 println!(
-                    "Grant a folder next: pithagoras-sync folder add <path> --rw (nothing is reachable until then)."
+                    "Every call waits for your approval (in the portal, or `pithagoras-sync approve`). To let it work in folders of your choice: pithagoras-sync folder add <path> --rw --exec, then pithagoras-sync mode folders."
+                );
+            } else if cfg.policy.mode == Mode::Folders && cfg.policy.folders.is_empty() {
+                println!(
+                    "Grant a folder next: pithagoras-sync folder add <path> --rw --exec (nothing is reachable until then)."
                 );
             }
             match control::send(&dirs.socket(), Request::Reload).await {
@@ -798,7 +803,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 Ok(Some(r)) if r.ok => println!(
                     "The running client restarts with it (its unit or logon task starts it again)."
                 ),
-                _ => println!("No client is running; it starts with the new version."),
+                _ => println!(
+                    "No client of this user is running. A client run by a system unit restarts with: systemctl restart pithagoras-sync"
+                ),
             }
         }
         Cmd::Install {
@@ -895,6 +902,12 @@ fn install_plan(
             actions::System
                 .run(&actions::argv(&["getent", "passwd", u]))
                 .map_err(|_| format!("there is no user {u}"))?;
+        } else if !Dirs::from_env()
+            .and_then(|d| load_config(&d))
+            .is_ok_and(|c| c.policy.privilege.allow_root)
+        {
+            // The client would refuse to start, and the unit restart it forever.
+            return Err("the root variant runs the client as root, which it refuses until you allow it: pithagoras-sync config set policy.privilege.allow_root true (or use --user <name>)".into());
         }
         return Ok(install::system_plan(exe, user));
     }

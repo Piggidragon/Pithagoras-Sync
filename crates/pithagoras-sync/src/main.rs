@@ -11,6 +11,13 @@ fn main() -> ExitCode {
         std::process::exit(sync_ops::shim_main(&spec));
     }
     let cli = Cli::parse();
+    // The short commands die quietly when their output is cut off (`| head`), as
+    // command line tools do; the client itself keeps ignoring SIGPIPE.
+    #[cfg(unix)]
+    if !matches!(cli.cmd, Cmd::Run { .. }) {
+        // SAFETY: resets one signal's disposition before any thread starts.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let level = if cli.verbose {
         tracing::Level::DEBUG
     } else if matches!(cli.cmd, Cmd::Run { .. }) {

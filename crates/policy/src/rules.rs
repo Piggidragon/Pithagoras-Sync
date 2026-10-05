@@ -341,7 +341,8 @@ impl Hours {
 /// The system time zone's offset from UTC at `now_ms`.
 #[cfg(unix)]
 fn local_offset_ms(now_ms: i64) -> i64 {
-    let t = (now_ms / 1000) as libc::time_t;
+    // Typed by localtime_r: naming libc's time_t is deprecated on musl.
+    let t = (now_ms / 1000) as _;
     // SAFETY: localtime_r writes into the zeroed tm we own.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
