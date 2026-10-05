@@ -26,6 +26,12 @@ impl Fx {
     fn new() -> Fx {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
+        // Windows canonical paths start with `\\?\`, which grants and the wire
+        // form do not use.
+        #[cfg(windows)]
+        let root = PathBuf::from(sync_policy::paths::win::strip_verbatim(
+            &root.to_string_lossy(),
+        ));
         for d in ["home/.ssh", "home/proj/src", "outside", "state", "tmp"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -36,8 +42,9 @@ impl Fx {
         Fx { _t: t, root }
     }
 
+    /// A path as the portal sends it (`/c/...` on Windows).
     fn p(&self, rel: &str) -> String {
-        self.root.join(rel).to_string_lossy().into_owned()
+        sync_policy::paths::to_wire(&self.root.join(rel))
     }
 
     fn folders(&self, grants: &[(&str, Access)]) -> Policy {
