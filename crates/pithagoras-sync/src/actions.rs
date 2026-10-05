@@ -163,7 +163,26 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    std::fs::rename(&tmp, path)
+    #[cfg(windows)]
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // A running program cannot be replaced on Windows, but it can be renamed:
+        // it goes aside to `.old` first, as `update` does it.
+        let old = crate::update::old_path(path);
+        let _ = std::fs::remove_file(&old);
+        if std::fs::rename(path, &old).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::rename(&old, path);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Records commands instead of running them; answers from a script.

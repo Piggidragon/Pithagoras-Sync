@@ -153,8 +153,13 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The logon task for `user_id` (`DOMAIN\user`): starts `exe run --detach` at logon
-/// with the user's normal rights, restarts it when it fails, never stops it.
+/// The logon task for `user_id` (a SID): starts `exe run --detach` at logon with the
+/// user's normal rights and never stops it. Task Scheduler's restart on failure only
+/// covers a start that failed, not a program that exited with an error (a crash, or
+/// the restart after `update`). So a second trigger fires every minute (from a start
+/// in the past, so from the moment the task exists, not only after the next logon);
+/// a client still running makes it a no-op (`IgnoreNew`), and `InteractiveToken`
+/// keeps it from running while the user is logged off.
 pub fn task_xml(user_id: &str, exe: &str) -> String {
     let user = xml_escape(user_id);
     let exe = xml_escape(exe);
@@ -171,6 +176,14 @@ pub fn task_xml(user_id: &str, exe: &str) -> String {
       <Enabled>true</Enabled>
       <UserId>{user}</UserId>
     </LogonTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -284,6 +297,12 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
     let target = format!(r"{base}\Programs\pithagoras-sync\pithagoras-sync.exe");
     let xml_path = format!(r"{base}\pithagoras-sync\logon-task.xml");
     vec![
+        // A running client holds its program open, and the copy over it would fail:
+        // `install` again (to repair or update by hand) ends the task first.
+        Action::Try {
+            argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
+            hint: "it was not running".into(),
+        },
         Action::Copy {
             from: exe.to_path_buf(),
             to: PathBuf::from(&target),
@@ -339,6 +358,36 @@ mod tests {
         assert!(s.contains("WantedBy=multi-user.target"));
         // The root variant names root, so systemd sets HOME.
         assert!(system_unit(None).contains("User=root\nExecStart="));
+    }
+
+    /// `install` again while the client runs (to repair or update by hand): Windows
+    /// refuses to replace a running program, so it goes aside to `.old`.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_program_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let running = bin.join("p.exe");
+        std::fs::copy(r"C:\Windows\System32\PING.EXE", &running).unwrap();
+        let mut child = std::process::Command::new(&running)
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let new = root.path().join("new.exe");
+        std::fs::write(&new, b"new binary").unwrap();
+        let plan = [Action::Copy {
+            from: new,
+            to: PathBuf::from("bin/p.exe"),
+            mode: 0o755,
+        }];
+        let result = apply(&plan, root.path(), &Fake::default());
+        let _ = child.kill();
+        let _ = child.wait();
+        result.unwrap();
+        assert_eq!(std::fs::read(&running).unwrap(), b"new binary");
+        assert!(crate::update::old_path(&running).exists());
     }
 
     #[test]
@@ -454,6 +503,10 @@ mod tests {
         assert!(x.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(x.contains("<Arguments>run --detach</Arguments>"));
         assert!(x.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        // Started again within a minute after it exits, whatever its exit code.
+        assert!(x.contains("<TimeTrigger>"));
+        assert!(x.contains("<Repetition>\n        <Interval>PT1M</Interval>"));
+        assert!(x.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         let bytes = utf16_with_bom("a\nb");
         assert_eq!(
             bytes,
@@ -464,7 +517,11 @@ mod tests {
             Path::new("pithagoras-sync.exe"),
             r"PC\ann",
         );
-        let Action::Run { argv: create } = &plan[2] else {
+        let Action::Try { argv: end, .. } = &plan[0] else {
+            panic!("{plan:?}")
+        };
+        assert_eq!(end, &argv(&["schtasks", "/End", "/TN", TASK_NAME]));
+        let Action::Run { argv: create } = &plan[3] else {
             panic!("{plan:?}")
         };
         assert_eq!(
@@ -479,7 +536,7 @@ mod tests {
                 "/F"
             ])
         );
-        let Action::Copy { to, .. } = &plan[0] else {
+        let Action::Copy { to, .. } = &plan[1] else {
             panic!()
         };
         assert_eq!(
