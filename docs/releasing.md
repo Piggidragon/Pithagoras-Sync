@@ -40,8 +40,8 @@ The workflow refuses to run without both, and before it publishes it checks the 
 2. Tag that commit `v<version>` and push the tag:
 
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.0.1
+   git push origin v0.0.1
    ```
 
 The workflow checks that the tag is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
