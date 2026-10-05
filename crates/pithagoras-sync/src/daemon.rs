@@ -117,14 +117,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
             .map_err(|e| format!("{}: {e}", dirs.audit_file().display()))?,
     );
     if is_root() && !cfg.policy.privilege.allow_root {
-        return Err(format!(
-            "refusing to run as {}: the portal's agent would act with its rights. A dedicated user is safer (`pithagoras-sync setup --create-user`); to allow it, run `pithagoras-sync config set policy.privilege.allow_root true` as this user.",
-            if cfg!(windows) {
-                "an elevated administrator"
-            } else {
-                "root"
-            }
-        ));
+        return Err(root_refusal(cfg!(windows)));
     }
     let queue = ApprovalQueue::new(system_clock());
     #[allow(unused_mut)]
@@ -249,6 +242,25 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     device.execs.kill_all().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), control).await;
     Ok(daemon.restarting.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Why the client does not start as root (or elevated, on Windows) while
+/// `allow_root` is off, and what to do instead on that platform.
+pub fn root_refusal(windows: bool) -> String {
+    let (who, instead) = if windows {
+        (
+            "an elevated administrator",
+            "Run it without elevation: the logon task from `pithagoras-sync install` does",
+        )
+    } else {
+        (
+            "root",
+            "A dedicated user is safer (`pithagoras-sync setup --create-user`)",
+        )
+    };
+    format!(
+        "refusing to run as {who}: the portal's agent would act with its rights. {instead}; to allow it, run `pithagoras-sync config set policy.privilege.allow_root true` as this user."
+    )
 }
 
 /// Whether this process runs as root.
@@ -747,6 +759,19 @@ async fn serve_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_root_refusal_names_what_works_on_each_platform() {
+        let linux = super::root_refusal(false);
+        assert!(linux.contains("as root") && linux.contains("setup --create-user"));
+        let windows = super::root_refusal(true);
+        assert!(windows.contains("elevated administrator"), "{windows}");
+        assert!(!windows.contains("setup --create-user"), "{windows}");
+        assert!(windows.contains("pithagoras-sync install"), "{windows}");
+        for t in [linux, windows] {
+            assert!(t.contains("policy.privilege.allow_root true"), "{t}");
+        }
+    }
+
     #[test]
     fn the_control_pipe_is_the_users_alone() {
         let sddl = super::control_pipe_sddl("S-1-5-21-1-2-3-1001");
