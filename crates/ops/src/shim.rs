@@ -1,6 +1,7 @@
 //! The exec shim: a small process between the client and each command's shell.
 //!
-//! The client runs `pithagoras-sync __exec-shim <spec>` per command. On Linux the shim
+//! The client runs `pithagoras-sync __exec-shim` per command and writes the spec to
+//! its stdin. On Linux the shim
 //! makes itself a child subreaper, so whatever the command starts stays its
 //! descendant even after `setsid`, `nohup` or a double fork; it moves itself into the
 //! command's cgroup when there is one; it applies Landlock to the shell in Folders
@@ -8,8 +9,8 @@
 //! the client dies, the kernel sends the shim SIGTERM (`PR_SET_PDEATHSIG`).
 //!
 //! On Windows the client puts the shim into a Job Object before it starts anything
-//! (the shim waits for one byte on stdin), so the job holds every descendant and
-//! terminating it kills them all.
+//! (the shim waits for its spec on stdin, which comes only then), so the job holds
+//! every descendant and terminating it kills them all.
 
 use std::path::PathBuf;
 
@@ -36,16 +37,38 @@ pub struct ShimSpec {
     /// The client's pid: a shim whose parent already changed exits at once.
     pub parent: u32,
     pub cgroup: Option<PathBuf>,
+    /// The command may only run inside `cgroup` (an elevated one: the client
+    /// cannot signal root's processes, only kill their cgroup).
+    #[serde(default)]
+    pub require_cgroup: bool,
     pub landlock: Option<LandlockSpec>,
     /// The client passes the elevation secret on fd 4 for sudo's stdin.
     #[serde(default)]
     pub secret_fd: bool,
 }
 
+/// Largest spec the shim reads.
+const MAX_SPEC: u64 = 16 << 20;
+
 /// Runs the shim and returns its exit code. Must be called before any thread or
 /// async runtime starts in the process.
-pub fn shim_main(spec_json: &str) -> i32 {
-    let spec: ShimSpec = match serde_json::from_str(spec_json) {
+///
+/// The spec (JSON) comes on stdin, up to its end: in argv, the command's
+/// environment (passed-through tokens among it) would be readable by every user
+/// in `/proc/<pid>/cmdline`. On Windows the client sends it only after it has put
+/// the shim into the command's job.
+pub fn shim_main() -> i32 {
+    use std::io::Read;
+    let mut json = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(MAX_SPEC)
+        .read_to_end(&mut json)
+        .is_err()
+    {
+        return 125;
+    }
+    let spec: ShimSpec = match serde_json::from_slice(&json) {
         Ok(s) => s,
         Err(_) => return 125,
     };
@@ -254,9 +277,18 @@ mod imp {
             }
         }
         let me = std::process::id() as i32;
-        if let Some(cg) = &spec.cgroup {
-            // Best effort: without it the subreaper tree still holds everything.
-            let _ = std::fs::write(cg.join("cgroup.procs"), me.to_string());
+        // Best effort for a command of the user: without the cgroup the subreaper
+        // tree still holds everything. A root command must be in it.
+        let joined = spec
+            .cgroup
+            .as_ref()
+            .is_some_and(|cg| std::fs::write(cg.join("cgroup.procs"), me.to_string()).is_ok());
+        if spec.require_cgroup && !joined {
+            report(
+                &mut status,
+                "error elevation: could not join the command's cgroup",
+            );
+            return 126;
         }
         // Signals arrive through a signalfd, so the loop below is plain code.
         // SAFETY: building and installing a signal mask.
@@ -427,15 +459,10 @@ pub mod landlock {
 #[cfg(windows)]
 mod imp {
     use super::ShimSpec;
-    use std::io::Read;
     use std::process::{Command, Stdio};
 
     pub fn run(spec: ShimSpec) -> i32 {
-        // Wait until the client has put this process into the command's job.
-        let mut go = [0u8; 1];
-        if std::io::stdin().read_exact(&mut go).is_err() {
-            return 125;
-        }
+        // The spec came only after the client put this process into the job.
         // The shim's own console (the client starts it without a window) in UTF-8,
         // which the shell inherits: PowerShell and console programs then write UTF-8
         // instead of the OEM code page (850 on a German Windows).

@@ -8,8 +8,7 @@ fn main() -> ExitCode {
     // The exec shim is this same program; it must start before anything else
     // (no runtime, no threads) because it sets up a process tree.
     if std::env::args_os().nth(1).as_deref() == Some(sync_ops::SHIM_ARG.as_ref()) {
-        let spec = std::env::args().nth(2).unwrap_or_default();
-        std::process::exit(sync_ops::shim_main(&spec));
+        std::process::exit(sync_ops::shim_main());
     }
     let cli = Cli::parse();
     // The short commands die quietly when their output is cut off (`| head`), as

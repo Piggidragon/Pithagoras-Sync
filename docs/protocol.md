@@ -291,13 +291,15 @@ Params:
 - The answer is `{}` once the command started (or an error, and nothing else follows). Then come `ExecOutput` frames on `stream` (stdout and stderr merged, `seq` from 0), and last the `exec.exit` notification (section 9).
 - Output beyond the device's cap (16 MiB by default) is dropped; `exec.exit` says `truncated`. Output of background processes after the shell's exit is not forwarded.
 - Each command runs in its own process scope. On Linux a small shim between client and shell is a child subreaper, so everything the command starts stays below it; when the client runs in a systemd unit with `Delegate=yes` the command also gets its own cgroup. On Windows the scope is a Job Object. Timeout, `exec.signal`, pause and the end of the connection kill the whole scope, `setsid` and `nohup` children included. A process that another service starts for the command (`systemd-run --user`, a Windows scheduled task or WMI) is outside the scope.
-- At most 16 commands at once by default (`BUSY`); a `stream` already running is `INVALID_PARAMS`.
+- At most 16 commands at once by default (`BUSY`), commands still being started included; a `stream` already running or starting is `INVALID_PARAMS`.
+- A pause (`panic`) or the end of the connection while a command is being started kills it before it enters the device's table of running commands, and the call answers `DENIED`. While the device is paused no command starts.
+- The shim gets its instructions (program, working folder, environment) on its stdin, never in its command line, which every user of the machine can read.
 
 Elevated commands (Linux only, and only when the owner set `policy.privilege.elevation = "sudo"`):
 
 - A command that starts with the word `sudo` runs as root: the device runs `sudo` itself and the shell under it with the rest of the command. `sudo` with options of its own (`sudo -u nobody ...`) or alone is `DENIED`; only `sudo <command>`, as root, is taken. With elevation off, `sudo` is an ordinary word of the command and runs as the user would type it.
 - The password is the one the owner typed on the device (`pithagoras-sync secret set elevation`). The device hands it to `sudo -S` on a private channel; it never appears in the command line, the environment, the command's stdin (closed before the command starts) or anything sent to the portal. Without a stored password the device runs `sudo -n`, which works with a sudoers rule that asks none and fails otherwise.
-- An elevated command always asks for approval, in every mode, unless it matches the owner's `policy.commands.never_ask` list. It needs a cgroup of its own (the systemd unit's `Delegate=yes`), so that `panic` can kill root's processes, and it is `DENIED` where the shell runs under Landlock (sudo cannot gain rights under `no_new_privs`): in Folders mode it needs `folders_shell = "unconfined"`.
+- An elevated command always asks for approval, in every mode, unless it matches the owner's `policy.commands.never_ask` list. It needs a cgroup of its own (the systemd unit's `Delegate=yes`), so that `panic` can kill root's processes: where that cgroup cannot be made or joined, the command is `DENIED` or does not run. It is `DENIED` where the shell runs under Landlock (sudo cannot gain rights under `no_new_privs`): in Folders mode it needs `folders_shell = "unconfined"`.
 
 ### `exec.signal`
 

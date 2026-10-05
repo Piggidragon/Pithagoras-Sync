@@ -4,6 +4,8 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use sync_ops::{ExecConfig, ExecOutcome, Execs, SHIM_ARG, shim_main};
@@ -15,7 +17,7 @@ use tokio::sync::mpsc;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some(SHIM_ARG) {
-        std::process::exit(shim_main(&args[2]));
+        std::process::exit(shim_main());
     }
     run_tests(&args);
 }
@@ -42,6 +44,10 @@ fn all() -> Vec<(&'static str, Test)> {
         commands_get_their_own_cgroup,
         the_shim_dies_with_the_client,
         the_shim_takes_the_secret_only_untraced,
+        two_starts_cannot_share_a_stream_or_pass_the_limit,
+        a_panic_during_a_start_leaves_nothing_running,
+        the_environment_stays_out_of_the_command_line,
+        a_root_command_outside_its_cgroup_does_not_run,
     ]
 }
 
@@ -410,16 +416,30 @@ async fn the_shim_dies_with_the_client() {
         env: vec![],
         parent: 1,
         cgroup: None,
+        require_cgroup: false,
         landlock: None,
         secret_fd: false,
     };
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg(SHIM_ARG)
-        .arg(serde_json::to_string(&spec).unwrap())
-        .output()
-        .unwrap();
+    let out = run_shim(&serde_json::to_string(&spec).unwrap());
     assert_eq!(out.status.code(), Some(125));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
+}
+
+/// Runs the shim by hand with `spec` on its stdin, as the client starts it.
+#[cfg(target_os = "linux")]
+fn run_shim(spec: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(SHIM_ARG)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(spec.as_bytes());
+    drop(stdin);
+    child.wait_with_output().unwrap()
 }
 
 /// Runs the shim with `secret_fd`, the client's end of fd 4 answering as the client
@@ -437,6 +457,7 @@ fn shim_with_secret(dir: &Path, trace: bool) -> (i32, String, bool) {
         env: vec![],
         parent: std::process::id(),
         cgroup: None,
+        require_cgroup: false,
         landlock: None,
         secret_fd: true,
     };
@@ -444,7 +465,7 @@ fn shim_with_secret(dir: &Path, trace: bool) -> (i32, String, bool) {
     let raw = theirs.as_raw_fd();
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.arg(SHIM_ARG)
-        .arg(serde_json::to_string(&spec).unwrap())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     // SAFETY: dup2 and ptrace only, both async-signal-safe.
     unsafe {
@@ -463,6 +484,11 @@ fn shim_with_secret(dir: &Path, trace: bool) -> (i32, String, bool) {
     let mut child = cmd.spawn().unwrap();
     drop(theirs);
     let pid = child.id() as i32;
+    let mut stdin = child.stdin.take().unwrap();
+    let spec = serde_json::to_string(&spec).unwrap();
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(spec.as_bytes());
+    });
     let mut stdout = child.stdout.take().unwrap();
     let reader = std::thread::spawn(move || {
         let mut s = String::new();
@@ -500,6 +526,7 @@ fn shim_with_secret(dir: &Path, trace: bool) -> (i32, String, bool) {
         }
     };
     let ready = answer.join().unwrap();
+    feeder.join().unwrap();
     (code, reader.join().unwrap(), ready)
 }
 
@@ -512,6 +539,137 @@ async fn the_shim_takes_the_secret_only_untraced() {
     // A traced shim is never sent the secret, and runs nothing.
     let (code, out, ready) = shim_with_secret(&f.dir, true);
     assert_eq!((code, out.as_str(), ready), (126, "", false));
+}
+
+/// Two `start` calls at once (`n` of them, each on `streams[i]`), as two portal
+/// calls run on two workers; returns how many were started.
+#[cfg(target_os = "linux")]
+async fn start_at_once(e: &Arc<Execs>, f: &Fx, streams: [u32; 2], cmd: &str) -> usize {
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut calls = Vec::new();
+    for stream in streams {
+        let (e, barrier, p, cmd) = (e.clone(), barrier.clone(), permit(&f.dir), cmd.to_string());
+        calls.push(tokio::task::spawn_blocking(move || {
+            let (tx, _rx) = mpsc::channel(4);
+            barrier.wait();
+            e.start(stream, &cmd, &p, None, tx).is_ok()
+        }));
+    }
+    let mut started = 0;
+    for c in calls {
+        started += usize::from(c.await.unwrap());
+    }
+    started
+}
+
+#[cfg(target_os = "linux")]
+async fn two_starts_cannot_share_a_stream_or_pass_the_limit() {
+    // Each start is checked and counted before its shim is spawned, so neither a
+    // second command on a stream in use nor one over the limit gets in, and every
+    // command that started is in the table that panic kills from.
+    let f = fx();
+    let mut cfg = config(&f, own_env());
+    cfg.max_running = 1;
+    let e = Arc::new(Execs::new(cfg));
+    for (round, streams) in [[7, 7], [7, 8], [9, 9]].into_iter().enumerate() {
+        let m = marker(3100 + round as u32);
+        let started = start_at_once(&e, &f, streams, &format!("sleep {m}")).await;
+        assert_eq!(started, 1, "round {round}: {started} commands started");
+        assert_eq!(e.running(), 1);
+        e.kill_all().await;
+        assert!(
+            gone(&m).await,
+            "round {round}: panic left sleep {m} running"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn a_panic_during_a_start_leaves_nothing_running() {
+    // A panic that comes while a command's shim is being spawned: the command is
+    // killed when it would enter the table, and the start answers DENIED.
+    let f = fx();
+    let e = Arc::new(Execs::new(config(&f, own_env())));
+    for round in 0..5u32 {
+        let m = marker(3200 + round);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (e2, b2, p) = (e.clone(), barrier.clone(), permit(&f.dir));
+        let cmd = format!("sleep {m}");
+        let start = tokio::task::spawn_blocking(move || {
+            let (tx, _rx) = mpsc::channel(4);
+            b2.wait();
+            e2.start(8, &cmd, &p, None, tx).map(|_| ())
+        });
+        tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            std::thread::sleep(Duration::from_micros(200));
+        })
+        .await
+        .unwrap();
+        e.pause().await;
+        let r = start.await.unwrap();
+        assert!(
+            gone(&m).await,
+            "round {round}: sleep {m} outlived the panic ({r:?})"
+        );
+        assert_eq!(e.running(), 0, "round {round}: {r:?}");
+        // Paused, nothing starts; after unlock it does again.
+        let (tx, _rx) = mpsc::channel(4);
+        let err = e.start(9, "true", &permit(&f.dir), None, tx).err().unwrap();
+        assert_eq!(err.code, sync_proto::code::DENIED);
+        e.set_paused(false);
+    }
+    let (out, o) = run(&e, 9, "echo again", &permit(&f.dir), None).await;
+    assert_eq!((out.as_str(), o.code), ("again\n", Some(0)));
+}
+
+#[cfg(target_os = "linux")]
+async fn the_environment_stays_out_of_the_command_line() {
+    // A passed-through variable (a token, typically) reaches the command but no
+    // process's command line, which every user on the machine can read.
+    let f = fx();
+    let token = format!("tok-{}", marker(3301));
+    let mut env = own_env();
+    env.push(("SYNC_TEST_TOKEN".into(), token.clone()));
+    let mut cfg = config(&f, env);
+    cfg.env_passthrough = vec!["SYNC_TEST_TOKEN".into()];
+    let e = Execs::new(cfg);
+    let m = marker(3302);
+    let (tx, mut rx) = mpsc::channel(4);
+    let cmd = format!("echo \"$SYNC_TEST_TOKEN\"; sleep {m}");
+    let s = e.start(1, &cmd, &permit(&f.dir), None, tx).unwrap();
+    let first = rx.recv().await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&first).trim(), token);
+    assert!(alive(&m), "the command should still run");
+    assert!(!alive(&token), "the token is in a command line");
+    e.signal(1, Signal::Kill).await.unwrap();
+    s.outcome.await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+async fn a_root_command_outside_its_cgroup_does_not_run() {
+    // An elevated command must be in its cgroup, the only thing panic can kill
+    // root's processes by; a shim that cannot join it runs nothing.
+    let f = fx();
+    let spec = serde_json::json!({
+        "program": "/bin/sh",
+        "args": ["-c", "echo should-not-run"],
+        "cwd": f.dir,
+        "env": [],
+        "parent": std::process::id(),
+        "cgroup": f.dir.join("no-such-cgroup"),
+        "require_cgroup": true,
+        "landlock": null,
+        "secret_fd": false,
+    });
+    let out = run_shim(&spec.to_string());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
+    assert_eq!(out.status.code(), Some(126));
+    // A user's command still runs without one.
+    let mut spec = spec;
+    spec["require_cgroup"] = false.into();
+    let out = run_shim(&spec.to_string());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("should-not-run"));
 }
 
 #[cfg(windows)]

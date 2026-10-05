@@ -49,6 +49,7 @@ impl Device {
         let secrets = Arc::new(SecretSlot::default());
         engine.scrub_with(secrets.clone());
         execs.use_secrets(secrets.clone());
+        execs.set_paused(engine.is_paused());
         Arc::new(Device {
             engine,
             execs,
@@ -82,10 +83,11 @@ impl Device {
     pub async fn pause(&self) {
         self.engine.pause();
         self.paused.send_replace(true);
-        self.execs.kill_all().await;
+        self.execs.pause().await;
     }
 
     pub fn unlock(&self) {
+        self.execs.set_paused(false);
         self.engine.unlock();
         self.paused.send_replace(false);
     }

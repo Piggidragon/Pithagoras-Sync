@@ -27,6 +27,12 @@ impl CgroupBase {
         kill.then_some(CgroupBase { dir })
     }
 
+    /// A base at `dir`, for tests.
+    #[cfg(test)]
+    pub fn at(dir: PathBuf) -> CgroupBase {
+        CgroupBase { dir }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

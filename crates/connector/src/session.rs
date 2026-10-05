@@ -218,7 +218,10 @@ pub async fn run(
         }
         while tasks.try_join_next().is_some() {}
     };
-    tasks.abort_all();
+    // Waits for the calls to stop, not only asks them to: one inside the
+    // synchronous part of `exec.start` finishes that first, and the `kill_all`
+    // below then sees its command.
+    tasks.shutdown().await;
     shared.uploads.lock().unwrap().clear();
     drop(shared);
     drop(out);

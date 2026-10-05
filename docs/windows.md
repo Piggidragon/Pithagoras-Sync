@@ -15,7 +15,7 @@ Phase 1 on Windows gives the same remote access as on Linux: the agent's file, s
 
 ## Process trees: Job Objects
 
-- Each command runs under a small shim (`pithagoras-sync __exec-shim`). The client creates a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts the shim, assigns it to the job, and only then lets it go on (the shim waits for one byte on stdin). Everything the command starts itself is in the job, `Start-Process` children included.
+- Each command runs under a small shim (`pithagoras-sync __exec-shim`). The client creates a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts the shim, assigns it to the job, and only then lets it go on (the shim waits for its spec on stdin, which the client writes only after that; the spec is never in the command line). Everything the command starts itself is in the job, `Start-Process` children included.
 - Timeout, `exec.signal` (every signal), `panic` and a dropped connection terminate the job. If the client itself dies, the job handle closes and Windows kills the job. Each was tested with a hidden `Start-Process` child.
 - **What escapes the job:** a process that another service starts on the command's behalf is not the command's child and not in the job. A process started through WMI (`Win32_Process.Create`) survived `panic` (tested); a scheduled task, a service or an out-of-process COM server would do the same. Linux has the same gap for `systemd-run --user` and similar. The job ends the command; it is not a sandbox.
 - Linux's cgroups and child subreaper have no part in this; the Windows code sits behind `#[cfg(windows)]` next to them.

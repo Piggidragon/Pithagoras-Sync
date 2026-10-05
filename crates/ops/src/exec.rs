@@ -5,7 +5,7 @@
 //! A command whose shell exited may leave background processes; they keep running
 //! (as on the server) until a panic or disconnect, which kills them too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -123,8 +123,16 @@ fn send_pidfd(fd: &std::os::fd::OwnedFd, sig: i32) {
 #[derive(Default)]
 struct Table {
     running: HashMap<u32, Arc<Scope>>,
+    /// Streams whose command is being started: taken under the same lock as the
+    /// checks, so two starts cannot both pass them, and counted as running.
+    starting: HashSet<u32>,
     /// Shells that exited while their background processes live on.
     lingering: Vec<Arc<Scope>>,
+    /// Counts `kill_all`: a command whose start began before one is killed when
+    /// it would enter the table, since that `kill_all` could not see it.
+    epoch: u64,
+    /// Panic: no command starts until `unlock`.
+    paused: bool,
 }
 
 pub struct Execs {
@@ -203,6 +211,18 @@ impl Execs {
         self.table.lock().unwrap().running.len()
     }
 
+    /// Panic: kill everything, and start nothing until `unlock`. A start that
+    /// was already under way is killed when it would enter the table.
+    pub async fn pause(&self) {
+        self.set_paused(true);
+        self.kill_all().await;
+    }
+
+    /// Whether commands may start (false after `unlock`).
+    pub fn set_paused(&self, paused: bool) {
+        self.table.lock().unwrap().paused = paused;
+    }
+
     /// Starts a command the policy allowed (`permit.path` is the working folder).
     /// Output chunks go to `out`; a slow receiver slows the command down.
     pub fn start(
@@ -214,17 +234,48 @@ impl Execs {
         out: mpsc::Sender<Vec<u8>>,
     ) -> Result<Started, RpcError> {
         let cfg = self.cfg.read().unwrap().clone();
-        {
+        let epoch = {
             let mut t = self.table.lock().unwrap();
             t.lingering.retain(|s| !s.done());
-            if t.running.contains_key(&stream) {
+            if t.paused {
+                return Err(RpcError::denied("the device is paused"));
+            }
+            if t.running.contains_key(&stream) || t.starting.contains(&stream) {
                 return Err(RpcError::new(code::INVALID_PARAMS, "stream already in use"));
             }
-            if t.running.len() >= cfg.max_running {
+            if t.running.len() + t.starting.len() >= cfg.max_running {
                 return Err(RpcError::new(code::BUSY, "too many commands running"));
             }
+            t.starting.insert(stream);
+            t.epoch
+        };
+        let spawned = self.spawn_command(&cfg, stream, command, permit);
+        let mut t = self.table.lock().unwrap();
+        t.starting.remove(&stream);
+        let spawned = spawned?;
+        if t.epoch != epoch || t.paused {
+            // A panic or disconnect came while this command was being started.
+            let scope = spawned.scope.clone();
+            t.lingering.push(scope.clone());
+            drop(t);
+            tokio::spawn(async move { scope.kill(true).await });
+            return Err(RpcError::denied(
+                "the device was paused or the connection ended while the command started",
+            ));
         }
-        let timeout = timeout.unwrap_or(cfg.max_timeout).min(cfg.max_timeout);
+        t.running.insert(stream, spawned.scope.clone());
+        drop(t);
+        Ok(self.watch(&cfg, stream, spawned, timeout, out))
+    }
+
+    /// Everything of `start` from the checks to the running shim.
+    fn spawn_command(
+        &self,
+        cfg: &ExecConfig,
+        stream: u32,
+        command: &str,
+        permit: &Permit,
+    ) -> Result<Spawned, RpcError> {
         let mut env = crate::env::scrubbed(&cfg.base_env, &cfg.env_passthrough);
         let landlock = match &permit.confine {
             Confine::None => None,
@@ -251,28 +302,55 @@ impl Execs {
             None => (shell.clone(), shell_args(&shell, command), None),
             Some(sudo) => self.elevated(sudo, &shell, command)?,
         };
+        let elevated = permit.elevate.is_some();
+        #[cfg(target_os = "linux")]
+        let cgroup = match self.cgroups.as_ref().map(|c| c.create()) {
+            None => None,
+            Some(Ok(cg)) => Some(cg),
+            // Without one, panic could not stop a root command: refuse it.
+            Some(Err(e)) if elevated => {
+                return Err(RpcError::denied(format!(
+                    "an elevated command needs a cgroup of its own, and none could be made: {e}"
+                )));
+            }
+            Some(Err(_)) => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let cgroup = None;
         let spec = ShimSpec {
             args,
             program,
             cwd: permit.path.clone(),
             env,
             parent: std::process::id(),
-            #[cfg(target_os = "linux")]
-            cgroup: self.cgroups.as_ref().and_then(|c| c.create().ok()),
-            #[cfg(not(target_os = "linux"))]
-            cgroup: None,
+            cgroup,
+            require_cgroup: elevated,
             landlock,
             secret_fd: secret.is_some(),
         };
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?;
-        let spawned = spawn(&cfg, &spec_json, &spec, secret)?;
+        let spawned = spawn(cfg, spec_json, &spec, secret);
+        #[cfg(target_os = "linux")]
+        if spawned.is_err()
+            && let Some(cg) = &spec.cgroup
+        {
+            let _ = std::fs::remove_dir(cg);
+        }
+        spawned
+    }
+
+    /// Streams the output of a command in the table and takes it out at its end.
+    fn watch(
+        &self,
+        cfg: &ExecConfig,
+        stream: u32,
+        spawned: Spawned,
+        timeout: Option<Duration>,
+        out: mpsc::Sender<Vec<u8>>,
+    ) -> Started {
+        let timeout = timeout.unwrap_or(cfg.max_timeout).min(cfg.max_timeout);
         let scope = spawned.scope;
-        self.table
-            .lock()
-            .unwrap()
-            .running
-            .insert(stream, scope.clone());
         let table = self.table.clone();
         let cap = cfg.output_cap;
         let scrub = self.secret().map(|s| Scrubber::new(&s));
@@ -294,7 +372,12 @@ impl Execs {
             };
             {
                 let mut t = table.lock().unwrap();
-                t.running.remove(&stream);
+                if t.running
+                    .get(&stream)
+                    .is_some_and(|s| Arc::ptr_eq(s, &scope))
+                {
+                    t.running.remove(&stream);
+                }
                 if !scope.done() {
                     t.lingering.push(scope.clone());
                 }
@@ -304,7 +387,7 @@ impl Execs {
             o.truncated = truncated;
             o
         });
-        Ok(Started { outcome })
+        Started { outcome }
     }
 
     /// sudo running the shell as root: `sudo -k -S` with the secret on stdin (the
@@ -377,6 +460,7 @@ impl Execs {
     pub async fn kill_all(&self) {
         let scopes: Vec<Arc<Scope>> = {
             let mut t = self.table.lock().unwrap();
+            t.epoch += 1;
             let mut v: Vec<Arc<Scope>> = t.running.values().cloned().collect();
             v.append(&mut t.lingering);
             v
@@ -557,7 +641,7 @@ struct Spawned {
 #[cfg(unix)]
 fn spawn(
     cfg: &ExecConfig,
-    spec_json: &str,
+    spec_json: String,
     spec: &ShimSpec,
     secret: Option<Secret>,
 ) -> Result<Spawned, RpcError> {
@@ -575,11 +659,12 @@ fn spawn(
     };
     let sk_raw = secret_pair.as_ref().map_or(-1, |(_, c)| c.as_raw_fd());
     let mut cmd = tokio::process::Command::new(&cfg.shim_program);
+    // The spec goes on stdin, not in argv: every user can read a process's
+    // command line, and the spec holds the command's environment.
     cmd.args(&cfg.shim_args)
         .arg(SHIM_ARG)
-        .arg(spec_json)
         .env_clear()
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::from(OwnedFd::from(out_w)))
         .stderr(std::process::Stdio::from(OwnedFd::from(out_w2)))
         .kill_on_drop(false);
@@ -602,6 +687,14 @@ fn spawn(
     let mut child = cmd.spawn().map_err(io)?;
     drop(cmd);
     drop(st_w);
+    let stdin = child.stdin.take();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        // Closing stdin ends the spec; a shim that died first just misses it.
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(spec_json.as_bytes()).await;
+        }
+    });
     if let (Some((mine, theirs)), Some(secret)) = (secret_pair, secret) {
         drop(theirs);
         send_secret(mine, secret);
@@ -680,7 +773,7 @@ fn send_secret(sock: std::os::unix::net::UnixStream, secret: Secret) {
 #[cfg(windows)]
 fn spawn(
     cfg: &ExecConfig,
-    spec_json: &str,
+    spec_json: String,
     _spec: &ShimSpec,
     _secret: Option<Secret>,
 ) -> Result<Spawned, RpcError> {
@@ -694,7 +787,6 @@ fn spawn(
     let mut cmd = tokio::process::Command::new(&cfg.shim_program);
     cmd.args(&cfg.shim_args)
         .arg(SHIM_ARG)
-        .arg(spec_json)
         .env_clear()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::from(
@@ -724,8 +816,9 @@ fn spawn(
     let (tx, exited) = watch::channel(false);
     let (status_tx, status_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     tokio::spawn(async move {
-        // The shim waits for this byte, so nothing runs outside the job.
-        let _ = stdin.write_all(b"g").await;
+        // The shim waits for its spec, which comes only now that it is in the
+        // job, so nothing runs outside the job. Not in argv, as on Linux.
+        let _ = stdin.write_all(spec_json.as_bytes()).await;
         drop(stdin);
         let st = child.wait().await.ok().and_then(|s| s.code());
         let _ = status_tx.send(st.map(|c| format!("exit {c}")));
@@ -833,5 +926,44 @@ mod tests {
             assert!(!args.iter().any(|a| a == "-EncodedCommand"));
         }
         assert_eq!(shell_args(Path::new("/bin/bash"), cmd), ["-c", cmd]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_elevated_command_without_its_cgroup_is_refused() {
+        // Cgroups are on, but this command's cgroup cannot be made: a command of
+        // the user runs without it, a root one must not.
+        let tmp = tempfile::tempdir().unwrap();
+        let t = tmp.path().to_path_buf();
+        let mut e = Execs::new(ExecConfig {
+            shim_program: PathBuf::from("/bin/true"),
+            shim_args: vec![],
+            shell: Some(PathBuf::from("/bin/sh")),
+            base_env: vec![],
+            env_passthrough: vec![],
+            output_cap: 1024,
+            max_timeout: Duration::from_secs(5),
+            max_running: 4,
+            tmp_base: t.clone(),
+        });
+        e.cgroups = Some(crate::cgroup::CgroupBase::at(t.join("missing/base")));
+        let permit = Permit {
+            path: PathBuf::from("/"),
+            root: None,
+            confine: Confine::None,
+            elevate: Some(PathBuf::from("/nonexistent/sudo")),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let err = e
+            .start(1, "sudo true", &permit, None, tx)
+            .err()
+            .expect("an elevated command without its cgroup started");
+        assert_eq!(err.code, code::DENIED, "{err:?}");
+        let user = Permit {
+            elevate: None,
+            ..permit
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(e.start(2, "true", &user, None, tx).is_ok());
     }
 }
