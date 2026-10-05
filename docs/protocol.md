@@ -397,3 +397,5 @@ What the architecture left open and how phase 1 decided it. Each can still chang
 12. **Output after the shell exits is dropped.** Background processes a command leaves behind keep running until the scope is killed (timeout, signal, pause, disconnect) but their output is not forwarded.
 13. **The updater is not built.** The architecture's signed manifest (minisign) needs a release channel and a key; neither exists yet.
 14. **The portal's `tainted` flag** is only ever added to the device's own taint. Taint ends with `grant.end`, or when the client restarts (taint is not persisted; the portal's flag brings it back on the next call).
+15. **"Let the portal approve" is not built.** The architecture keeps it as an opt-in per device; it needs a portal-to-device answer to `approval.waiting`, which this version does not define. Approvals happen on the device only.
+16. **The root password for `sudo`** (asked in a device dialog, handed over through `SUDO_ASKPASS`) needs the phase 2 GUI. In phase 1, root works by running the client as root or through a sudoers rule the owner writes; pattern prompts still catch `sudo` outside Full mode's settings.
