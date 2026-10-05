@@ -9,6 +9,10 @@
 # Point it only at a disposable test machine: the tests start the real client there
 # (against a mock portal on loopback, with its folders in %TEMP%).
 #
+# An administrator's ssh session on Windows is elevated (no UAC filtering over ssh);
+# the end-to-end test then checks that the client refuses it and allows it in its own
+# config. Log in as a standard user to test the unelevated path.
+#
 # Needs cargo-xwin (`cargo install cargo-xwin`). The first build downloads the MSVC
 # CRT and Windows SDK into XWIN_CACHE_DIR; that needs XWIN_ACCEPT_LICENSE=1.
 set -euo pipefail
@@ -26,6 +30,13 @@ cd "$root"
 echo "== building for $target"
 cargo xwin build --release --target "$target" -p pithagoras-sync
 cp "$target_dir/$target/release/pithagoras-sync.exe" "$stage/"
+# A fresh Windows has no Visual C++ runtime: the program must link it statically
+# (.cargo/config.toml), or it does not start there and prints nothing.
+if command -v llvm-objdump >/dev/null &&
+  llvm-objdump -p "$stage/pithagoras-sync.exe" | grep -qi 'DLL Name: vcruntime'; then
+  echo "pithagoras-sync.exe needs VCRUNTIME140.dll; build with crt-static" >&2
+  exit 1
+fi
 cargo xwin test --no-run --target "$target" --workspace --message-format=json \
   | python3 -c '
 import json, sys
@@ -47,7 +58,7 @@ echo "== ${#tests[@]} test programs"
 
 # Through powershell explicitly, so the remote default shell does not matter.
 remote_ps() {
-  ssh "$host" "powershell -NoProfile -NonInteractive -Command \"$1\""
+  ssh -o BatchMode=yes "$host" "powershell -NoProfile -NonInteractive -Command \"$1\""
 }
 
 echo "== copying to $host:$remote"
@@ -56,8 +67,13 @@ scp -q -r "$stage" "$host:$remote"
 failed=()
 for t in "${tests[@]}"; do
   echo "== $t"
-  # One thread: the end-to-end tests start clients and commands of their own.
-  if ! ssh "$host" ".\\$remote\\$t --test-threads=1 $filter"; then
+  # One thread: the end-to-end tests start clients and commands of their own. The
+  # path works in cmd and in PowerShell, whichever is the remote default shell.
+  rc=0
+  ssh -o BatchMode=yes "$host" ".\\$remote\\$t --test-threads=1 $filter" || rc=$?
+  if ((rc)); then
+    # ssh passes on the low byte of the exit code: 53 is 0xC0000135, a DLL missing.
+    ((rc == 53)) && echo "exit 53: probably STATUS_DLL_NOT_FOUND (0xC0000135)"
     failed+=("$t")
   fi
 done
