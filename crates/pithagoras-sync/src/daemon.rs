@@ -2,7 +2,7 @@
 //! engine and the command runner, keeps the link to the portal, and answers the
 //! control channel.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +58,9 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
     if cfg.policy.date_full(now_ms()) {
         cfg.save(&dirs.config_file())?;
     }
+    // Without its control channel `panic` could not reach the client, so it does not
+    // start at all.
+    let listener = open_control(&socket)?;
     let home = info::home().ok_or("cannot find the home directory")?;
     let audit = Arc::new(
         AuditLog::open(&dirs.audit_file())
@@ -126,7 +129,12 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
         approvals,
     });
     let (shutdown_tx, shutdown) = watch::channel(false);
-    let control = tokio::spawn(serve_control(daemon.clone(), socket, shutdown.clone()));
+    let control = tokio::spawn(serve_control(
+        daemon.clone(),
+        listener,
+        socket,
+        shutdown.clone(),
+    ));
     let supervisor = tokio::spawn(supervise(
         daemon.clone(),
         relink_rx,
@@ -350,23 +358,31 @@ async fn handle_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 }
 
 #[cfg(unix)]
-async fn serve_control(d: Arc<Daemon>, socket: PathBuf, mut shutdown: watch::Receiver<bool>) {
-    use tokio::net::UnixListener;
-    if let Some(dir) = socket.parent()
-        && let Err(e) = sync_policy::private::private_dir(dir)
-    {
-        return warn!("no control socket: {}: {e}", dir.display());
+type ControlListener = tokio::net::UnixListener;
+
+#[cfg(unix)]
+fn open_control(socket: &Path) -> Result<ControlListener, String> {
+    let fail =
+        |e: &dyn std::fmt::Display| format!("no control socket at {}: {e}", socket.display());
+    if let Some(dir) = socket.parent() {
+        sync_policy::private::private_dir(dir).map_err(|e| fail(&e))?;
     }
     // No client answered on it (checked at start), so a socket file there is stale.
-    let _ = std::fs::remove_file(&socket);
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) => return warn!("no control socket at {}: {e}", socket.display()),
-    };
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = std::fs::remove_file(socket);
+    let listener = tokio::net::UnixListener::bind(socket).map_err(|e| fail(&e))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| fail(&e))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+async fn serve_control(
+    d: Arc<Daemon>,
+    listener: ControlListener,
+    socket: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) {
     // SAFETY: geteuid cannot fail.
     let me = unsafe { libc::geteuid() };
     loop {
@@ -390,16 +406,29 @@ async fn serve_control(d: Arc<Daemon>, socket: PathBuf, mut shutdown: watch::Rec
 }
 
 #[cfg(windows)]
-async fn serve_control(d: Arc<Daemon>, socket: PathBuf, mut shutdown: watch::Receiver<bool>) {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let mut server = match ServerOptions::new()
+type ControlListener = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// The first instance of the pipe. Failing when the name exists means a program
+/// that took the name first can stop the client from starting, but never receive
+/// what the owner's CLI sends to it.
+#[cfg(windows)]
+fn open_control(socket: &Path) -> Result<ControlListener, String> {
+    tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true)
         .reject_remote_clients(true)
-        .create(&socket)
-    {
-        Ok(s) => s,
-        Err(e) => return warn!("no control pipe at {}: {e}", socket.display()),
-    };
+        .create(socket)
+        .map_err(|e| format!("no control pipe at {}: {e}", socket.display()))
+}
+
+#[cfg(windows)]
+async fn serve_control(
+    d: Arc<Daemon>,
+    listener: ControlListener,
+    socket: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let mut server = listener;
     loop {
         tokio::select! {
             r = server.connect() => {

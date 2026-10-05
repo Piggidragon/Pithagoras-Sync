@@ -357,3 +357,22 @@ async fn install_print_and_toggle() {
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_to_run_without_its_control_socket() {
+    // Without the socket, `panic` could not reach the client: it must not start.
+    let env = Env::new();
+    let state = env.home.join(".local/state/pithagoras-sync");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("run"), "not a directory").unwrap();
+    let out = tokio::time::timeout(WAIT, env.cmd(&["run"]).output())
+        .await
+        .expect("the client gives up instead of running")
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no control socket"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
