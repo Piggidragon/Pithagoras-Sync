@@ -10,8 +10,10 @@ use sync_ops::info;
 use sync_policy::{Access, DeviceConfig, Dirs, FolderGrant, Mode, Policy, Profile};
 
 use crate::actions::{self, Action};
-use crate::control::{self, Request, Status};
+use crate::config_cmd::{self, Op};
+use crate::control::{self, Reply, Request, Status};
 use crate::{install, owner, setup};
+use sync_proto::methods::{ApprovalInfo, Choice};
 
 #[derive(Parser)]
 #[command(
@@ -69,6 +71,27 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: FolderCmd,
     },
+    /// Show or change any setting by name (docs/permissions.md lists them).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// The calls waiting for your approval.
+    Approvals {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Allow a waiting call: once, or with --chat or --minutes for more calls of its
+    /// kind from the same chat.
+    Approve {
+        id: u64,
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, conflicts_with = "chat")]
+        minutes: Option<u32>,
+    },
+    /// Refuse a waiting call.
+    Deny { id: u64 },
     /// Start the client with the machine (systemd unit, or a logon task on Windows).
     Install {
         /// A system unit instead of a user unit (run as root).
@@ -126,12 +149,28 @@ impl From<ModeArg> for Mode {
 }
 
 #[derive(Subcommand)]
+pub enum ConfigCmd {
+    /// Print one setting, or all of them.
+    Get { key: Option<String> },
+    /// `config set policy.tools.bash false`; values are JSON or text.
+    Set { key: String, value: String },
+    /// Back to the default.
+    Unset { key: String },
+    /// Add an entry to a list: `config add policy.deny '{"path": "~/secret"}'`.
+    Add { key: String, value: String },
+    /// Take an entry out of a list.
+    Remove { key: String, value: String },
+}
+
+#[derive(Subcommand)]
 pub enum FolderCmd {
-    /// Grant a folder, read-only unless --rw.
+    /// Grant a folder, read-only unless --rw; commands run there only with --exec.
     Add {
         path: PathBuf,
         #[arg(long)]
         rw: bool,
+        #[arg(long)]
+        exec: bool,
     },
     Remove {
         path: PathBuf,
@@ -155,8 +194,9 @@ pub fn is_root() -> bool {
     }
 }
 
-/// The profile of a fresh config: desktop where someone can answer notifications.
-/// Windows has no approvals in phase 1, so it counts as headless there.
+/// The profile of a fresh config: desktop where a person uses the machine (owner
+/// confirmations ask for the password there). Windows counts as headless in
+/// phase 1, which has no password dialog there.
 fn detect_profile() -> Profile {
     if cfg!(windows) || is_root() || info::session() == "headless" {
         Profile::Headless
@@ -259,7 +299,27 @@ fn print_status(s: &Status) {
         "Shell:     {} ({} in Folders mode)",
         s.shell, s.folders_shell
     );
-    println!("Approvals: {}", s.approvals);
+    println!(
+        "Approvals: {}{}",
+        s.approvals,
+        if s.approvals_waiting > 0 {
+            format!(
+                " ({} waiting: `pithagoras-sync approvals`)",
+                s.approvals_waiting
+            )
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "Portal:    may {} the settings",
+        match s.portal_policy.as_str() {
+            "write" => "read and change",
+            "read" => "read",
+            _ => "not see",
+        }
+    );
+    println!("Elevation: {}", s.elevation);
     println!(
         "Commands:  {} running; own cgroup per command: {}; Landlock: {}",
         s.running_commands,
@@ -268,6 +328,37 @@ fn print_status(s: &Status) {
     );
     println!("Config:    {}", s.config_file);
     println!("Audit log: {}", s.audit_file);
+}
+
+/// Sends a request to the running client and wants an answer.
+async fn to_running(dirs: &Dirs, req: Request) -> Result<Reply, String> {
+    match control::send(&dirs.socket(), req).await? {
+        Some(r) if r.ok => Ok(r),
+        Some(r) => Err(r.error.unwrap_or_default()),
+        None => Err("pithagoras-sync is not running".into()),
+    }
+}
+
+fn print_approval(a: &ApprovalInfo) {
+    let secs = (a.expires_ms - now_ms()).max(0) / 1000;
+    println!("#{} chat {}: {} {}", a.id, a.chat, a.tool, a.target);
+    for r in &a.reasons {
+        println!("    why: {r}");
+    }
+    if let Some(p) = &a.preview {
+        for l in p.lines().take(5) {
+            println!("    | {l}");
+        }
+    }
+    let more = if a.choices.contains(&Choice::Chat) {
+        format!(", --chat or --minutes 1..{}", a.max_minutes)
+    } else {
+        String::new()
+    };
+    println!(
+        "    approve {}{more} or deny {}; denied in {secs}s",
+        a.id, a.id
+    );
 }
 
 fn show_plan(plan: &[Action]) {
@@ -456,10 +547,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             FolderCmd::List => {
                 let cfg = DeviceConfig::load(&dirs.config_file())?;
                 for f in &cfg.policy.folders {
-                    println!("{} ({:?})", f.path.display(), f.access);
+                    let x = if f.execute { ", exec" } else { "" };
+                    println!("{} ({:?}{x})", f.path.display(), f.access);
                 }
             }
-            FolderCmd::Add { path, rw } => {
+            FolderCmd::Add { path, rw, exec } => {
                 let mut cfg = owner_edit(&dirs).await?;
                 let path = canonical_folder(&path)?;
                 let access = if rw { Access::Rw } else { Access::Ro };
@@ -467,9 +559,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 cfg.policy.folders.push(FolderGrant {
                     path: path.clone(),
                     access,
+                    execute: exec,
                 });
                 cfg.save(&dirs.config_file())?;
-                println!("Granted {} ({access:?}).", path.display());
+                println!(
+                    "Granted {} ({access:?}{}).",
+                    path.display(),
+                    if exec { ", commands run here" } else { "" }
+                );
                 reload_running(&dirs).await;
             }
             FolderCmd::Remove { path } => {
@@ -487,6 +584,83 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 reload_running(&dirs).await;
             }
         },
+        Cmd::Config { cmd } => {
+            let (key, op) = match cmd {
+                ConfigCmd::Get { key } => {
+                    let cfg = load_config(&dirs)?;
+                    let v = config_cmd::get(&cfg, key.as_deref())?;
+                    match v {
+                        serde_json::Value::String(s) => println!("{s}"),
+                        v => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                ConfigCmd::Set { key, value } => (key, Op::Set(config_cmd::parse_value(&value))),
+                ConfigCmd::Unset { key } => (key, Op::Unset),
+                ConfigCmd::Add { key, value } => (key, Op::Add(config_cmd::parse_value(&value))),
+                ConfigCmd::Remove { key, value } => {
+                    (key, Op::Remove(config_cmd::parse_value(&value)))
+                }
+            };
+            let cfg = owner_edit(&dirs).await?;
+            let next = config_cmd::edit(&cfg, &key, op, now_ms())?;
+            next.save(&dirs.config_file())?;
+            let v = config_cmd::get(&next, Some(&key))?;
+            println!("{key} = {v}");
+            if key == "profile" {
+                println!("Restart the client for the profile to take effect.");
+            }
+            reload_running(&dirs).await;
+        }
+        Cmd::Approvals { json } => {
+            owner::not_from_own_command(&dirs).await?;
+            let list = to_running(&dirs, Request::Approvals)
+                .await?
+                .approvals
+                .unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&list).unwrap_or_default()
+                );
+            } else if list.is_empty() {
+                println!("Nothing waits for an approval.");
+            }
+            if !json {
+                list.iter().for_each(print_approval);
+            }
+        }
+        Cmd::Approve { id, chat, minutes } => {
+            owner::not_from_own_command(&dirs).await?;
+            let answer = match (chat, minutes) {
+                (true, _) => Choice::Chat,
+                (_, Some(_)) => Choice::Time,
+                _ => Choice::Once,
+            };
+            to_running(
+                &dirs,
+                Request::Answer {
+                    id,
+                    answer,
+                    minutes,
+                },
+            )
+            .await?;
+            println!("Allowed #{id}.");
+        }
+        Cmd::Deny { id } => {
+            owner::not_from_own_command(&dirs).await?;
+            to_running(
+                &dirs,
+                Request::Answer {
+                    id,
+                    answer: Choice::Deny,
+                    minutes: None,
+                },
+            )
+            .await?;
+            println!("Denied #{id}.");
+        }
         Cmd::Install {
             system,
             user,

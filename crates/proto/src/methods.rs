@@ -16,6 +16,15 @@ pub const FS_FIND: &str = "fs.find";
 pub const EXEC_START: &str = "exec.start";
 pub const EXEC_SIGNAL: &str = "exec.signal";
 
+/// The owner's answer to an approval request, from the portal's Devices tab.
+pub const APPROVAL_ANSWER: &str = "approval.answer";
+/// The approvals waiting now (after a reconnect, say).
+pub const APPROVAL_LIST: &str = "approval.list";
+/// The device's settings, for the portal's Devices tab (`portal_policy` read or write).
+pub const POLICY_GET: &str = "policy.get";
+/// Replaces the device's settings (`portal_policy = write` only).
+pub const POLICY_SET: &str = "policy.set";
+
 /// Portal to device notification: a chat's grant of this device ended.
 pub const GRANT_END: &str = "grant.end";
 
@@ -23,10 +32,16 @@ pub const GRANT_END: &str = "grant.end";
 pub const HELLO: &str = "hello";
 pub const EXEC_EXIT: &str = "exec.exit";
 pub const AUDIT: &str = "audit";
-pub const APPROVAL_WAITING: &str = "approval.waiting";
+pub const APPROVAL_REQUESTED: &str = "approval.requested";
+pub const APPROVAL_RESOLVED: &str = "approval.resolved";
+pub const POLICY_CHANGED: &str = "policy.changed";
 
 /// Capabilities phase 1 announces in `hello`.
 pub const CAPABILITIES: &[&str] = &["fs", "grep", "find", "exec", "probe"];
+/// Added to `hello`'s capabilities when the device asks the portal for approvals.
+pub const CAP_APPROVALS: &str = "approvals";
+/// Added when the device shares its settings (`portal_policy` read or write).
+pub const CAP_POLICY: &str = "policy";
 
 /// Which chat a call comes from, and the portal guard's taint flag for it. The
 /// device keeps its own taint and only ever adds the portal's flag to it.
@@ -36,6 +51,48 @@ pub struct Ctx {
     pub chat: String,
     #[serde(default)]
     pub tainted: bool,
+    /// The pi tool the call is for. The device checks that this tool is switched on;
+    /// a label can only narrow what a call may do, since every label still has to
+    /// fit the method (an `fs.write` is `write` or `edit`).
+    #[serde(default)]
+    pub tool: Option<PiTool>,
+}
+
+/// pi's built-in tools, the ones a device can serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiTool {
+    Read,
+    Write,
+    Edit,
+    Bash,
+    Grep,
+    Find,
+    Ls,
+}
+
+impl PiTool {
+    pub const ALL: [PiTool; 7] = [
+        PiTool::Read,
+        PiTool::Write,
+        PiTool::Edit,
+        PiTool::Bash,
+        PiTool::Grep,
+        PiTool::Find,
+        PiTool::Ls,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PiTool::Read => "read",
+            PiTool::Write => "write",
+            PiTool::Edit => "edit",
+            PiTool::Bash => "bash",
+            PiTool::Grep => "grep",
+            PiTool::Find => "find",
+            PiTool::Ls => "ls",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +329,9 @@ pub enum Access {
 pub struct FolderInfo {
     pub path: String,
     pub access: Access,
+    /// Commands may run in it.
+    #[serde(default)]
+    pub execute: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +356,9 @@ pub struct DeviceInfo {
     pub folders: Vec<FolderInfo>,
     /// How the shell runs in Folders mode: `landlock`, `prompt` or `unconfined`.
     pub folders_shell: String,
+    /// The pi tools switched on; the portal offers the device to these only.
+    #[serde(default)]
+    pub tools: Vec<PiTool>,
     /// Computer-use tools; always empty in phase 1.
     pub mcp_tools: Vec<serde_json::Value>,
     pub client_version: String,
@@ -325,11 +388,94 @@ pub struct AuditEvent {
     pub reason: Option<String>,
 }
 
-/// Device to portal: a call is waiting for the owner's approval on the device.
+/// How the owner answers an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Choice {
+    /// This call only.
+    Once,
+    /// Calls of this kind from this chat, until the grant ends or the device's
+    /// `remember_minutes` run out.
+    Chat,
+    /// Calls of this kind from this chat for `minutes`.
+    Time,
+    Deny,
+}
+
+/// Device to portal (`approval.requested`), and what `approval.list` and the local
+/// `approvals` command show: a call waits for the owner's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ApprovalWaiting {
-    pub id: crate::Id,
+pub struct ApprovalInfo {
+    /// The device's number for this approval; answers name it.
+    pub id: u64,
+    /// The JSON-RPC id of the waiting call, when it came from the portal.
+    pub call: Option<crate::Id>,
     pub chat: String,
+    /// The method's tool (`read`, `write`, `exec`, ...).
+    pub tool: String,
+    /// The path or command.
+    pub target: String,
+    /// Why it asks (mode, protected path, pattern, taint, a rule).
+    pub reasons: Vec<String>,
+    /// The start of what a write puts there.
+    pub preview: Option<String>,
+    /// The answers the device accepts for this call.
+    pub choices: Vec<Choice>,
+    /// The longest `time` answer the device accepts, in minutes.
+    pub max_minutes: u32,
+    pub created_ms: i64,
+    /// When the device stops waiting and applies its timeout answer.
+    pub expires_ms: i64,
+}
+
+/// Device to portal (`approval.resolved`): an approval was answered, timed out or
+/// withdrawn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalResolved {
+    pub id: u64,
+    pub chat: String,
+    pub answer: Choice,
+    pub minutes: Option<u32>,
+    /// `portal`, `device` (the local CLI), `notification`, `timeout` or `pause`.
+    pub by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalAnswerParams {
+    pub id: u64,
+    pub answer: Choice,
+    /// For `time`: how long, at most the request's `max_minutes`.
+    #[serde(default)]
+    pub minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalListResult {
+    pub approvals: Vec<ApprovalInfo>,
+}
+
+/// `policy.set`: the whole settings document as `policy.get` returned it, changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySetParams {
+    pub settings: serde_json::Value,
+    /// The `version` the change is based on; a newer one on the device is
+    /// `CONFLICT`. Absent: replace whatever is there.
+    #[serde(default)]
+    pub if_version: Option<String>,
+}
+
+/// `policy.get` result and `policy.changed` notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDocument {
+    /// `read` or `write`: whether the portal may change it.
+    pub portal_policy: String,
+    /// A hash of the settings (hex); changes with every change.
+    pub version: String,
+    pub settings: serde_json::Value,
+    /// Settings only the device can change; `policy.set` must leave them as they are.
+    pub device_only: Vec<String>,
 }
 
 /// `POST /sync/v1/pair` body.

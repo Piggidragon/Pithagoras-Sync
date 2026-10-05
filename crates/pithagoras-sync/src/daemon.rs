@@ -3,10 +3,11 @@
 //! control channel.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sync_connector::link::{self, LinkConfig, LinkState, LinkStatus};
+use sync_connector::settings::ConfigStore;
 use sync_connector::{Device, pair};
 use sync_ops::{ExecConfig, Execs, info};
 use sync_policy::*;
@@ -18,31 +19,68 @@ use crate::control::{self, Reply, Request, Status};
 pub struct Daemon {
     dirs: Dirs,
     device: Arc<Device>,
-    cfg: Mutex<DeviceConfig>,
+    store: Arc<ConfigStore>,
+    queue: Arc<ApprovalQueue>,
     link_status: watch::Receiver<LinkStatus>,
     relink: mpsc::Sender<()>,
     approvals: String,
 }
 
-/// Who answers approvals, and how `status` describes it.
-async fn approver(profile: Profile) -> (Arc<dyn Approver>, String) {
-    if profile == Profile::Desktop {
-        #[cfg(unix)]
-        if let Some(a) = sync_policy::notify::NotifyApprover::connect().await {
-            return (Arc::new(a), "notifications".into());
+/// With `approvals.desktop_notifications` on a Linux desktop: each approval is also
+/// shown as a notification (Allow once / Deny) answering the same queue. Off by
+/// default; the device's own dialog replaces it in phase 2.
+#[cfg(unix)]
+async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
+    use std::collections::HashMap;
+    use sync_policy::notify::NotifyApprover;
+    let Some(n) = NotifyApprover::connect().await else {
+        warn!("approvals.desktop_notifications is on, but there is no notification service");
+        return false;
+    };
+    let n = Arc::new(n);
+    let mut events = queue.subscribe();
+    tokio::spawn(async move {
+        let mut shown: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+        loop {
+            match events.recv().await {
+                Ok(ApprovalEvent::Requested(info)) => {
+                    let (n, q) = (n.clone(), queue.clone());
+                    let id = info.id;
+                    shown.insert(
+                        id,
+                        tokio::spawn(async move {
+                            let req = ApprovalRequest {
+                                call: None,
+                                chat: info.chat,
+                                tool: info.tool,
+                                target: info.target,
+                                reasons: info.reasons,
+                                preview: info.preview,
+                                offer_chat: false,
+                                max_minutes: info.max_minutes,
+                                expires_ms: info.expires_ms,
+                                on_timeout_allow: false,
+                            };
+                            let choice = match n.ask(&req).await {
+                                Answer::Deny => sync_proto::methods::Choice::Deny,
+                                _ => sync_proto::methods::Choice::Once,
+                            };
+                            let _ = q.answer(id, choice, None, "notification");
+                        }),
+                    );
+                }
+                // Answered elsewhere: dropping the task withdraws the notification.
+                Ok(ApprovalEvent::Resolved(r)) => {
+                    if let Some(t) = shown.remove(&r.id) {
+                        t.abort();
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
         }
-        return (
-            Arc::new(NoApprover {
-                why: "no notification service",
-            }),
-            "nobody: no notification service with Allow/Deny actions, so what would ask is denied"
-                .into(),
-        );
-    }
-    (
-        Arc::new(NoApprover { why: "headless" }),
-        "nobody (headless): what would ask is denied".into(),
-    )
+    });
+    true
 }
 
 fn now_ms() -> i64 {
@@ -66,7 +104,27 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
         AuditLog::open(&dirs.audit_file())
             .map_err(|e| format!("{}: {e}", dirs.audit_file().display()))?,
     );
-    let (approver, approvals) = approver(cfg.profile).await;
+    if is_root() && !cfg.policy.privilege.allow_root {
+        return Err(format!(
+            "refusing to run as {}: the portal's agent would act with its rights. A dedicated user is safer (`pithagoras-sync setup --create-user`); to allow it, run `pithagoras-sync config set policy.privilege.allow_root true` as this user.",
+            if cfg!(windows) {
+                "an elevated administrator"
+            } else {
+                "root"
+            }
+        ));
+    }
+    let queue = ApprovalQueue::new(system_clock());
+    #[allow(unused_mut)]
+    let mut approvals =
+        "through the portal's Devices tab and `pithagoras-sync approve`".to_string();
+    #[cfg(unix)]
+    if cfg.policy.approvals.desktop_notifications
+        && cfg.profile == Profile::Desktop
+        && mirror_to_notifications(queue.clone()).await
+    {
+        approvals.push_str(", and as desktop notifications");
+    }
     let landlock = sync_ops::landlock_available();
     let engine = Arc::new(Engine::new(
         cfg.policy.clone(),
@@ -78,7 +136,7 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
                 dirs.state.clone(),
                 dirs.runtime.clone(),
             ],
-            approver,
+            approver: queue.clone(),
             audit,
             clock: system_clock(),
             landlock,
@@ -104,7 +162,20 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
-    let device = Device::new(engine, execs, name, home);
+    let store = ConfigStore::new(
+        dirs.config_file(),
+        cfg.clone(),
+        engine.clone(),
+        execs.clone(),
+    );
+    let device = Device::with_parts(
+        engine,
+        execs,
+        name,
+        home,
+        Some(queue.clone()),
+        Some(store.clone()),
+    );
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
         cfg.profile,
@@ -113,17 +184,19 @@ pub async fn run(dirs: Dirs) -> Result<(), String> {
     );
     if is_root() {
         warn!(
-            "running as root: the portal's agent acts with root's rights where the policy allows"
+            "running as root (privilege.allow_root): the portal's agent acts with its rights where the policy allows"
         );
     }
 
     let (status_tx, link_status) =
         watch::channel(LinkStatus::new(LinkState::Stopped, Some("starting".into())));
     let (relink, relink_rx) = mpsc::channel(4);
+    drop(cfg);
     let daemon = Arc::new(Daemon {
         dirs: dirs.clone(),
         device: device.clone(),
-        cfg: Mutex::new(cfg),
+        store,
+        queue,
         link_status,
         relink,
         approvals,
@@ -156,9 +229,34 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Whether this process runs with an elevated administrator token.
 #[cfg(windows)]
 fn is_root() -> bool {
-    false
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo handle needs no closing; the token handle is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut len = 0u32;
+    // SAFETY: the buffer is a TOKEN_ELEVATION of the size given.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    // SAFETY: the token handle is ours.
+    unsafe { CloseHandle(token) };
+    ok != 0 && elevation.TokenIsElevated != 0
 }
 
 /// Returns on SIGTERM or SIGINT (Ctrl+C on Windows); SIGHUP reloads the config.
@@ -195,7 +293,7 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
 
 impl Daemon {
     fn link_config(&self) -> Result<Option<LinkConfig>, String> {
-        let Some(portal) = self.cfg.lock().unwrap().portal.clone() else {
+        let Some(portal) = self.store.config().portal else {
             return Ok(None);
         };
         let token = pair::load_token(&self.dirs.token_file())?;
@@ -205,27 +303,17 @@ impl Daemon {
     /// Takes the config file as it is now. A bad file leaves the running policy as it
     /// was.
     pub fn reload(&self) -> Result<(), String> {
-        let mut cfg = DeviceConfig::load(&self.dirs.config_file())?;
-        if cfg.policy.date_full(now_ms()) {
-            cfg.save(&self.dirs.config_file())?;
-        }
-        let old_profile = self.cfg.lock().unwrap().profile;
-        if cfg.profile != old_profile {
-            warn!("the profile changed; restart the client for it to take effect");
-            cfg.profile = old_profile;
-        }
-        self.device.engine.reload(cfg.policy.clone(), cfg.profile);
+        let cfg = self.store.reload()?;
         if let Some(p) = &cfg.portal {
             self.device.set_name(p.name.clone());
         }
-        *self.cfg.lock().unwrap() = cfg;
         let _ = self.relink.try_send(());
         info!("config reloaded");
         Ok(())
     }
 
     pub fn status(&self) -> Status {
-        let cfg = self.cfg.lock().unwrap().clone();
+        let cfg = self.store.config();
         let info = self.device.info();
         Status {
             pid: std::process::id(),
@@ -242,6 +330,9 @@ impl Daemon {
             folders_shell: info.folders_shell,
             shell: info.shell,
             approvals: self.approvals.clone(),
+            approvals_waiting: self.queue.list().len(),
+            portal_policy: cfg.portal_policy.as_str().into(),
+            elevation: self.elevation_status(&cfg),
             running_commands: self.device.execs.running(),
             cgroups: self.device.execs.uses_cgroups(),
             landlock: self.device.engine.landlock_available(),
@@ -277,6 +368,28 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),
             },
+            Request::Approvals => Reply {
+                approvals: Some(self.queue.list()),
+                ..Reply::ok()
+            },
+            Request::Answer {
+                id,
+                answer,
+                minutes,
+            } => match self.queue.answer(id, answer, minutes, "device") {
+                Ok(()) => Reply::ok(),
+                Err(e) => Reply::err(e.to_string()),
+            },
+            Request::SecretSet { .. } | Request::SecretClear { .. } => {
+                Reply::err("this client keeps no secrets")
+            }
+        }
+    }
+
+    fn elevation_status(&self, cfg: &DeviceConfig) -> String {
+        match cfg.policy.privilege.elevation {
+            sync_policy::config::Elevation::Off => "off".into(),
+            sync_policy::config::Elevation::Sudo => "sudo".into(),
         }
     }
 }
@@ -348,9 +461,9 @@ async fn handle_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 ) {
     let (r, w) = tokio::io::split(s);
     let reply = match control::read_request(r).await {
-        Ok(req) if from_own_command && !req.allowed_from_own_commands() => {
-            Reply::err("commands the client runs for the portal cannot unlock or reload it")
-        }
+        Ok(req) if from_own_command && !req.allowed_from_own_commands() => Reply::err(
+            "commands the client runs for the portal cannot change, unlock or reload it, answer its approvals or set its secrets",
+        ),
         Ok(req) => d.handle(req).await,
         Err(e) => Reply::err(e),
     };

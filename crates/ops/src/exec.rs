@@ -127,7 +127,8 @@ struct Table {
 }
 
 pub struct Execs {
-    cfg: ExecConfig,
+    /// Read once per command; the owner's limits change at runtime.
+    cfg: std::sync::RwLock<ExecConfig>,
     table: Arc<Mutex<Table>>,
     #[cfg(target_os = "linux")]
     cgroups: Option<crate::cgroup::CgroupBase>,
@@ -136,7 +137,7 @@ pub struct Execs {
 impl Execs {
     pub fn new(cfg: ExecConfig) -> Execs {
         Execs {
-            cfg,
+            cfg: std::sync::RwLock::new(cfg),
             table: Arc::new(Mutex::new(Table::default())),
             #[cfg(target_os = "linux")]
             cgroups: crate::cgroup::CgroupBase::detect(),
@@ -157,7 +158,7 @@ impl Execs {
 
     /// The shell commands run in, for `device.info` and `hello`.
     pub fn shell(&self) -> PathBuf {
-        if let Some(s) = &self.cfg.shell {
+        if let Some(s) = &self.cfg.read().unwrap().shell {
             return s.clone();
         }
         default_shell()
@@ -169,6 +170,21 @@ impl Execs {
             .file_stem()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default()
+    }
+
+    /// The owner changed the limits: later commands get the new ones.
+    pub fn set_limits(
+        &self,
+        env_passthrough: Vec<String>,
+        output_cap: u64,
+        max_timeout: Duration,
+        max_running: usize,
+    ) {
+        let mut cfg = self.cfg.write().unwrap();
+        cfg.env_passthrough = env_passthrough;
+        cfg.output_cap = output_cap;
+        cfg.max_timeout = max_timeout;
+        cfg.max_running = max_running;
     }
 
     pub fn running(&self) -> usize {
@@ -185,26 +201,24 @@ impl Execs {
         timeout: Option<Duration>,
         out: mpsc::Sender<Vec<u8>>,
     ) -> Result<Started, RpcError> {
+        let cfg = self.cfg.read().unwrap().clone();
         {
             let mut t = self.table.lock().unwrap();
             t.lingering.retain(|s| !s.done());
             if t.running.contains_key(&stream) {
                 return Err(RpcError::new(code::INVALID_PARAMS, "stream already in use"));
             }
-            if t.running.len() >= self.cfg.max_running {
+            if t.running.len() >= cfg.max_running {
                 return Err(RpcError::new(code::BUSY, "too many commands running"));
             }
         }
-        let timeout = timeout
-            .unwrap_or(self.cfg.max_timeout)
-            .min(self.cfg.max_timeout);
-        let mut env = crate::env::scrubbed(&self.cfg.base_env, &self.cfg.env_passthrough);
+        let timeout = timeout.unwrap_or(cfg.max_timeout).min(cfg.max_timeout);
+        let mut env = crate::env::scrubbed(&cfg.base_env, &cfg.env_passthrough);
         let landlock = match &permit.confine {
             Confine::None => None,
             Confine::Landlock(rules) => {
                 // A private temporary directory: the confined shell cannot write /tmp.
-                let tmp = self
-                    .cfg
+                let tmp = cfg
                     .tmp_base
                     .join(format!("exec-{}-{stream}", std::process::id()));
                 std::fs::create_dir_all(&tmp)
@@ -216,6 +230,7 @@ impl Execs {
                 Some(LandlockSpec {
                     read: rules.read.clone(),
                     write,
+                    exec: rules.exec.clone(),
                 })
             }
         };
@@ -234,7 +249,7 @@ impl Execs {
         };
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?;
-        let spawned = spawn(&self.cfg, &spec_json, &spec)?;
+        let spawned = spawn(&cfg, &spec_json, &spec)?;
         let scope = spawned.scope;
         self.table
             .lock()
@@ -242,7 +257,7 @@ impl Execs {
             .running
             .insert(stream, scope.clone());
         let table = self.table.clone();
-        let cap = self.cfg.output_cap;
+        let cap = cfg.output_cap;
         let outcome = tokio::spawn(async move {
             let reader = tokio::spawn(forward_output(spawned.output, out, cap));
             let mut timed_out = false;

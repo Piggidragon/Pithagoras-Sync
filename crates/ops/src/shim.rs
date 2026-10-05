@@ -21,7 +21,10 @@ pub const SHIM_ARG: &str = "__exec-shim";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LandlockSpec {
     pub read: Vec<PathBuf>,
+    /// Writable, and readable.
     pub write: Vec<PathBuf>,
+    /// Programs here may run.
+    pub exec: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +319,11 @@ pub mod landlock {
 
     pub fn prepare(spec: &LandlockSpec) -> Result<RulesetCreated, String> {
         let e = |e: landlock::RulesetError| e.to_string();
+        // Running a program is its own right, granted only where `exec` says.
+        let mut read = AccessFs::from_read(ABI_WANTED);
+        read.remove(AccessFs::Execute);
+        let mut write = AccessFs::from_all(ABI_WANTED);
+        write.remove(AccessFs::Execute);
         let mut rs = Ruleset::default()
             .handle_access(AccessFs::from_all(ABI_WANTED))
             .map_err(e)?;
@@ -324,15 +332,11 @@ pub mod landlock {
         }
         rs.create()
             .map_err(e)?
-            .add_rules(path_beneath_rules(
-                &spec.read,
-                AccessFs::from_read(ABI_WANTED),
-            ))
+            .add_rules(path_beneath_rules(&spec.read, read))
             .map_err(e)?
-            .add_rules(path_beneath_rules(
-                &spec.write,
-                AccessFs::from_all(ABI_WANTED),
-            ))
+            .add_rules(path_beneath_rules(&spec.write, write))
+            .map_err(e)?
+            .add_rules(path_beneath_rules(&spec.exec, AccessFs::Execute))
             .map_err(e)
     }
 

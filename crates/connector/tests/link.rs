@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use sync_connector::link::{self, LinkConfig, LinkEnd, LinkState, LinkStatus};
+use sync_connector::settings::ConfigStore;
 use sync_connector::{Device, pair, tls};
 use sync_ops::{ExecConfig, Execs};
+use sync_policy::config::PortalPolicy;
 use sync_policy::*;
 use sync_proto::code;
+use sync_proto::methods::Choice;
 use sync_testkit::{DeviceLink, MockOptions, MockPortal};
 use tokio::sync::watch;
 
@@ -55,6 +58,7 @@ impl Fx {
                 .map(|(p, a)| FolderGrant {
                     path: self.root.join(p),
                     access: *a,
+                    execute: true,
                 })
                 .collect(),
             ..Policy::default()
@@ -62,6 +66,51 @@ impl Fx {
     }
 
     fn device(&self, policy: Policy, profile: Profile, approver: Arc<dyn Approver>) -> Arc<Device> {
+        let (engine, execs) = self.parts(policy, profile, approver);
+        Device::new(engine, execs, "laptop".into(), self.root.join("home"))
+    }
+
+    /// A device as the daemon builds it: approvals through the portal, the config
+    /// in a file the portal may see or change as `portal_policy` says.
+    fn full_device(
+        &self,
+        policy: Policy,
+        portal_policy: PortalPolicy,
+    ) -> (Arc<Device>, Arc<ApprovalQueue>, Arc<ConfigStore>) {
+        let queue = ApprovalQueue::new(system_clock());
+        let (engine, execs) = self.parts(policy.clone(), Profile::Headless, queue.clone());
+        let cfg = DeviceConfig {
+            portal_policy,
+            policy,
+            ..Default::default()
+        };
+        cfg.save(&self.config_file()).unwrap();
+        let store = ConfigStore::new(self.config_file(), cfg, engine.clone(), execs.clone());
+        let dev = Device::with_parts(
+            engine,
+            execs,
+            "laptop".into(),
+            self.root.join("home"),
+            Some(queue.clone()),
+            Some(store.clone()),
+        );
+        (dev, queue, store)
+    }
+
+    fn config_file(&self) -> PathBuf {
+        self.root.join("config/config.toml")
+    }
+
+    fn audit(&self) -> String {
+        std::fs::read_to_string(self.root.join("state/audit.jsonl")).unwrap_or_default()
+    }
+
+    fn parts(
+        &self,
+        policy: Policy,
+        profile: Profile,
+        approver: Arc<dyn Approver>,
+    ) -> (Arc<Engine>, Arc<Execs>) {
         let home = self.root.join("home");
         let engine = Engine::new(
             policy,
@@ -86,24 +135,12 @@ impl Fx {
             max_running: 4,
             tmp_base: self.root.join("tmp"),
         });
-        Device::new(Arc::new(engine), Arc::new(execs), "laptop".into(), home)
+        (Arc::new(engine), Arc::new(execs))
     }
 }
 
 fn headless() -> Arc<dyn Approver> {
     Arc::new(NoApprover { why: "headless" })
-}
-
-/// An owner who never answers.
-struct Never;
-
-impl Approver for Never {
-    fn can_prompt(&self) -> bool {
-        true
-    }
-    fn ask<'a>(&'a self, _req: &'a ApprovalRequest) -> BoxFuture<'a, Answer> {
-        Box::pin(std::future::pending())
-    }
 }
 
 struct Running {
@@ -144,9 +181,12 @@ async fn connected(
     profile: Profile,
     approver: Arc<dyn Approver>,
 ) -> (MockPortal, Arc<Device>, Running, DeviceLink) {
+    connect(fx.device(policy, profile, approver)).await
+}
+
+async fn connect(dev: Arc<Device>) -> (MockPortal, Arc<Device>, Running, DeviceLink) {
     let mock = MockPortal::start(MockOptions::default()).await;
     mock.add_token(TOKEN, "dev-x");
-    let dev = fx.device(policy, profile, approver);
     let r = run(&mock, dev.clone(), TOKEN);
     let dl = mock.next_device(WAIT).await.expect("the device connects");
     (mock, dev, r, dl)
@@ -380,9 +420,11 @@ async fn the_portal_cannot_widen_mode_folders_or_protections() {
     let fx = Fx::new();
     let policy = fx.folders(&[("home/proj", Access::Ro)]);
     let (_mock, dev, r, dl) = connected(&fx, policy.clone(), Profile::Headless, headless()).await;
-    // Methods that would change the policy do not exist.
+    // Methods that would change the policy do not exist (and `policy.set` only
+    // where the owner set `portal_policy = write`, tested below).
     for m in [
         "policy.set",
+        "approval.answer",
         "device.mode",
         "folder.add",
         "approve",
@@ -485,12 +527,10 @@ async fn uploads_must_match_their_announced_size() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_approval_is_denied_and_the_portal_sees_it_wait() {
     let fx = Fx::new();
-    let policy = Policy {
-        mode: Mode::Ask,
-        approval_timeout_secs: 1,
-        ..Policy::default()
-    };
-    let (_mock, _dev, r, dl) = connected(&fx, policy, Profile::Desktop, Arc::new(Never)).await;
+    let mut policy = Policy::default();
+    policy.approvals.timeout_secs = 1;
+    let (dev, queue, _) = fx.full_device(policy, PortalPolicy::Read);
+    let (_mock, _dev, r, dl) = connect(dev).await;
     let e = dl
         .call(
             "fs.read",
@@ -504,9 +544,264 @@ async fn an_unanswered_approval_is_denied_and_the_portal_sees_it_wait() {
         }
         Ok(v) => panic!("read went through without approval: {v}"),
     }
-    let waiting = dl.notification("approval.waiting", WAIT).await.unwrap();
-    assert_eq!(waiting["chat"], "chat-1");
+    let asked = dl.notification("approval.requested", WAIT).await.unwrap();
+    assert_eq!(asked["chat"], "chat-1");
+    assert_eq!(asked["tool"], "read");
+    assert_eq!(asked["choices"], json!(["once", "chat", "time", "deny"]));
+    let done = dl.notification("approval.resolved", WAIT).await.unwrap();
+    assert_eq!(
+        (&done["answer"], &done["by"]),
+        (&json!("deny"), &json!("timeout"))
+    );
     assert!(dl.stream_data(1).is_empty());
+    assert!(queue.list().is_empty());
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_portal_and_the_device_answer_approvals() {
+    let fx = Fx::new();
+    let (dev, queue, _) = fx.full_device(Policy::default(), PortalPolicy::Read);
+    let (_mock, _dev, r, dl) = connect(dev).await;
+    // The portal allows a read for this chat.
+    let read = |stream: u32| {
+        dl.start_call(
+            "fs.read",
+            json!({"path": fx.p("outside/b.txt"), "stream": stream, "ctx": ctx()}),
+        )
+    };
+    let pending = read(1).await;
+    let asked = dl.notification("approval.requested", WAIT).await.unwrap();
+    let id = asked["id"].as_u64().unwrap();
+    let listed = dl.call("approval.list", json!({})).await.unwrap();
+    assert_eq!(listed["approvals"][0]["id"], id);
+    // Answers it does not take are refused; the approval keeps waiting.
+    let e = dl
+        .call(
+            "approval.answer",
+            json!({"id": id, "answer": "time", "minutes": 100000}),
+        )
+        .await;
+    assert_eq!(err_code(e), code::INVALID_PARAMS);
+    let e = dl
+        .call("approval.answer", json!({"id": id + 100, "answer": "once"}))
+        .await;
+    assert_eq!(err_code(e), code::NOT_FOUND);
+    dl.call("approval.answer", json!({"id": id, "answer": "chat"}))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(dl.stream_data(1), b"beta outside\n");
+    let done = dl.notification("approval.resolved", WAIT).await.unwrap();
+    assert_eq!(
+        (&done["answer"], &done["by"]),
+        (&json!("chat"), &json!("portal"))
+    );
+    // Remembered for the chat: the next read asks nobody.
+    read(2).await.await.unwrap().unwrap();
+    assert!(queue.list().is_empty());
+    // A command asks every time and takes once or deny; the device denies this one.
+    let cmd = dl
+        .start_call(
+            "exec.start",
+            json!({"stream": 3, "command": "id", "cwd": fx.p("outside"), "ctx": ctx()}),
+        )
+        .await;
+    let mut waiting = queue.list();
+    for _ in 0..100 {
+        if !waiting.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waiting = queue.list();
+    }
+    assert_eq!(waiting[0].choices, [Choice::Once, Choice::Deny]);
+    queue
+        .answer(waiting[0].id, Choice::Deny, None, "device")
+        .unwrap();
+    let e = tokio::time::timeout(WAIT, cmd).await.unwrap().unwrap();
+    assert_eq!(err_code(e), code::DENIED);
+    assert!(fx.audit().contains("the owner denied it"));
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_portal_reads_the_policy_only_where_the_owner_allows_it() {
+    let fx = Fx::new();
+    let policy = fx.folders(&[("home/proj", Access::Ro)]);
+    // Off: the portal sees nothing and changes nothing.
+    let (dev, _, _) = fx.full_device(policy.clone(), PortalPolicy::Off);
+    let (_mock, dev, r, dl) = connect(dev).await;
+    assert_eq!(
+        err_code(dl.call("policy.get", json!({})).await),
+        code::DENIED
+    );
+    assert!(!dl.hello["capabilities"].to_string().contains("policy"));
+    assert!(dl.hello["capabilities"].to_string().contains("approvals"));
+    let mut wide = serde_json::to_value(sync_policy::settings::Settings {
+        policy: policy.clone(),
+        exec: Default::default(),
+    })
+    .unwrap();
+    wide["policy"]["mode"] = "full".into();
+    wide["policy"]["full"]["protected_paths"] = false.into();
+    wide["policy"]["folders"] =
+        json!([{"path": fx.root.to_string_lossy(), "access": "rw", "execute": true}]);
+    let e = dl
+        .call("policy.set", json!({"settings": wide.clone()}))
+        .await;
+    assert_eq!(err_code(e), code::DENIED);
+    assert_eq!(dev.engine.policy().0, policy);
+    r.stop().await;
+
+    // Read: it sees the settings and still cannot change them.
+    let (dev, _, _) = fx.full_device(policy.clone(), PortalPolicy::Read);
+    let (_mock, dev, r, dl) = connect(dev).await;
+    let doc = dl.call("policy.get", json!({})).await.unwrap();
+    assert_eq!(doc["portal_policy"], "read");
+    assert_eq!(doc["settings"]["policy"]["mode"], "folders");
+    assert!(doc["device_only"].to_string().contains("exec.shell"));
+    let e = dl.call("policy.set", json!({"settings": wide})).await;
+    assert_eq!(err_code(e), code::DENIED);
+    assert_eq!(dev.engine.policy().0, policy);
+    let e = dl
+        .write(
+            1,
+            json!({"path": fx.p("home/proj/a.txt"), "ctx": ctx()}),
+            b"x",
+        )
+        .await;
+    assert_eq!(err_code(e), code::DENIED);
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_write_the_portal_changes_the_policy_and_each_change_is_audited() {
+    let fx = Fx::new();
+    let policy = fx.folders(&[("home/proj", Access::Ro)]);
+    let (dev, _, store) = fx.full_device(policy.clone(), PortalPolicy::Write);
+    let (_mock, dev, r, dl) = connect(dev).await;
+    let doc = dl.call("policy.get", json!({})).await.unwrap();
+    let mut settings = doc["settings"].clone();
+    settings["policy"]["folders"][0]["access"] = "rw".into();
+    settings["policy"]["tools"]["bash"] = false.into();
+    // A stale version conflicts.
+    let e = dl
+        .call(
+            "policy.set",
+            json!({"settings": settings.clone(), "if_version": "stale"}),
+        )
+        .await;
+    assert_eq!(err_code(e), code::CONFLICT);
+    // Device-only settings and the switch itself stay out of reach.
+    let mut shell = settings.clone();
+    shell["exec"]["shell"] = "/bin/evil".into();
+    let e = dl.call("policy.set", json!({"settings": shell})).await;
+    assert_eq!(err_code(e), code::DENIED);
+    let mut switch = settings.clone();
+    switch["portal_policy"] = "write".into();
+    let e = dl.call("policy.set", json!({"settings": switch})).await;
+    assert_eq!(err_code(e), code::INVALID_PARAMS);
+    let e = dl
+        .call(
+            "policy.set",
+            json!({"settings": settings.clone(), "secret": "x"}),
+        )
+        .await;
+    assert_eq!(err_code(e), code::INVALID_PARAMS);
+
+    let new = dl
+        .call(
+            "policy.set",
+            json!({"settings": settings, "if_version": doc["version"]}),
+        )
+        .await
+        .unwrap();
+    assert_ne!(new["version"], doc["version"]);
+    // In force at once, saved in the file, audited with old and new values.
+    dl.write(
+        1,
+        json!({"path": fx.p("home/proj/a.txt"), "ctx": ctx()}),
+        b"x",
+    )
+    .await
+    .unwrap();
+    assert!(!dev.engine.policy().0.tools.bash);
+    let saved = DeviceConfig::load(&fx.config_file()).unwrap();
+    assert_eq!(saved.policy.folders[0].access, Access::Rw);
+    assert_eq!(saved.portal_policy, PortalPolicy::Write);
+    let audit = fx.audit();
+    assert!(
+        audit.contains(r#""target":"policy.folders""#) && audit.contains(r#"\"ro\""#),
+        "{audit}"
+    );
+    assert!(audit.contains(r#""target":"policy.tools.bash""#), "{audit}");
+    let changed = dl.notification("policy.changed", WAIT).await.unwrap();
+    assert_eq!(changed["version"], new["version"]);
+
+    // A change the owner makes on the device reaches the portal too.
+    let mut cfg = DeviceConfig::load(&fx.config_file()).unwrap();
+    cfg.policy.tools.bash = true;
+    cfg.save(&fx.config_file()).unwrap();
+    store.reload().unwrap();
+    for _ in 0..100 {
+        if dl.notifications("policy.changed").len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let all = dl.notifications("policy.changed");
+    assert_eq!(
+        all.last().unwrap()["settings"]["policy"]["tools"]["bash"],
+        true
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_labels_only_narrow() {
+    let fx = Fx::new();
+    let mut policy = fx.folders(&[("home/proj", Access::Rw)]);
+    policy.tools.write = false;
+    let (_mock, _dev, r, dl) = connected(&fx, policy, Profile::Headless, headless()).await;
+    let with = |tool: &str| json!({"chat": "chat-1", "tool": tool});
+    let e = dl
+        .write(
+            1,
+            json!({"path": fx.p("home/proj/n.txt"), "ctx": with("write")}),
+            b"x",
+        )
+        .await;
+    assert_eq!(err_code(e), code::DENIED);
+    dl.write(
+        2,
+        json!({"path": fx.p("home/proj/n.txt"), "ctx": with("edit")}),
+        b"x",
+    )
+    .await
+    .unwrap();
+    let e = dl
+        .write(
+            3,
+            json!({"path": fx.p("home/proj/n.txt"), "ctx": with("ls")}),
+            b"x",
+        )
+        .await;
+    assert_eq!(err_code(e), code::DENIED);
+    let e = dl
+        .write(
+            4,
+            json!({"path": fx.p("home/proj/n.txt"), "ctx": with("sudo")}),
+            b"x",
+        )
+        .await;
+    assert_eq!(err_code(e), code::INVALID_PARAMS);
+    let info = dl.call("device.info", json!({})).await.unwrap();
+    assert!(!info["tools"].to_string().contains("\"write\""), "{info}");
     r.stop().await;
 }
 

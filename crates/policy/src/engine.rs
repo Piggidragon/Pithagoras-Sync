@@ -1,9 +1,11 @@
-//! The engine every portal call goes through: resolve the path, decide by mode,
-//! folders, protected paths, patterns and taint, ask the owner where needed, audit.
+//! The engine every portal call goes through: resolve the path, decide by tools,
+//! hours, deny rules, mode, folders, protected paths, command rules, patterns and
+//! taint, ask the owner where needed, audit.
 //!
-//! Only the device owner changes the policy (config file or CLI, then `reload`).
-//! Nothing the portal sends reaches `reload`; the portal's only inputs here are the
-//! call itself and its taint flag, which can only add prompts.
+//! Only the device owner changes the policy (config file or CLI, or the portal's
+//! `policy.set` where the owner switched that on, then `reload`). A call's own
+//! inputs are the call itself, its tool label and its taint flag, which can only
+//! narrow what it may do.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,11 +18,12 @@ use tokio::sync::broadcast;
 
 use crate::approve::{Answer, ApprovalRequest, Approver};
 use crate::audit::{AuditLog, AuditRecord};
-use crate::config::{FolderGrant, FoldersShell, Mode, Policy, Profile};
+use crate::config::{FolderGrant, FoldersShell, Mode, Policy, Profile, TimeoutAnswer};
 use crate::paths::{PathError, parse_device_path, resolve, within};
 use crate::patterns::{command_prompts, names_protected};
-use crate::protected::{Protected, tool_config};
-use sync_proto::methods::Access;
+use crate::protected::{Protected, fold};
+use crate::rules::{Compiled, Rights};
+use sync_proto::methods::{Access, PiTool};
 
 /// System directories the Landlock-confined shell may read and execute from.
 const SYSTEM_READ: &[&str] = &[
@@ -52,11 +55,6 @@ const DEVICE_WRITE: &[&str] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Audit(AuditRecord),
-    /// A call waits for the owner's approval; the portal shows it in the chat.
-    Waiting {
-        id: Id,
-        chat: String,
-    },
 }
 
 /// Where a call comes from.
@@ -66,8 +64,12 @@ pub struct Call<'a> {
     pub chat: &'a str,
     /// The portal guard's taint flag. Adds to the device's own taint, never clears it.
     pub portal_tainted: bool,
-    /// Tool name for prompts and the audit log (`read`, `write`, `exec`, ...).
+    /// The method's tool name for prompts and the audit log (`read`, `write`,
+    /// `exec`, ...).
     pub tool: &'a str,
+    /// The pi tool the portal says the call is for; checked against the method and
+    /// the tools switched on.
+    pub pi_tool: Option<PiTool>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,10 +87,12 @@ pub enum Request<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandlockRules {
-    /// Readable (and executable) hierarchies or files.
+    /// Readable hierarchies or files.
     pub read: Vec<PathBuf>,
-    /// Writable hierarchies or files.
+    /// Writable (and readable) hierarchies or files.
     pub write: Vec<PathBuf>,
+    /// Hierarchies or files whose programs may run.
+    pub exec: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,13 +135,29 @@ enum Scope {
 #[derive(Debug, Default)]
 struct ChatState {
     tainted: bool,
-    approved: HashSet<Scope>,
+    /// Standing approvals and when they end (Unix ms; `None` with the grant).
+    approved: HashMap<Scope, Option<i64>>,
 }
 
 struct Snapshot {
     policy: Policy,
     profile: Profile,
     protected: Protected,
+    /// The policy's rules, or why they do not compile (then everything is denied).
+    rules: Result<Compiled, String>,
+}
+
+impl Snapshot {
+    fn new(policy: Policy, profile: Profile, home: &Path, own_dirs: &[PathBuf]) -> Snapshot {
+        let protected = Protected::new(home, own_dirs, &policy.protected);
+        let rules = policy.compile(home);
+        Snapshot {
+            policy,
+            profile,
+            protected,
+            rules,
+        }
+    }
 }
 
 enum Verdict {
@@ -187,14 +207,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(policy: Policy, profile: Profile, opts: EngineOptions) -> Engine {
-        let protected = Protected::new(&opts.home, &opts.own_dirs, &policy.protected);
+        let snap = Snapshot::new(policy, profile, &opts.home, &opts.own_dirs);
         let (events, _) = broadcast::channel(256);
         Engine {
-            snap: RwLock::new(Arc::new(Snapshot {
-                policy,
-                profile,
-                protected,
-            })),
+            snap: RwLock::new(Arc::new(snap)),
             home: opts.home,
             own_dirs: opts.own_dirs,
             chats: Mutex::new(HashMap::new()),
@@ -215,18 +231,16 @@ impl Engine {
         (self.clock)()
     }
 
-    /// Takes a new policy from the owner (config file or CLI). Audited as a mode
-    /// change when the mode differs.
+    /// Takes a new policy from the owner (config file, CLI or the portal where the
+    /// owner allows it). Audited when it differs.
     pub fn reload(&self, policy: Policy, profile: Profile) {
-        let protected = Protected::new(&self.home, &self.own_dirs, &policy.protected);
-        let old = std::mem::replace(
-            &mut *self.snap.write().unwrap(),
-            Arc::new(Snapshot {
-                policy,
-                profile,
-                protected,
-            }),
-        );
+        self.reload_by(policy, profile, "the device owner");
+    }
+
+    /// `reload`, saying who changed it in the audit log.
+    pub fn reload_by(&self, policy: Policy, profile: Profile, by: &str) {
+        let snap = Snapshot::new(policy, profile, &self.home, &self.own_dirs);
+        let old = std::mem::replace(&mut *self.snap.write().unwrap(), Arc::new(snap));
         let new = self.snapshot();
         if old.policy != new.policy {
             let now = self.now();
@@ -235,7 +249,7 @@ impl Engine {
                 "policy",
                 &format!("{:?}", new.policy.effective_mode(new.profile, now)).to_lowercase(),
                 "changed",
-                Some("changed by the device owner".into()),
+                Some(format!("changed by {by}")),
             );
         }
     }
@@ -258,12 +272,14 @@ impl Engine {
         self.landlock
     }
 
-    /// Panic: deny everything and forget per-chat approvals until `unlock`.
+    /// Panic: deny everything, answer open approvals with deny and forget per-chat
+    /// approvals until `unlock`.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
         for c in self.chats.lock().unwrap().values_mut() {
             c.approved.clear();
         }
+        self.approver.cancel_all();
         self.record(None, "pause", "", "paused", None);
     }
 
@@ -358,7 +374,7 @@ impl Engine {
         if call.portal_tainted {
             self.mark_tainted(call.chat);
         }
-        let verdict = match self.decide(call.chat, &req) {
+        let verdict = match self.decide(call, &req) {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -388,23 +404,35 @@ impl Engine {
             Request::Write { preview, .. } => preview.clone(),
             _ => None,
         };
+        let opts = self.snapshot().policy.approvals.clone();
+        let timeout = Duration::from_secs(opts.timeout_secs);
         let request = ApprovalRequest {
+            call: call.id.cloned(),
             chat: call.chat.to_string(),
             tool: call.tool.to_string(),
             target: target.clone(),
             reasons,
             preview,
             offer_chat: offer.is_some(),
+            max_minutes: opts.max_minutes,
+            expires_ms: self.now() + timeout.as_millis() as i64,
+            on_timeout_allow: opts.on_timeout == TimeoutAnswer::Allow,
         };
-        if let Some(id) = call.id {
-            let _ = self.events.send(Event::Waiting {
-                id: id.clone(),
-                chat: call.chat.to_string(),
-            });
-        }
-        let timeout = Duration::from_secs(self.snapshot().policy.approval_timeout_secs);
         let answer = match tokio::time::timeout(timeout, self.approver.ask(&request)).await {
             Ok(a) => a,
+            Err(_) if opts.on_timeout == TimeoutAnswer::Allow && !self.is_paused() => {
+                self.record(
+                    Some(call.chat),
+                    call.tool,
+                    &target,
+                    "approved",
+                    Some(format!(
+                        "no answer within {}s, and this device allows on timeout ({reason_text})",
+                        timeout.as_secs()
+                    )),
+                );
+                return Ok(permit);
+            }
             Err(_) => {
                 return Err(Refusal::Denied(deny(format!(
                     "no answer to the approval within {}s",
@@ -420,15 +448,25 @@ impl Engine {
             Answer::Deny => Err(Refusal::Denied(deny(format!(
                 "the owner denied it ({reason_text})"
             )))),
-            Answer::Once | Answer::ForChat => {
-                if let (Answer::ForChat, Some(scope)) = (answer, offer) {
+            Answer::Once | Answer::ForChat | Answer::ForTime(_) => {
+                let until = match answer {
+                    Answer::ForChat if opts.remember_minutes == 0 => Some(None),
+                    Answer::ForChat => {
+                        Some(Some(self.now() + i64::from(opts.remember_minutes) * 60_000))
+                    }
+                    Answer::ForTime(m) => Some(Some(
+                        self.now() + i64::from(m.min(opts.max_minutes)) * 60_000,
+                    )),
+                    _ => None,
+                };
+                if let (Some(until), Some(scope)) = (until, offer) {
                     self.chats
                         .lock()
                         .unwrap()
                         .entry(call.chat.to_string())
                         .or_default()
                         .approved
-                        .insert(scope);
+                        .insert(scope, until);
                 }
                 self.record(
                     Some(call.chat),
@@ -453,25 +491,54 @@ impl Engine {
         let folders = mode == Mode::Folders;
         let grants = resolved_grants(&snap.policy.folders);
         Box::new(move |p: &Path| {
-            if folders && grant_for(p, &grants).is_none() {
+            let Ok(rules) = &snap.rules else {
+                return false;
+            };
+            if rules.denied(p, Rights::READ).is_some() {
+                return false;
+            }
+            if folders && grant_for(p, &grants).is_none() && rules.glob_grant(p).is_none() {
                 return false;
             }
             !(protections && snap.protected.check(p, false, &grants).is_some())
         })
     }
 
-    fn decide(&self, chat: &str, req: &Request<'_>) -> Result<Verdict, PathError> {
+    fn decide(&self, call: &Call<'_>, req: &Request<'_>) -> Result<Verdict, PathError> {
         let snap = self.snapshot();
         let policy = &snap.policy;
-        let mode = policy.effective_mode(snap.profile, self.now());
+        let rules = match &snap.rules {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(Verdict::Deny(format!(
+                    "the device's policy has a broken rule ({e}), so it refuses everything"
+                )));
+            }
+        };
+        if let Some(why) = policy.tools.refusal(call.tool, call.pi_tool) {
+            return Ok(Verdict::Deny(why));
+        }
+        let now = self.now();
+        if !rules.within_hours(now) {
+            return Ok(Verdict::Deny(
+                "outside the hours this device works for the portal".into(),
+            ));
+        }
+        let mode = policy.effective_mode(snap.profile, now);
         let grants = resolved_grants(&policy.folders);
         let (tainted, approved) = {
             let chats = self.chats.lock().unwrap();
-            let c = chats.get(chat);
-            (
-                c.is_some_and(|c| c.tainted),
-                c.map(|c| c.approved.clone()).unwrap_or_default(),
-            )
+            let c = chats.get(call.chat);
+            let approved: HashSet<Scope> = c
+                .map(|c| {
+                    c.approved
+                        .iter()
+                        .filter(|(_, until)| until.is_none_or(|u| now < u))
+                        .map(|(s, _)| *s)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (c.is_some_and(|c| c.tainted), approved)
         };
         let full = mode == Mode::Full;
         let protections = !full || policy.full.protected_paths;
@@ -483,6 +550,15 @@ impl Engine {
             Request::Read(p) | Request::Write { path: p, .. } => {
                 let write = matches!(req, Request::Write { .. });
                 let path = resolve(&parse_device_path(p)?)?;
+                let right = if write { Rights::WRITE } else { Rights::READ };
+                if let Some(r) = rules.denied(&path, right) {
+                    return Ok(Verdict::Deny(format!(
+                        "{} is denied on this device (rule {} {})",
+                        path.display(),
+                        r.path,
+                        r.rights
+                    )));
+                }
                 let mut root = None;
                 match mode {
                     Mode::Ask => {
@@ -493,19 +569,26 @@ impl Engine {
                         }
                     }
                     Mode::Folders => {
-                        let Some(g) = grant_for(&path, &grants) else {
+                        let access = if let Some(g) = grant_for(&path, &grants) {
+                            root = Some(g.path.clone());
+                            (g.access, g.path.display().to_string())
+                        } else if let Some(g) = rules.glob_grant(&path) {
+                            // A glob names files, not a folder to open beneath; the
+                            // resolved path's own folder is the root.
+                            root = path.parent().map(Path::to_path_buf);
+                            (g.access, g.glob.clone())
+                        } else {
                             return Ok(Verdict::Deny(format!(
                                 "{} is outside the folders granted on this device",
                                 path.display()
                             )));
                         };
-                        if write && g.access == Access::Ro {
+                        if write && access.0 == Access::Ro {
                             return Ok(Verdict::Deny(format!(
                                 "{} is read-only on this device",
-                                g.path.display()
+                                access.1
                             )));
                         }
-                        root = Some(g.path.clone());
                     }
                     Mode::Full => {}
                 }
@@ -513,7 +596,7 @@ impl Engine {
                     if let Some(e) = snap.protected.check(&path, write, &grants) {
                         reasons.push(format!("{} is a protected path", e.display()));
                     }
-                    if write && let Some(t) = tool_config(&path) {
+                    if write && let Some(t) = snap.protected.tool_config(&path) {
                         reasons.push(format!("writes to {t} ask first"));
                     }
                 }
@@ -528,45 +611,71 @@ impl Engine {
             }
             Request::Exec { command, cwd } => {
                 let cwd = resolve(&parse_device_path(cwd)?)?;
+                if let Some(r) = rules.denied(&cwd, Rights::EXECUTE) {
+                    return Ok(Verdict::Deny(format!(
+                        "commands are denied in {} (rule {} {})",
+                        cwd.display(),
+                        r.path,
+                        r.rights
+                    )));
+                }
+                if let Some(why) = rules.command_refusal(command) {
+                    return Ok(Verdict::Deny(why));
+                }
+                let never_ask = rules.never_ask(command);
+                let mut asks = Vec::new();
                 let mut confine = Confine::None;
                 match mode {
-                    Mode::Ask => reasons.push("Ask mode: every command asks".to_string()),
+                    Mode::Ask => asks.push("Ask mode: every command asks".to_string()),
                     Mode::Folders => {
-                        if grant_for(&cwd, &grants).is_none() {
+                        let Some(g) = grant_for(&cwd, &grants) else {
                             return Ok(Verdict::Deny(format!(
                                 "working folder {} is outside the folders granted on this device",
                                 cwd.display()
                             )));
+                        };
+                        if !g.execute {
+                            return Ok(Verdict::Deny(format!(
+                                "{} does not allow commands on this device (no execute right)",
+                                g.path.display()
+                            )));
                         }
                         match policy.folders_shell {
                             FoldersShell::Landlock if self.landlock => {
-                                confine =
-                                    Confine::Landlock(landlock_rules(&grants, &snap.protected));
+                                confine = Confine::Landlock(landlock_rules(
+                                    &grants,
+                                    &snap.protected,
+                                    &rules.denied_paths(),
+                                ));
                             }
-                            FoldersShell::Landlock => reasons.push(
+                            FoldersShell::Landlock => asks.push(
                                 "the kernel has no Landlock, so every command asks".to_string(),
                             ),
                             FoldersShell::Prompt => {
-                                reasons.push("Folders mode: every command asks".to_string())
+                                asks.push("Folders mode: every command asks".to_string())
                             }
                             FoldersShell::Unconfined => {
-                                reasons.extend(command_prompts(command, &cwd, &self.home));
-                                reasons.extend(names_protected(
-                                    command,
-                                    &snap.protected,
-                                    &self.home,
-                                ));
+                                asks.extend(command_prompts(command, &cwd, &self.home));
+                                asks.extend(names_protected(command, &snap.protected, &self.home));
                             }
                         }
                     }
                     Mode::Full => {
                         if policy.full.pattern_prompts {
-                            reasons.extend(command_prompts(command, &cwd, &self.home));
+                            asks.extend(command_prompts(command, &cwd, &self.home));
                         }
                         if policy.full.protected_paths {
-                            reasons.extend(names_protected(command, &snap.protected, &self.home));
+                            asks.extend(names_protected(command, &snap.protected, &self.home));
                         }
                     }
+                }
+                // The owner's never-ask list skips the mode's and the patterns'
+                // questions; the confinement above and the taint question stay.
+                if !never_ask {
+                    reasons.extend(asks);
+                }
+                if let Some(r) = rules.always_ask(command) {
+                    reasons.push(format!("the command matches the always-ask rule {r}"));
                 }
                 if taint_prompts {
                     reasons.push("this chat has seen untrusted content".to_string());
@@ -598,6 +707,7 @@ fn resolved_grants(folders: &[FolderGrant]) -> Vec<FolderGrant> {
             std::fs::canonicalize(&g.path).ok().map(|path| FolderGrant {
                 path,
                 access: g.access,
+                execute: g.execute,
             })
         })
         .collect()
@@ -612,33 +722,101 @@ fn grant_for<'a>(path: &Path, grants: &'a [FolderGrant]) -> Option<&'a FolderGra
         .max_by_key(|g| g.path.components().count())
 }
 
-/// The Landlock rules for the Folders shell: system directories readable, granted
-/// folders readable or writable, minus the protected paths inside them.
-pub fn landlock_rules(grants: &[FolderGrant], protected: &Protected) -> LandlockRules {
-    let mut read: Vec<PathBuf> = SYSTEM_READ
-        .iter()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
+/// The Landlock rules for the Folders shell: system directories readable and
+/// executable, granted folders readable or writable (and executable where the
+/// grant says so), minus the protected paths and the denied paths inside them.
+pub fn landlock_rules(
+    grants: &[FolderGrant],
+    protected: &Protected,
+    denied: &[(PathBuf, Rights)],
+) -> LandlockRules {
+    let existing = |list: &[&str]| -> Vec<PathBuf> {
+        list.iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect()
+    };
+    // Folded, as the protected entries are, to compare against.
+    let denied_for = |right: Rights| -> Vec<PathBuf> {
+        denied
+            .iter()
+            .filter(|(_, r)| r.overlaps(right))
+            .map(|(p, _)| fold(p))
+            .collect()
+    };
+    let (no_read, no_write, no_exec) = (
+        denied_for(Rights::READ),
+        denied_for(Rights::WRITE),
+        denied_for(Rights::EXECUTE),
+    );
+    let mut read = existing(SYSTEM_READ);
+    read.retain(|p| !no_read.iter().any(|d| within(&fold(p), d)));
     read.extend(
         protected
             .write_only()
             .iter()
-            .filter(|p| p.exists())
+            .filter(|p| p.exists() && !no_read.iter().any(|d| within(p, d)))
             .cloned(),
     );
-    let mut write: Vec<PathBuf> = DEVICE_WRITE
-        .iter()
-        .map(PathBuf::from)
-        .filter(|p| p.exists())
-        .collect();
+    let mut exec = existing(SYSTEM_READ);
+    exec.retain(|p| !no_exec.iter().any(|d| within(&fold(p), d)));
+    let mut write = existing(DEVICE_WRITE);
     for g in grants {
         match g.access {
-            Access::Ro => carve(&g.path, &protected.inside(&g.path, false), &mut read),
-            Access::Rw => carve(&g.path, &protected.inside(&g.path, true), &mut write),
+            Access::Ro => add(
+                &g.path,
+                protected.inside(&g.path, false),
+                &no_read,
+                &mut read,
+            ),
+            Access::Rw => {
+                // A write rule grants reading too, so paths denied either way stay out.
+                let mut no_rw = no_read.clone();
+                no_rw.extend(no_write.iter().cloned());
+                add(&g.path, protected.inside(&g.path, true), &no_rw, &mut write);
+                // What is only write-denied inside stays readable.
+                for (d, _) in denied.iter().filter(|(_, r)| r.write && !r.read) {
+                    let df = fold(d);
+                    if within(&df, &fold(&g.path))
+                        && !no_read.iter().any(|r| within(&df, r))
+                        && protected
+                            .inside(&g.path, false)
+                            .iter()
+                            .all(|p| !within(&df, p))
+                        && d.exists()
+                    {
+                        read.push(d.clone());
+                    }
+                }
+            }
+        }
+        if g.execute {
+            add(
+                &g.path,
+                protected.inside(&g.path, false),
+                &no_exec,
+                &mut exec,
+            );
         }
     }
-    LandlockRules { read, write }
+    LandlockRules { read, write, exec }
+}
+
+/// Adds the rule for `dir` minus the paths carved out of it: none when `dir` itself
+/// lies in a denied path.
+fn add(dir: &Path, protected_inside: Vec<&Path>, denied: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let folded = fold(dir);
+    if denied.iter().any(|d| within(&folded, d)) {
+        return;
+    }
+    let mut inside = protected_inside;
+    inside.extend(
+        denied
+            .iter()
+            .filter(|d| d.as_path() != folded && within(d, &folded))
+            .map(PathBuf::as_path),
+    );
+    carve(dir, &inside, out);
 }
 
 /// Adds `dir` as one rule, or, when protected paths lie inside it, each of its

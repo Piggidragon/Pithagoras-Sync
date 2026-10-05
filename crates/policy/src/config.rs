@@ -10,8 +10,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 pub use sync_proto::methods::{Access, Mode};
 
-/// Desktop: someone can answer approval notifications. Headless: nobody can, so
-/// Ask mode does not exist and whatever would prompt is denied.
+pub use crate::rules::{
+    CommandRule, Commands, Compiled, DenyRule, GlobGrant, Hours, Rights, Tools,
+};
+
+/// Desktop: a person uses the machine (owner confirmations go through `su` on the
+/// terminal). Headless: a server. Both answer approvals through the portal or the
+/// local `approve` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
@@ -49,6 +54,9 @@ impl FoldersShell {
 pub struct FolderGrant {
     pub path: PathBuf,
     pub access: Access,
+    /// Commands may run here (as their working folder) and run programs from here.
+    #[serde(default)]
+    pub execute: bool,
 }
 
 /// What stays on in Full mode. Every switch defaults to the restricted side; turning
@@ -77,13 +85,111 @@ impl Default for FullOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ProtectedOptions {
     /// More protected paths (absolute, or `~/...`).
     pub extra: Vec<String>,
     /// Built-in protected paths the owner releases by name (absolute, or `~/...`).
     pub allow: Vec<String>,
+    /// Names that, anywhere in a path, make writes ask (`.git`, `.envrc`, ...).
+    pub tool_config: Vec<String>,
+}
+
+impl Default for ProtectedOptions {
+    fn default() -> Self {
+        ProtectedOptions {
+            extra: Vec::new(),
+            allow: Vec::new(),
+            tool_config: crate::protected::TOOL_CONFIG
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+/// What an approval nobody answers in time turns into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeoutAnswer {
+    #[default]
+    Deny,
+    /// Allow this call once (the owner's explicit choice).
+    Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ApprovalOptions {
+    /// How long a call waits for an answer.
+    pub timeout_secs: u64,
+    pub on_timeout: TimeoutAnswer,
+    /// How long an "allow for this chat" answer lasts; 0 means until the chat's
+    /// grant ends.
+    pub remember_minutes: u32,
+    /// The longest "allow for a time" answer the device accepts.
+    pub max_minutes: u32,
+    /// Also show approvals as desktop notifications (Allow once / Deny). Off: they
+    /// come back as the device's own dialog in phase 2.
+    pub desktop_notifications: bool,
+}
+
+impl Default for ApprovalOptions {
+    fn default() -> Self {
+        ApprovalOptions {
+            timeout_secs: 120,
+            on_timeout: TimeoutAnswer::Deny,
+            remember_minutes: 60,
+            max_minutes: 480,
+            desktop_notifications: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Elevation {
+    #[default]
+    Off,
+    /// `sudo ...` commands run through sudo with the password the owner stored on
+    /// the device (`secret set elevation`), or a sudoers rule of the owner's.
+    Sudo,
+}
+
+/// Where the elevation password is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretStorage {
+    /// Only in the running client's memory: set again after each start.
+    #[default]
+    Memory,
+    /// A 0600 file in the client's config folder, which survives restarts. Any
+    /// unconfined command of the same user could read it.
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PrivilegeOptions {
+    /// The client may run as root (Linux) or an elevated administrator (Windows).
+    pub allow_root: bool,
+    pub elevation: Elevation,
+    /// The sudo the client runs (device only).
+    pub sudo_path: PathBuf,
+    /// Device only.
+    pub secret_storage: SecretStorage,
+}
+
+impl Default for PrivilegeOptions {
+    fn default() -> Self {
+        PrivilegeOptions {
+            allow_root: false,
+            elevation: Elevation::Off,
+            sudo_path: PathBuf::from("/usr/bin/sudo"),
+            secret_storage: SecretStorage::Memory,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,31 +200,42 @@ pub struct Policy {
     pub folders_shell: FoldersShell,
     pub full: FullOptions,
     pub protected: ProtectedOptions,
-    /// An unanswered approval is denied after this long.
-    pub approval_timeout_secs: u64,
+    pub tools: Tools,
+    /// Paths and globs refused in every mode.
+    pub deny: Vec<DenyRule>,
+    /// Globs the file tools may reach in Folders mode, besides the folders.
+    pub allow_globs: Vec<GlobGrant>,
+    pub commands: Commands,
+    /// Absent: every hour of every day.
+    pub hours: Option<Hours>,
+    pub approvals: ApprovalOptions,
+    pub privilege: PrivilegeOptions,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Policy {
-            mode: Mode::Folders,
+            mode: Mode::Ask,
             folders: Vec::new(),
             folders_shell: FoldersShell::default(),
             full: FullOptions::default(),
             protected: ProtectedOptions::default(),
-            approval_timeout_secs: 120,
+            tools: Tools::default(),
+            deny: Vec::new(),
+            allow_globs: Vec::new(),
+            commands: Commands::default(),
+            hours: None,
+            approvals: ApprovalOptions::default(),
+            privilege: PrivilegeOptions::default(),
         }
     }
 }
 
 impl Policy {
-    /// The restricted default for a profile: Ask where someone can answer, Folders
-    /// (with nothing granted) where nobody can.
-    pub fn default_mode(profile: Profile) -> Mode {
-        match profile {
-            Profile::Desktop => Mode::Ask,
-            Profile::Headless => Mode::Folders,
-        }
+    /// The restricted default, the mode Full falls back to: Ask, on every device
+    /// (approvals come through the portal or the local `approve` command).
+    pub fn default_mode(_profile: Profile) -> Mode {
+        Mode::Ask
     }
 
     /// The mode in force at `now_ms`: Full falls back once its time is up.
@@ -158,19 +275,42 @@ impl Policy {
         false
     }
 
-    pub fn validate(&self, profile: Profile) -> Result<(), String> {
-        if profile == Profile::Headless && self.mode == Mode::Ask {
-            return Err("Ask mode needs a desktop to answer prompts; use folders or full".into());
-        }
+    pub fn validate(&self, _profile: Profile) -> Result<(), String> {
         for f in &self.folders {
             if !f.path.is_absolute() {
                 return Err(format!("folder {} is not absolute", f.path.display()));
             }
         }
-        if self.approval_timeout_secs == 0 || self.approval_timeout_secs > 3600 {
-            return Err("approval_timeout_secs must be between 1 and 3600".into());
+        let a = &self.approvals;
+        if a.timeout_secs == 0 || a.timeout_secs > 3600 {
+            return Err("approvals.timeout_secs must be between 1 and 3600".into());
         }
-        Ok(())
+        if a.max_minutes > 7 * 24 * 60 || a.remember_minutes > 7 * 24 * 60 {
+            return Err("approvals: minutes must be at most a week (10080)".into());
+        }
+        if !self.privilege.sudo_path.is_absolute() {
+            return Err("privilege.sudo_path must be absolute".into());
+        }
+        for t in &self.protected.tool_config {
+            if t.is_empty() || t.contains(['/', '\\']) {
+                return Err(format!(
+                    "protected.tool_config {t:?}: a single file or folder name"
+                ));
+            }
+        }
+        // Compiling checks every rule; any home will do for that.
+        self.compile(Path::new("/")).map(|_| ())
+    }
+
+    /// The deny rules, glob grants, command lists and hours, compiled.
+    pub fn compile(&self, home: &Path) -> Result<Compiled, String> {
+        Compiled::new(
+            home,
+            &self.deny,
+            &self.allow_globs,
+            &self.commands,
+            self.hours.as_ref(),
+        )
     }
 }
 
@@ -204,6 +344,22 @@ pub struct ExecOptions {
     pub shell: Option<PathBuf>,
 }
 
+impl ExecOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_timeout_secs == 0 || self.max_running == 0 || self.output_cap_bytes == 0 {
+            return Err(
+                "exec: max_timeout_secs, max_running and output_cap_bytes must be above 0".into(),
+            );
+        }
+        if let Some(s) = &self.shell
+            && !s.is_absolute()
+        {
+            return Err("exec.shell must be absolute".into());
+        }
+        Ok(())
+    }
+}
+
 impl Default for ExecOptions {
     fn default() -> Self {
         ExecOptions {
@@ -216,10 +372,36 @@ impl Default for ExecOptions {
     }
 }
 
+/// What the portal's Devices tab may do with this device's settings. Only the CLI
+/// changes it, never the portal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PortalPolicy {
+    /// The portal neither sees nor changes them.
+    Off,
+    /// The portal shows them.
+    #[default]
+    Read,
+    /// The owner's portal session may change them, widening included; each change is
+    /// audited with its old and new value.
+    Write,
+}
+
+impl PortalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortalPolicy::Off => "off",
+            PortalPolicy::Read => "read",
+            PortalPolicy::Write => "write",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeviceConfig {
     pub profile: Profile,
+    pub portal_policy: PortalPolicy,
     pub portal: Option<PortalConfig>,
     pub policy: Policy,
     pub exec: ExecOptions,
@@ -235,12 +417,14 @@ impl DeviceConfig {
         let cfg: DeviceConfig =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         cfg.policy.validate(cfg.profile)?;
+        cfg.exec.validate()?;
         Ok(cfg)
     }
 
     /// Writes the file atomically with mode 0600.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         self.policy.validate(self.profile)?;
+        self.exec.validate()?;
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         write_private(path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
     }
@@ -389,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             p.effective_mode(Profile::Headless, 1_000 + eight_h),
-            Mode::Folders
+            Mode::Ask
         );
     }
 
@@ -404,20 +588,59 @@ mod tests {
     #[test]
     fn full_written_by_hand_without_a_start_counts_as_expired() {
         let mut p: Policy = toml::from_str("mode = \"full\"").unwrap();
-        assert_eq!(p.effective_mode(Profile::Headless, 0), Mode::Folders);
+        assert_eq!(p.effective_mode(Profile::Headless, 0), Mode::Ask);
         assert!(p.date_full(5));
         assert_eq!(p.effective_mode(Profile::Headless, 5), Mode::Full);
         assert!(!p.date_full(6));
     }
 
     #[test]
-    fn ask_does_not_exist_headless() {
-        let p = Policy {
-            mode: Mode::Ask,
-            ..Policy::default()
-        };
-        assert!(p.validate(Profile::Headless).is_err());
+    fn ask_is_the_default_everywhere() {
+        let p = Policy::default();
+        assert_eq!(p.mode, Mode::Ask);
+        assert!(p.validate(Profile::Headless).is_ok());
         assert!(p.validate(Profile::Desktop).is_ok());
+        let cfg: DeviceConfig = toml::from_str("profile = \"headless\"").unwrap();
+        assert_eq!(cfg.policy.effective_mode(cfg.profile, 0), Mode::Ask);
+    }
+
+    #[test]
+    fn every_setting_defaults_to_the_safe_side() {
+        let p = Policy::default();
+        assert!(!p.privilege.allow_root);
+        assert_eq!(p.privilege.elevation, Elevation::Off);
+        assert_eq!(p.privilege.secret_storage, SecretStorage::Memory);
+        assert_eq!(p.approvals.on_timeout, TimeoutAnswer::Deny);
+        assert!(!p.approvals.desktop_notifications);
+        assert!(p.folders.is_empty() && p.allow_globs.is_empty());
+        assert_eq!(p.folders_shell, FoldersShell::Landlock);
+        assert!(p.full.pattern_prompts && p.full.protected_paths && p.full.taint_prompts);
+        assert_eq!(p.full.expiry_hours, 8);
+        assert!(p.commands.never_ask.is_empty());
+        assert!(p.hours.is_none());
+        assert_eq!(
+            p.protected.tool_config,
+            [".git", ".envrc", ".vscode", ".idea"]
+        );
+        let g: FolderGrant = toml::from_str("path = \"/a\"\naccess = \"rw\"").unwrap();
+        assert!(!g.execute);
+    }
+
+    #[test]
+    fn broken_rules_do_not_load() {
+        for text in [
+            "[[policy.commands.deny]]\nregex = \"(\"\n",
+            "[[policy.commands.allow]]\nexact = \"a\"\nprefix = \"b\"\n",
+            "[[policy.deny]]\npath = \"relative\"\n",
+            "[[policy.deny]]\npath = \"/a\"\nrights = \"q\"\n",
+            "[policy.hours]\nfrom = \"25:00\"\nto = \"01:00\"\n",
+            "[policy.approvals]\ntimeout_secs = 0\n",
+            "[policy.protected]\ntool_config = [\"a/b\"]\n",
+        ] {
+            let cfg: Result<DeviceConfig, _> = toml::from_str(text);
+            let ok = cfg.is_ok_and(|c| c.policy.validate(c.profile).is_ok());
+            assert!(!ok, "{text}");
+        }
     }
 
     #[test]
@@ -428,6 +651,15 @@ mod tests {
         cfg.policy.folders.push(FolderGrant {
             path: "/srv/a".into(),
             access: Access::Ro,
+            execute: true,
+        });
+        cfg.policy.deny.push(DenyRule {
+            path: "~/x/**".into(),
+            rights: "wx".parse().unwrap(),
+        });
+        cfg.policy.commands.deny.push(CommandRule {
+            prefix: Some("rm ".into()),
+            ..Default::default()
         });
         cfg.save(&path).unwrap();
         assert_eq!(DeviceConfig::load(&path).unwrap(), cfg);

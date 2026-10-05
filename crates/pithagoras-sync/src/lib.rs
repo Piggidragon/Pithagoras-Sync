@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod cli;
+pub mod config_cmd;
 pub mod control;
 pub mod daemon;
 pub mod install;

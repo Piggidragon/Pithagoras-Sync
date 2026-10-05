@@ -309,17 +309,33 @@ async fn landlock_keeps_the_shell_in_its_folders() {
     }
     let f = fx();
     let home = f.dir.join("home");
-    for d in ["home/proj", "home/.ssh", "outside"] {
+    for d in ["home/proj", "home/private", "home/.ssh", "outside", "tools"] {
         std::fs::create_dir_all(f.dir.join(d)).unwrap();
     }
     std::fs::write(f.dir.join("outside/secret"), "s").unwrap();
     std::fs::write(home.join(".ssh/id"), "key").unwrap();
+    std::fs::write(home.join("private/p"), "p").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for script in [home.join("proj/run.sh"), f.dir.join("tools/tool.sh")] {
+        std::fs::write(&script, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let protected = sync_policy::protected::Protected::new(&home, &[], &Default::default());
-    let grants = vec![sync_policy::FolderGrant {
-        path: home.clone(),
-        access: sync_policy::Access::Rw,
-    }];
-    let rules = sync_policy::engine::landlock_rules(&grants, &protected);
+    let grants = vec![
+        sync_policy::FolderGrant {
+            path: home.clone(),
+            access: sync_policy::Access::Rw,
+            execute: true,
+        },
+        // Readable, but its programs do not run.
+        sync_policy::FolderGrant {
+            path: f.dir.join("tools"),
+            access: sync_policy::Access::Ro,
+            execute: false,
+        },
+    ];
+    let denied = [(home.join("private"), sync_policy::config::Rights::ALL)];
+    let rules = sync_policy::engine::landlock_rules(&grants, &protected, &denied);
     let p = Permit {
         path: home.join("proj"),
         root: Some(home.clone()),
@@ -334,9 +350,14 @@ async fn landlock_keeps_the_shell_in_its_folders() {
          cat {h}/.ssh/id 2>/dev/null || echo NO_READ_SSH; \
          echo x > {h}/.bashrc 2>/dev/null || echo NO_WRITE_HOME_ROOT; \
          echo t > $TMPDIR/t && echo WROTE_TMP; \
-         kill -0 {me} 2>/dev/null && echo SIGNAL_OUT || echo NO_SIGNAL_OUT",
+         kill -0 {me} 2>/dev/null && echo SIGNAL_OUT || echo NO_SIGNAL_OUT; \
+         {h}/proj/run.sh >/dev/null && echo RAN_INSIDE; \
+         cat {t}/tool.sh >/dev/null && echo READ_TOOLS; \
+         {t}/tool.sh 2>/dev/null || echo NO_EXEC_TOOLS; \
+         cat {h}/private/p 2>/dev/null || echo NO_READ_DENIED",
         h = home.display(),
         o = f.dir.join("outside").display(),
+        t = f.dir.join("tools").display(),
     );
     let (out, o) = run(&e, 1, &cmd, &p, None).await;
     assert_eq!(o.code, Some(0), "{out} {o:?}");
@@ -347,6 +368,10 @@ async fn landlock_keeps_the_shell_in_its_folders() {
         "NO_READ_SSH",
         "NO_WRITE_HOME_ROOT",
         "WROTE_TMP",
+        "RAN_INSIDE",
+        "READ_TOOLS",
+        "NO_EXEC_TOOLS",
+        "NO_READ_DENIED",
     ] {
         assert!(out.contains(want), "missing {want}: {out}");
     }

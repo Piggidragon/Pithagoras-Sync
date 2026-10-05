@@ -2,31 +2,51 @@
 //! one JSON line out. A Unix socket in the private runtime directory on Linux, a
 //! named pipe on Windows.
 //!
-//! The channel carries no policy: `mode` and `folder` edit the config file as the
-//! owner and then ask for a `reload`. Commands the client runs for the portal may
-//! still ask for `status` or `panic`, never for `unlock` or `reload`.
+//! The channel carries no policy: `mode`, `folder` and `config` edit the config file
+//! as the owner and then ask for a `reload`. It also carries the owner's answers to
+//! approvals and the elevation secret. Commands the client runs for the portal may
+//! still ask for `status` or `panic`, nothing else.
 
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sync_connector::LinkStatus;
+use sync_policy::secret::Secret;
 use sync_policy::{Mode, Profile};
-use sync_proto::methods::FolderInfo;
+use sync_proto::methods::{ApprovalInfo, Choice, FolderInfo};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "cmd", rename_all = "lowercase")]
+/// `Debug` shows no secret: `Secret` prints as `<secret>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
     Panic,
     Unlock,
     Reload,
+    /// The approvals waiting now.
+    Approvals,
+    /// The owner's answer to approval `id`.
+    Answer {
+        id: u64,
+        answer: Choice,
+        #[serde(default)]
+        minutes: Option<u32>,
+    },
+    /// Sets the elevation password (only `elevation` exists).
+    SecretSet {
+        name: String,
+        value: Secret,
+    },
+    SecretClear {
+        name: String,
+    },
 }
 
 impl Request {
     /// Whether a command the client itself runs (a descendant) may send this.
-    pub fn allowed_from_own_commands(self) -> bool {
+    pub fn allowed_from_own_commands(&self) -> bool {
         matches!(self, Request::Status | Request::Panic)
     }
 }
@@ -46,8 +66,17 @@ pub struct Status {
     pub folders: Vec<FolderInfo>,
     pub folders_shell: String,
     pub shell: String,
-    /// Who answers approvals: `notifications`, or why nobody can.
+    /// Who answers approvals.
     pub approvals: String,
+    /// Approvals waiting now.
+    #[serde(default)]
+    pub approvals_waiting: usize,
+    /// `off`, `read` or `write`.
+    #[serde(default)]
+    pub portal_policy: String,
+    /// `off`, or `sudo` with whether the secret is set.
+    #[serde(default)]
+    pub elevation: String,
     pub running_commands: usize,
     pub cgroups: bool,
     pub landlock: bool,
@@ -62,6 +91,8 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<Vec<ApprovalInfo>>,
 }
 
 impl Reply {
@@ -70,6 +101,7 @@ impl Reply {
             ok: true,
             error: None,
             status: None,
+            approvals: None,
         }
     }
 
@@ -78,6 +110,7 @@ impl Reply {
             ok: false,
             error: Some(e.into()),
             status: None,
+            approvals: None,
         }
     }
 }
@@ -207,6 +240,19 @@ mod tests {
         assert!(Request::Panic.allowed_from_own_commands());
         assert!(!Request::Unlock.allowed_from_own_commands());
         assert!(!Request::Reload.allowed_from_own_commands());
+        assert!(!Request::Approvals.allowed_from_own_commands());
+        let answer = Request::Answer {
+            id: 1,
+            answer: Choice::Once,
+            minutes: None,
+        };
+        assert!(!answer.allowed_from_own_commands());
+        let secret = Request::SecretSet {
+            name: "elevation".into(),
+            value: Secret::new("hunter2".into()),
+        };
+        assert!(!secret.allowed_from_own_commands());
+        assert!(!format!("{secret:?}").contains("hunter2"));
         let r: Request = serde_json::from_str(r#"{"cmd":"panic"}"#).unwrap();
         assert_eq!(r, Request::Panic);
     }

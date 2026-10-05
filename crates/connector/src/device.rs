@@ -4,9 +4,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use sync_ops::{Execs, info};
+use sync_policy::config::PortalPolicy;
 use sync_policy::paths::to_wire;
-use sync_policy::{Engine, FoldersShell, Mode};
-use sync_proto::methods::{CAPABILITIES, DeviceInfo, FolderInfo, Hello};
+use sync_policy::{ApprovalQueue, Engine, FoldersShell, Mode};
+use sync_proto::methods::{
+    CAP_APPROVALS, CAP_POLICY, CAPABILITIES, DeviceInfo, FolderInfo, Hello, PiTool,
+};
+
+use crate::settings::ConfigStore;
 use tokio::sync::watch;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,10 +22,25 @@ pub struct Device {
     name: RwLock<String>,
     pub home: PathBuf,
     paused: watch::Sender<bool>,
+    /// The engine's approver, when it asks through the portal and the local CLI.
+    pub approvals: Option<Arc<ApprovalQueue>>,
+    /// The config, when the portal may see it (`policy.get`, `policy.set`).
+    pub store: Option<Arc<ConfigStore>>,
 }
 
 impl Device {
     pub fn new(engine: Arc<Engine>, execs: Arc<Execs>, name: String, home: PathBuf) -> Arc<Device> {
+        Device::with_parts(engine, execs, name, home, None, None)
+    }
+
+    pub fn with_parts(
+        engine: Arc<Engine>,
+        execs: Arc<Execs>,
+        name: String,
+        home: PathBuf,
+        approvals: Option<Arc<ApprovalQueue>>,
+        store: Option<Arc<ConfigStore>>,
+    ) -> Arc<Device> {
         let (paused, _) = watch::channel(engine.is_paused());
         Arc::new(Device {
             engine,
@@ -28,7 +48,16 @@ impl Device {
             name: RwLock::new(name),
             home,
             paused,
+            approvals,
+            store,
         })
+    }
+
+    /// Whether the portal may read the settings now.
+    pub fn shares_policy(&self) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|s| s.portal_policy() != PortalPolicy::Off)
     }
 
     pub fn name(&self) -> String {
@@ -98,9 +127,14 @@ impl Device {
                 .map(|f| FolderInfo {
                     path: to_wire(&f.path),
                     access: f.access,
+                    execute: f.execute,
                 })
                 .collect(),
             folders_shell: self.folders_shell().into(),
+            tools: PiTool::ALL
+                .into_iter()
+                .filter(|t| policy.tools.enabled(*t))
+                .collect(),
             mcp_tools: Vec::new(),
             client_version: CLIENT_VERSION.into(),
         }
@@ -114,7 +148,13 @@ impl Device {
             os: info::os().into(),
             user: info::user().0,
             shell: self.execs.shell_name(),
-            capabilities: CAPABILITIES.iter().map(|c| c.to_string()).collect(),
+            capabilities: CAPABILITIES
+                .iter()
+                .copied()
+                .chain(self.approvals.is_some().then_some(CAP_APPROVALS))
+                .chain(self.shares_policy().then_some(CAP_POLICY))
+                .map(str::to_string)
+                .collect(),
         }
     }
 }

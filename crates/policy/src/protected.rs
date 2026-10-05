@@ -149,19 +149,21 @@ const SYSTEM: &[&str] = &[
 ];
 
 /// Inside any folder: whose content the user's tools run. Writes there prompt.
-const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
+pub(crate) const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
 
 #[derive(Debug, Clone)]
 pub struct Protected {
     entries: Vec<PathBuf>,
     write_only: Vec<PathBuf>,
+    /// Tool-config names, folded.
+    tool_config: Vec<String>,
 }
 
-fn fold(p: &Path) -> PathBuf {
+pub(crate) fn fold(p: &Path) -> PathBuf {
     PathBuf::from(p.to_string_lossy().to_lowercase())
 }
 
-fn expand(home: &Path, s: &str) -> Option<PathBuf> {
+pub(crate) fn expand(home: &Path, s: &str) -> Option<PathBuf> {
     if let Some(rest) = s.strip_prefix("~/") {
         Some(home.join(rest))
     } else if s == "~" {
@@ -206,6 +208,7 @@ impl Protected {
         Protected {
             entries: finish(entries, &allow),
             write_only: finish(write_only, &allow),
+            tool_config: opts.tool_config.iter().map(|t| t.to_lowercase()).collect(),
         }
     }
 
@@ -247,17 +250,20 @@ impl Protected {
     pub fn entries(&self) -> impl Iterator<Item = &PathBuf> {
         self.entries.iter().chain(&self.write_only)
     }
-}
 
-/// The tool-config component (`.git`, `.envrc`, ...) a write to `path` touches.
-pub fn tool_config(path: &Path) -> Option<&'static str> {
-    path.components().find_map(|c| match c {
-        Component::Normal(n) => {
-            let n = n.to_string_lossy().to_lowercase();
-            TOOL_CONFIG.iter().copied().find(|t| *t == n)
-        }
-        _ => None,
-    })
+    /// The tool-config component (`.git`, `.envrc`, ...) a write to `path` touches.
+    pub fn tool_config(&self, path: &Path) -> Option<&str> {
+        path.components().find_map(|c| match c {
+            Component::Normal(n) => {
+                let n = n.to_string_lossy().to_lowercase();
+                self.tool_config
+                    .iter()
+                    .find(|t| **t == n)
+                    .map(String::as_str)
+            }
+            _ => None,
+        })
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -277,6 +283,7 @@ mod tests {
         FolderGrant {
             path: p.into(),
             access: Access::Rw,
+            execute: false,
         }
     }
 
@@ -357,17 +364,27 @@ mod tests {
 
     #[test]
     fn finds_tool_config_inside_folders() {
+        let p = prot();
+        let tool_config = |s: &str| p.tool_config(Path::new(s)).map(str::to_string);
         assert_eq!(
-            tool_config(Path::new("/w/p/.git/hooks/pre-commit")),
+            tool_config("/w/p/.git/hooks/pre-commit").as_deref(),
             Some(".git")
         );
-        assert_eq!(tool_config(Path::new("/w/p/.envrc")), Some(".envrc"));
+        assert_eq!(tool_config("/w/p/.envrc").as_deref(), Some(".envrc"));
         assert_eq!(
-            tool_config(Path::new("/w/p/.VSCode/tasks.json")),
+            tool_config("/w/p/.VSCode/tasks.json").as_deref(),
             Some(".vscode")
         );
-        assert_eq!(tool_config(Path::new("/w/p/src/git.rs")), None);
-        assert_eq!(tool_config(Path::new("/w/p/.github/x.yml")), None);
+        assert_eq!(tool_config("/w/p/src/git.rs"), None);
+        assert_eq!(tool_config("/w/p/.github/x.yml"), None);
+        // The list is the owner's: names can go and come.
+        let opts = ProtectedOptions {
+            tool_config: vec![".github".into()],
+            ..Default::default()
+        };
+        let p = Protected::new(Path::new("/home/u"), &[], &opts);
+        assert!(p.tool_config(Path::new("/w/p/.git/config")).is_none());
+        assert!(p.tool_config(Path::new("/w/p/.github/x.yml")).is_some());
     }
 
     #[test]

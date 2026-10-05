@@ -7,6 +7,7 @@ pub mod link;
 pub mod net;
 pub mod pair;
 pub mod session;
+pub mod settings;
 pub mod tls;
 pub mod url;
 

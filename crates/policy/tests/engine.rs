@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sync_policy::config::{CommandRule, DenyRule, GlobGrant, Hours, Rights};
 use sync_policy::*;
 use sync_proto::Id;
+use sync_proto::methods::{Choice, PiTool};
 
 /// Answers every prompt with a fixed answer, counting them.
 struct Scripted {
@@ -102,6 +104,7 @@ impl Fixture {
                 .map(|(p, a)| FolderGrant {
                     path: self.root.join(p),
                     access: *a,
+                    execute: true,
                 })
                 .collect(),
             ..Policy::default()
@@ -135,6 +138,7 @@ fn call(tool: &'static str) -> Call<'static> {
         chat: "chat-1",
         portal_tainted: false,
         tool,
+        pi_tool: None,
     }
 }
 
@@ -321,12 +325,11 @@ async fn a_protected_path_prompts_on_a_desktop() {
 #[tokio::test]
 async fn an_approval_timeout_denies() {
     let f = Fixture::new();
-    let policy = Policy {
-        approval_timeout_secs: 1,
-        ..f.folders(&[("home", Access::Rw)])
-    };
-    let e = f.engine(policy, Profile::Desktop, Arc::new(Never));
-    let mut events = e.subscribe();
+    let mut policy = f.folders(&[("home", Access::Rw)]);
+    policy.approvals.timeout_secs = 1;
+    let queue = ApprovalQueue::new(Arc::new(|| i64::MAX));
+    let e = f.engine(policy, Profile::Desktop, queue.clone());
+    let mut events = queue.subscribe();
     let id = Id::Num(9);
     let c = Call {
         id: Some(&id),
@@ -340,13 +343,89 @@ async fn an_approval_timeout_denies() {
     .expect("the approval must time out on its own");
     let m = denied(r);
     assert!(m.contains("no answer"), "{m}");
+    let ApprovalEvent::Requested(info) = events.recv().await.unwrap() else {
+        panic!("expected the request first")
+    };
+    assert_eq!((info.call, info.chat.as_str()), (Some(id), "chat-1"));
+    let ApprovalEvent::Resolved(r) = events.recv().await.unwrap() else {
+        panic!("expected the resolution")
+    };
+    assert_eq!((r.answer, r.by.as_str()), (Choice::Deny, "timeout"));
+    assert!(queue.list().is_empty());
+}
+
+#[tokio::test]
+async fn the_owner_may_make_a_timeout_allow() {
+    let f = Fixture::new();
+    let mut policy = f.folders(&[("home", Access::Rw)]);
+    policy.approvals.timeout_secs = 1;
+    policy.approvals.on_timeout = sync_policy::config::TimeoutAnswer::Allow;
+    let e = f.engine(policy, Profile::Headless, Arc::new(Never));
+    read(&e, &f.p("home/.ssh/id_ed25519")).await.unwrap();
+    assert!(f.audit().iter().any(|r| {
+        r.decision == "approved"
+            && r.reason
+                .as_deref()
+                .is_some_and(|m| m.contains("allows on timeout"))
+    }));
+}
+
+#[tokio::test]
+async fn time_and_chat_answers_last_as_long_as_the_device_says() {
+    let f = Fixture::new();
+    let mut policy = Policy::default();
+    policy.approvals.remember_minutes = 10;
+    policy.approvals.max_minutes = 30;
+    let chat = scripted(Answer::ForChat);
+    let e = f.engine(policy.clone(), Profile::Headless, chat.clone());
+    read(&e, &f.p("outside/b.txt")).await.unwrap();
+    f.clock.fetch_add(9 * 60_000, Ordering::SeqCst);
+    read(&e, &f.p("outside/b.txt")).await.unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 1, "still remembered");
+    f.clock.fetch_add(2 * 60_000, Ordering::SeqCst);
+    read(&e, &f.p("outside/b.txt")).await.unwrap();
     assert_eq!(
-        events.recv().await.unwrap(),
-        Event::Waiting {
-            id,
-            chat: "chat-1".into()
-        }
+        chat.asked.load(Ordering::SeqCst),
+        2,
+        "remembered for 10 minutes"
     );
+
+    // A time answer beyond the device's longest is cut to it.
+    let timed = scripted(Answer::ForTime(600));
+    let e = f.engine(policy, Profile::Headless, timed.clone());
+    write(&e, &f.p("outside/c")).await.unwrap();
+    f.clock.fetch_add(29 * 60_000, Ordering::SeqCst);
+    write(&e, &f.p("outside/c")).await.unwrap();
+    assert_eq!(timed.asked.load(Ordering::SeqCst), 1);
+    f.clock.fetch_add(2 * 60_000, Ordering::SeqCst);
+    write(&e, &f.p("outside/c")).await.unwrap();
+    assert_eq!(timed.asked.load(Ordering::SeqCst), 2);
+    // The shell is never remembered.
+    exec(&e, "ls", &f.p("outside")).await.unwrap();
+    exec(&e, "ls", &f.p("outside")).await.unwrap();
+    assert_eq!(timed.asked.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn pause_answers_open_approvals_with_deny() {
+    let f = Fixture::new();
+    let queue = ApprovalQueue::new(Arc::new(|| 0));
+    let e = f.engine(Policy::default(), Profile::Headless, queue.clone());
+    let mut events = queue.subscribe();
+    let target = f.p("outside/b.txt");
+    let ask = read(&e, &target);
+    let pauser = async {
+        let _ = events.recv().await.unwrap();
+        e.pause();
+    };
+    // Denied at once, not when the two-minute timeout runs out.
+    let (r, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(ask, pauser)
+    })
+    .await
+    .expect("pause answers the open approval");
+    denied(r);
+    assert!(queue.list().is_empty());
 }
 
 #[tokio::test]
@@ -465,9 +544,10 @@ async fn full_mode_expires() {
     let e = f.engine(policy, Profile::Headless, none());
     read(&e, &f.p("outside/b.txt")).await.unwrap();
     f.clock.fetch_add(8 * 3_600_000, Ordering::SeqCst);
-    assert_eq!(e.effective_mode(), Mode::Folders);
+    // Back to Ask, which nobody answers here.
+    assert_eq!(e.effective_mode(), Mode::Ask);
     denied(read(&e, &f.p("outside/b.txt")).await);
-    read(&e, &f.p("home/proj/a.txt")).await.unwrap();
+    denied(read(&e, &f.p("home/proj/a.txt")).await);
 }
 
 #[tokio::test]
@@ -493,6 +573,14 @@ async fn folders_shell_is_confined_or_asks() {
     );
     assert!(!rules.write.contains(&f.root.join("home")));
     assert!(rules.read.contains(&PathBuf::from("/usr")));
+    assert!(rules.exec.contains(&PathBuf::from("/usr")));
+    assert!(rules.exec.contains(&f.root.join("home/proj")));
+    assert!(
+        !rules
+            .exec
+            .iter()
+            .any(|p| p.starts_with(f.root.join("home/.ssh")))
+    );
     denied(exec(&e, "ls", &f.p("outside")).await);
 
     let prompt = Policy {
@@ -579,4 +667,290 @@ async fn a_search_walk_skips_protected_paths() {
     policy.full.protected_paths = false;
     e.reload(policy, Profile::Headless);
     assert!(e.walk_filter()(&f.root.join("home/.ssh/id_ed25519")));
+}
+
+fn with(mut policy: Policy, edit: impl FnOnce(&mut Policy)) -> Policy {
+    edit(&mut policy);
+    policy
+}
+
+fn full(f: &Fixture) -> Policy {
+    let mut policy = Policy::default();
+    policy.set_mode(Mode::Full, f.clock.load(Ordering::SeqCst));
+    policy
+}
+
+#[tokio::test]
+async fn a_folder_without_the_execute_right_runs_no_commands() {
+    let f = Fixture::new();
+    let mut policy = f.folders(&[("home/proj", Access::Rw), ("ro", Access::Ro)]);
+    policy.folders[1].execute = false;
+    let e = f.engine(policy, Profile::Headless, none());
+    exec(&e, "ls", &f.p("home/proj")).await.unwrap();
+    let m = denied(exec(&e, "ls", &f.p("ro")).await);
+    assert!(m.contains("execute"), "{m}");
+    let Confine::Landlock(rules) = exec(&e, "ls", &f.p("home/proj")).await.unwrap().confine else {
+        panic!("expected Landlock")
+    };
+    assert!(rules.read.contains(&f.root.join("ro")));
+    assert!(!rules.exec.contains(&f.root.join("ro")));
+}
+
+async fn write_as(e: &Engine, tool: PiTool, path: &str) -> Result<Permit, Refusal> {
+    let c = Call {
+        pi_tool: Some(tool),
+        ..call("write")
+    };
+    e.authorize(
+        &c,
+        Request::Write {
+            path,
+            preview: None,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn switched_off_tools_are_refused() {
+    let f = Fixture::new();
+    let policy = with(full(&f), |p| {
+        p.tools.write = false;
+        p.tools.bash = false;
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    denied(exec(&e, "true", &f.p("outside")).await);
+    // An unlabelled write still serves the edit tool, which is on.
+    write(&e, &f.p("outside/x")).await.unwrap();
+    let target = f.p("outside/x");
+    denied(write_as(&e, PiTool::Write, &target).await);
+    write_as(&e, PiTool::Edit, &target).await.unwrap();
+    // A label that does not fit the method is refused, not trusted.
+    denied(write_as(&e, PiTool::Read, &target).await);
+    // With write and edit off nothing writes, however it is labelled.
+    let policy = with(full(&f), |p| {
+        p.tools.write = false;
+        p.tools.edit = false;
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    denied(write(&e, &f.p("outside/x")).await);
+    read(&e, &f.p("outside/b.txt")).await.unwrap();
+}
+
+#[tokio::test]
+async fn deny_rules_hold_in_every_mode() {
+    let f = Fixture::new();
+    let deny = |p: &mut Policy| {
+        p.deny = vec![
+            DenyRule {
+                path: f.p("outside"),
+                rights: "r".parse().unwrap(),
+            },
+            DenyRule {
+                path: "~/proj/**/*.secret".into(),
+                rights: Rights::ALL,
+            },
+            DenyRule {
+                path: "~/proj/src".into(),
+                rights: "wx".parse().unwrap(),
+            },
+            DenyRule {
+                path: "~/proj/docs".into(),
+                rights: "r".parse().unwrap(),
+            },
+        ];
+    };
+    fs::create_dir(f.root.join("home/proj/docs")).unwrap();
+    // Unrestricted Full.
+    let policy = with(full(&f), |p| {
+        p.full.pattern_prompts = false;
+        p.full.protected_paths = false;
+        deny(p);
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    denied(read(&e, &f.p("outside/b.txt")).await);
+    write(&e, &f.p("outside/new")).await.unwrap();
+    fs::write(f.root.join("home/proj/src/k.secret"), "k").unwrap();
+    denied(read(&e, &f.p("home/proj/src/k.secret")).await);
+    denied(read(&e, &f.p("home/proj/K.SECRET")).await);
+    read(&e, &f.p("home/proj/src")).await.unwrap();
+    denied(write(&e, &f.p("home/proj/src/x.rs")).await);
+    denied(exec(&e, "ls", &f.p("home/proj/src")).await);
+    exec(&e, "ls", &f.p("home/proj")).await.unwrap();
+    // A search walk skips what is denied.
+    let ok = e.walk_filter();
+    assert!(!ok(&f.root.join("outside/b.txt")));
+    assert!(!ok(&f.root.join("home/proj/src/k.secret")));
+    assert!(ok(&f.root.join("home/proj/a.txt")));
+
+    // Folders mode: Landlock leaves the denied paths out.
+    let policy = with(
+        f.folders(&[("home/proj", Access::Rw), ("outside", Access::Ro)]),
+        deny,
+    );
+    let e = f.engine(policy, Profile::Headless, none());
+    let Confine::Landlock(rules) = exec(&e, "make", &f.p("home/proj")).await.unwrap().confine
+    else {
+        panic!("expected Landlock")
+    };
+    assert!(!rules.read.contains(&f.root.join("outside")));
+    assert!(
+        !rules
+            .write
+            .iter()
+            .any(|p| p.starts_with(f.root.join("home/proj/src")))
+    );
+    assert!(rules.write.contains(&f.root.join("home/proj/a.txt")));
+    // Read-denied inside a writable folder: no write rule either, which would read.
+    assert!(
+        !rules
+            .write
+            .iter()
+            .any(|p| p.starts_with(f.root.join("home/proj/docs")))
+    );
+    assert!(
+        !rules
+            .read
+            .iter()
+            .any(|p| p.starts_with(f.root.join("home/proj/docs")))
+    );
+    // Write-denied only: still readable, not runnable.
+    assert!(rules.read.contains(&f.root.join("home/proj/src")));
+    assert!(
+        !rules
+            .exec
+            .iter()
+            .any(|p| p.starts_with(f.root.join("home/proj/src")))
+    );
+}
+
+#[tokio::test]
+async fn glob_grants_open_files_outside_the_folders() {
+    let f = Fixture::new();
+    let policy = with(f.folders(&[("home/proj", Access::Rw)]), |p| {
+        p.allow_globs = vec![GlobGrant {
+            glob: f.p("outside/*.txt"),
+            access: Access::Ro,
+        }];
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    let permit = read(&e, &f.p("outside/b.txt")).await.unwrap();
+    assert_eq!(permit.root, Some(f.root.join("outside")));
+    denied(write(&e, &f.p("outside/b.txt")).await);
+    denied(read(&e, &f.p("outside/c.md")).await);
+    // Commands do not run there: a glob is no folder grant.
+    denied(exec(&e, "ls", &f.p("outside")).await);
+    assert!(e.walk_filter()(&f.root.join("outside/b.txt")));
+}
+
+fn rule(prefix: &str) -> CommandRule {
+    CommandRule {
+        prefix: Some(prefix.into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn command_lists_deny_allow_and_ask() {
+    let f = Fixture::new();
+    let cwd = f.p("home/proj");
+    let open_full = |f: &Fixture| {
+        with(full(f), |p| {
+            p.full.pattern_prompts = false;
+            p.full.protected_paths = false;
+            p.full.taint_prompts = false;
+        })
+    };
+    // Deny and always-ask hold even in unrestricted Full.
+    let policy = with(open_full(&f), |p| {
+        p.commands.deny = vec![rule("shutdown")];
+        p.commands.always_ask = vec![rule("git push")];
+    });
+    let yes = scripted(Answer::Once);
+    let e = f.engine(policy, Profile::Headless, yes.clone());
+    let m = denied(exec(&e, "true && shutdown -h now", &cwd).await);
+    assert!(m.contains("deny rule"), "{m}");
+    exec(&e, "git status", &cwd).await.unwrap();
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+    exec(&e, "git push origin", &cwd).await.unwrap();
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 1);
+
+    // An allow list refuses everything else, and anything compound.
+    let policy = with(open_full(&f), |p| {
+        p.commands.allow = vec![rule("cargo ")];
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    exec(&e, "cargo build", &cwd).await.unwrap();
+    denied(exec(&e, "ls", &cwd).await);
+    denied(exec(&e, "cargo build; ls", &cwd).await);
+}
+
+#[tokio::test]
+async fn never_ask_skips_the_mode_but_not_taint() {
+    let f = Fixture::new();
+    let cwd = f.p("home/proj");
+    let policy = with(Policy::default(), |p| {
+        p.commands.never_ask = vec![rule("cargo test")];
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    // Ask mode, nobody to answer: only the never-ask command runs.
+    exec(&e, "cargo test -q", &cwd).await.unwrap();
+    denied(exec(&e, "cargo build", &cwd).await);
+    denied(exec(&e, "cargo test; rm -rf ~", &cwd).await);
+    e.mark_tainted("chat-1");
+    denied(exec(&e, "cargo test -q", &cwd).await);
+}
+
+#[tokio::test]
+async fn outside_the_hours_everything_is_refused() {
+    let f = Fixture::new();
+    // The fixture's clock stands at 00:16:40 UTC on 1 January 1970, a Thursday.
+    let hours = |from: &str, to: &str, days: &[&str]| Hours {
+        days: days.iter().map(|d| d.to_string()).collect(),
+        from: from.into(),
+        to: to.into(),
+        utc_offset_minutes: Some(0),
+    };
+    let policy = with(full(&f), |p| p.hours = Some(hours("08:00", "18:00", &[])));
+    let e = f.engine(policy, Profile::Headless, none());
+    let m = denied(read(&e, &f.p("outside/b.txt")).await);
+    assert!(m.contains("hours"), "{m}");
+    let policy = with(full(&f), |p| {
+        p.hours = Some(hours("22:00", "06:00", &["wed"]))
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    read(&e, &f.p("outside/b.txt")).await.unwrap();
+    let policy = with(full(&f), |p| {
+        p.hours = Some(hours("22:00", "06:00", &["thu"]))
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    denied(read(&e, &f.p("outside/b.txt")).await);
+}
+
+#[tokio::test]
+async fn a_broken_rule_refuses_everything() {
+    let f = Fixture::new();
+    // validate() keeps such a file from loading; the engine fails closed anyway.
+    let policy = with(full(&f), |p| {
+        p.commands.deny = vec![CommandRule {
+            regex: Some("(".into()),
+            ..Default::default()
+        }];
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    let m = denied(read(&e, &f.p("outside/b.txt")).await);
+    assert!(m.contains("broken rule"), "{m}");
+    assert!(!e.walk_filter()(&f.root.join("outside/b.txt")));
+}
+
+#[tokio::test]
+async fn the_tool_config_list_is_the_owners() {
+    let f = Fixture::new();
+    let policy = with(f.folders(&[("home/proj", Access::Rw)]), |p| {
+        p.protected.tool_config.retain(|t| t != ".git");
+        p.protected.tool_config.push("Makefile".into());
+    });
+    let e = f.engine(policy, Profile::Headless, none());
+    write(&e, &f.p("home/proj/.git/config")).await.unwrap();
+    denied(write(&e, &f.p("home/proj/Makefile")).await);
 }

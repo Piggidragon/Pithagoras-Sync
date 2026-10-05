@@ -14,7 +14,7 @@ use serde_json::Value;
 use sync_ops::fsops::{self, MAX_WRITE};
 use sync_ops::search::{self, GrepOptions};
 use sync_ops::{ExecOutcome, info};
-use sync_policy::{Call, Event, Permit, Request};
+use sync_policy::{AnswerError, ApprovalEvent, Call, Event, Permit, Request};
 use sync_proto::binary::MAX_CHUNK;
 use sync_proto::methods::*;
 use sync_proto::{
@@ -132,9 +132,6 @@ pub async fn run(
                         reason: r.reason,
                     },
                 ),
-                Ok(Event::Waiting { id, chat }) => {
-                    notification(APPROVAL_WAITING, ApprovalWaiting { id, chat })
-                }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
@@ -142,6 +139,39 @@ pub async fn run(
             ev.send_text(text).await;
         }
     });
+
+    if let Some(queue) = &device.approvals {
+        let mut events = queue.subscribe();
+        let ev = shared.clone();
+        tasks.spawn(async move {
+            loop {
+                let text = match events.recv().await {
+                    Ok(ApprovalEvent::Requested(info)) => notification(APPROVAL_REQUESTED, info),
+                    Ok(ApprovalEvent::Resolved(r)) => notification(APPROVAL_RESOLVED, r),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                ev.send_text(text).await;
+            }
+        });
+    }
+    if let Some(store) = &device.store {
+        let mut changed = store.subscribe();
+        let ev = shared.clone();
+        let store = store.clone();
+        tasks.spawn(async move {
+            loop {
+                match changed.recv().await {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                }
+                // Off: the portal hears nothing of the settings.
+                if let Ok(doc) = store.document_for_portal() {
+                    ev.send_text(notification(POLICY_CHANGED, doc)).await;
+                }
+            }
+        });
+    }
 
     let calls = Arc::new(Semaphore::new(MAX_CALLS));
     let mut paused = device.paused();
@@ -279,6 +309,7 @@ async fn authorize(
         chat: &ctx.chat,
         portal_tainted: ctx.tainted,
         tool,
+        pi_tool: ctx.tool,
     };
     shared
         .device
@@ -424,16 +455,57 @@ async fn dispatch(
             let allowed = shared.device.engine.walk_filter();
             to_value(blocking(move || search::find(&permit, &p.pattern, p.limit, &*allowed)).await?)
         }
+        APPROVAL_ANSWER => {
+            let queue = shared
+                .device
+                .approvals
+                .as_ref()
+                .ok_or_else(|| unknown(method))?;
+            let p: ApprovalAnswerParams = parse(params)?;
+            queue
+                .answer(p.id, p.answer, p.minutes, "portal")
+                .map_err(|e| match e {
+                    AnswerError::NotFound(_) => RpcError::new(code::NOT_FOUND, e.to_string()),
+                    AnswerError::Invalid(_) => RpcError::new(code::INVALID_PARAMS, e.to_string()),
+                })?;
+            Ok(serde_json::json!({}))
+        }
+        APPROVAL_LIST => {
+            let queue = shared
+                .device
+                .approvals
+                .as_ref()
+                .ok_or_else(|| unknown(method))?;
+            parse::<EmptyParams>(params)?;
+            to_value(ApprovalListResult {
+                approvals: queue.list(),
+            })
+        }
+        POLICY_GET => {
+            let store = shared
+                .device
+                .store
+                .as_ref()
+                .ok_or_else(|| unknown(method))?;
+            parse::<EmptyParams>(params)?;
+            to_value(store.document_for_portal()?)
+        }
+        POLICY_SET => {
+            let store = shared.device.store.clone().ok_or_else(|| unknown(method))?;
+            let p: PolicySetParams = parse(params)?;
+            to_value(blocking(move || store.set_from_portal(p)).await?)
+        }
         EXEC_SIGNAL => {
             let p: ExecSignalParams = parse(params)?;
             shared.device.execs.signal(p.stream, p.signal).await?;
             Ok(serde_json::json!({}))
         }
-        _ => Err(RpcError::new(
-            code::METHOD_NOT_FOUND,
-            format!("unknown method {method}"),
-        )),
+        _ => Err(unknown(method)),
     }
+}
+
+fn unknown(method: &str) -> RpcError {
+    RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {method}"))
 }
 
 async fn write(

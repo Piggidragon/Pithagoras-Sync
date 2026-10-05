@@ -175,8 +175,10 @@ async fn pair_run_exec_panic_unlock() {
         !cfg.contains(&std::fs::read_to_string(&token).unwrap()),
         "the token stays out of the config"
     );
-    env.ok(&["folder", "add", &env.p("home/proj"), "--rw"])
+    env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
         .await;
+    // Ask is the default, headless too; this test works in Folders mode.
+    env.ok(&["mode", "folders"]).await;
 
     let daemon = env.start();
     let dl = mock.next_device(WAIT).await.expect("the client connects");
@@ -262,6 +264,59 @@ async fn pair_run_exec_panic_unlock() {
         .await
         .expect("reconnects with backoff");
 
+    // Ask mode: the portal hears of the approval, the owner answers on the device.
+    env.ok(&["mode", "ask"]).await;
+    let pending = dl
+        .start_call(
+            "exec.start",
+            json!({"stream": 6, "command": "echo approved-run", "cwd": env.p("home/proj"), "ctx": {"chat": "c1"}}),
+        )
+        .await;
+    let asked = dl
+        .notification("approval.requested", WAIT)
+        .await
+        .expect("the portal hears of the approval");
+    assert_eq!(asked["target"], "echo approved-run");
+    let listed: Value = serde_json::from_str(&env.ok(&["approvals", "--json"]).await).unwrap();
+    let id = listed[0]["id"].as_u64().unwrap();
+    assert_eq!(asked["id"], id);
+    let out = env.ok(&["approvals"]).await;
+    assert!(out.contains("echo approved-run"), "{out}");
+    env.ok(&["approve", &id.to_string()]).await;
+    tokio::time::timeout(WAIT, pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let exit = dl.notification("exec.exit", WAIT).await.unwrap();
+    assert_eq!(exit["stream"], 6);
+    assert!(String::from_utf8_lossy(&dl.stream_data(6)).contains("approved-run"));
+    let resolved = dl.notification("approval.resolved", WAIT).await.unwrap();
+    assert_eq!(
+        (&resolved["by"], &resolved["answer"]),
+        (&json!("device"), &json!("once"))
+    );
+    // Denied on the device: the call fails, nothing runs.
+    let pending = dl
+        .start_call(
+            "exec.start",
+            json!({"stream": 7, "command": "touch denied-run", "cwd": env.p("home/proj"), "ctx": {"chat": "c1"}}),
+        )
+        .await;
+    let mut id = None;
+    for _ in 0..100 {
+        let listed: Value = serde_json::from_str(&env.ok(&["approvals", "--json"]).await).unwrap();
+        if let Some(i) = listed[0]["id"].as_u64() {
+            id = Some(i);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    env.ok(&["deny", &id.unwrap().to_string()]).await;
+    let e = tokio::time::timeout(WAIT, pending).await.unwrap().unwrap();
+    assert_eq!(e.unwrap_err().code, sync_proto::code::DENIED);
+    assert!(!env.root.join("home/proj/denied-run").exists());
+
     // The local audit log has the decisions and the exits, but no file contents.
     let audit =
         std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/audit.jsonl")).unwrap();
@@ -282,8 +337,9 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
     })
     .await;
     env.ok(&["pair", &mock.pair_uri("CODE5678")]).await;
-    env.ok(&["folder", "add", &env.p("home/proj"), "--rw"])
+    env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
         .await;
+    env.ok(&["mode", "folders"]).await;
     // The owner allows an unconfined shell, so the program itself is reachable from
     // a command; the client still refuses to take orders from it.
     let cfg = std::fs::read_to_string(env.config()).unwrap();
@@ -309,6 +365,19 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
     assert!(out.contains("exit=1"), "{out}");
     let (out, _) = exec(&dl, 2, &me("folder add / --rw"), &env.p("home/proj")).await;
     assert!(out.contains("exit=1"), "{out}");
+    for (i, args) in [
+        "config set policy.mode full",
+        "config set portal_policy write",
+        "approvals",
+        "approve 1",
+        "deny 1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (out, _) = exec(&dl, 10 + i as u32, &me(args), &env.p("home/proj")).await;
+        assert!(out.contains("exit=1"), "{args}: {out}");
+    }
     let cfg = std::fs::read_to_string(env.config()).unwrap();
     assert!(cfg.contains("mode = \"folders\""), "{cfg}");
     assert!(!cfg.contains("path = \"/\""), "{cfg}");
@@ -324,9 +393,21 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
     {
         // The path is put together inside python: a command naming the client's
         // own directory would already be stopped by the protected-path hint.
-        let py = r#"python3 -c 'import os, socket; p = os.path.join(os.environ["HOME"], ".local", "state", "pithagoras-" + "sync", "run", "control.sock"); s = socket.socket(socket.AF_UNIX); s.connect(p); s.sendall(b"{\"cmd\":\"reload\"}\n"); print(s.recv(4096).decode())'"#;
-        let (out, _) = exec(&dl, 5, py, &env.p("home/proj")).await;
-        assert!(out.contains("cannot unlock or reload"), "{out}");
+        for (i, cmd) in [
+            r#"{\"cmd\":\"reload\"}"#,
+            r#"{\"cmd\":\"answer\",\"id\":1,\"answer\":\"once\"}"#,
+            r#"{\"cmd\":\"approvals\"}"#,
+            r#"{\"cmd\":\"secret_set\",\"name\":\"elevation\",\"value\":\"x\"}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let py = format!(
+                r#"python3 -c 'import os, socket; p = os.path.join(os.environ["HOME"], ".local", "state", "pithagoras-" + "sync", "run", "control.sock"); s = socket.socket(socket.AF_UNIX); s.connect(p); s.sendall(b"{cmd}\n"); print(s.recv(4096).decode())'"#
+            );
+            let (out, _) = exec(&dl, 20 + i as u32, &py, &env.p("home/proj")).await;
+            assert!(out.contains("cannot change"), "{cmd}: {out}");
+        }
     }
     // panic is allowed from anywhere: it only takes rights away. It also kills the
     // command that asked, so no exec.exit comes; the link just closes.

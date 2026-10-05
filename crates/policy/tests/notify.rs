@@ -171,12 +171,16 @@ async fn client(bus: &Bus) -> zbus::Connection {
 
 fn request(offer_chat: bool) -> ApprovalRequest {
     ApprovalRequest {
+        call: None,
         chat: "chat-1".into(),
         tool: "write".into(),
         target: "/w/<a>".into(),
         reasons: vec!["protected".into()],
         preview: None,
         offer_chat,
+        max_minutes: 60,
+        expires_ms: i64::MAX,
+        on_timeout_allow: false,
     }
 }
 
@@ -233,7 +237,10 @@ async fn an_unanswered_notification_is_withdrawn_and_denied() {
     let engine = Engine::new(
         Policy {
             mode: Mode::Full,
-            approval_timeout_secs: 1,
+            approvals: config::ApprovalOptions {
+                timeout_secs: 1,
+                ..Default::default()
+            },
             full: config::FullOptions {
                 expiry_hours: 0,
                 ..Default::default()
@@ -256,6 +263,7 @@ async fn an_unanswered_notification_is_withdrawn_and_denied() {
         chat: "c",
         portal_tainted: false,
         tool: "read",
+        pi_tool: None,
     };
     let r = engine.authorize(&call, Request::Read(&path)).await;
     assert!(matches!(r, Err(Refusal::Denied(_))), "{r:?}");
