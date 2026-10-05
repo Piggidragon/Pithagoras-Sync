@@ -284,8 +284,10 @@ pub struct DeviceInfo {
     pub user: String,
     pub uid: u32,
     pub home: String,
+    /// What the `bash` tool runs: `bash` or `sh` on Linux, `pwsh` or `powershell` on
+    /// Windows. The tool keeps its name; the model has to write for this shell.
     pub shell: String,
-    /// `headless`, `wayland`, `x11` or `tty`.
+    /// `headless`, `wayland`, `x11` or `windows`.
     pub session: String,
     /// The mode in force now (after Full's expiry).
     pub mode: Mode,
@@ -306,6 +308,8 @@ pub struct Hello {
     pub client_version: String,
     pub os: String,
     pub user: String,
+    /// As in `DeviceInfo::shell`.
+    pub shell: String,
     pub capabilities: Vec<String>,
 }
 

@@ -556,3 +556,27 @@ async fn a_folder_that_does_not_exist_grants_nothing() {
     );
     denied(write(&e, &f.p("not-yet/x")).await);
 }
+
+#[tokio::test]
+async fn a_search_walk_skips_protected_paths() {
+    let f = Fixture::new();
+    let e = f.engine(
+        f.folders(&[("home", Access::Rw)]),
+        Profile::Headless,
+        none(),
+    );
+    // grep over the whole home folder may start, but its walk must not read keys.
+    read(&e, &f.p("home")).await.unwrap();
+    let ok = e.walk_filter();
+    assert!(ok(&f.root.join("home/proj/a.txt")));
+    assert!(!ok(&f.root.join("home/.ssh/id_ed25519")));
+    assert!(!ok(&f.root.join("home/.SSH/id_ed25519")));
+    // Outside the granted folders nothing is read in Folders mode.
+    assert!(!ok(&f.root.join("outside/b.txt")));
+    // Full mode with protections off reads everything.
+    let mut policy = Policy::default();
+    policy.set_mode(Mode::Full, f.clock.load(Ordering::SeqCst));
+    policy.full.protected_paths = false;
+    e.reload(policy, Profile::Headless);
+    assert!(e.walk_filter()(&f.root.join("home/.ssh/id_ed25519")));
+}

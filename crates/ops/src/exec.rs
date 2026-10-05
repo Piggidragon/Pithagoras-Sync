@@ -163,6 +163,14 @@ impl Execs {
         default_shell()
     }
 
+    /// The shell's name as the portal sees it: `bash`, `sh`, `pwsh`, `powershell`.
+    pub fn shell_name(&self) -> String {
+        self.shell()
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }
+
     pub fn running(&self) -> usize {
         self.table.lock().unwrap().running.len()
     }

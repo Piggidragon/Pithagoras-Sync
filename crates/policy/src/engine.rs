@@ -442,6 +442,24 @@ impl Engine {
         }
     }
 
+    /// For grep and find, after the search root passed `authorize`: whether a path
+    /// met during the walk may be read. Protected paths are skipped rather than
+    /// prompted for one by one, and in Folders mode the walk stays in granted
+    /// folders (it never follows symlinks, so this only matters for nested grants).
+    pub fn walk_filter(&self) -> Box<dyn Fn(&Path) -> bool + Send + Sync> {
+        let snap = self.snapshot();
+        let mode = snap.policy.effective_mode(snap.profile, self.now());
+        let protections = mode != Mode::Full || snap.policy.full.protected_paths;
+        let folders = mode == Mode::Folders;
+        let grants = resolved_grants(&snap.policy.folders);
+        Box::new(move |p: &Path| {
+            if folders && grant_for(p, &grants).is_none() {
+                return false;
+            }
+            !(protections && snap.protected.check(p, false, &grants).is_some())
+        })
+    }
+
     fn decide(&self, chat: &str, req: &Request<'_>) -> Result<Verdict, PathError> {
         let snap = self.snapshot();
         let policy = &snap.policy;
