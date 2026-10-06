@@ -987,8 +987,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             // Whether a release is newer is decided by the program it replaces,
             // as it is on disk.
             let mine = env!("CARGO_PKG_VERSION");
-            let (current, whose) = match crate::update::version_of(&exe) {
-                Some(v) => (v, format!("{} is", exe.display())),
+            // A unit's program that went missing is put back by any release.
+            let missing = unit_runs_exe && std::fs::symlink_metadata(&exe).is_err();
+            let (current, about) = match crate::update::version_of(&exe) {
+                Some(v) => (v.clone(), format!("{} is {v}", exe.display())),
+                None if missing => ("0.0.0".to_string(), format!("{} is missing", exe.display())),
                 None => {
                     let v = crate::update::current_version(client, mine);
                     let whose = if client.is_some_and(|(_, cv)| cv == v) {
@@ -996,7 +999,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     } else {
                         "this is"
                     };
-                    (v.to_string(), whose.to_string())
+                    (v.to_string(), format!("{whose} {v}"))
                 }
             };
             let records = [dirs.update_seen_file(&exe), dirs.update_user_seen_file()];
@@ -1012,9 +1015,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 // The file is current, but this user's client may still run the
                 // one it replaced (`install` run again from a newer download).
                 match client.filter(|(_, v)| crate::update::is_older(v, &current)) {
-                    None => println!(
-                        "Up to date ({whose} {current}; the newest release was made {released})."
-                    ),
+                    None => {
+                        println!("Up to date ({about}; the newest release was made {released}).")
+                    }
                     Some((_, v)) => {
                         println!(
                             "{} is up to date ({current}; the newest release was made {released}), but the running client is still {v}.",
@@ -1046,7 +1049,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             if check {
                 println!(
-                    "Version {} is available, released {released} ({whose} {current}).",
+                    "Version {} is available, released {released} ({about}).",
                     plan.version
                 );
                 return Ok(ExitCode::SUCCESS);

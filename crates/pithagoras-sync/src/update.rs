@@ -568,7 +568,18 @@ pub fn root_program(given: &Path, fs: &dyn Fs) -> Result<PathBuf, String> {
             Part::Name(n) => n,
         };
         let p = cur.join(&name);
-        let node = stat(&p)?.ok_or_else(|| format!("{} does not exist", p.display()))?;
+        let Some(node) = stat(&p)? else {
+            // The program itself may be missing (deleted by hand): its folder
+            // passed, so `update` may put a release there again.
+            if todo.is_empty() {
+                return Ok(p);
+            }
+            return Err(format!(
+                "the system unit starts {}, but {} does not exist: install the program again with `sudo pithagoras-sync install --system --user <name>` or `setup`",
+                given.display(),
+                p.display()
+            ));
+        };
         match node.link {
             // The link's folder, `cur`, passed: only root can turn it.
             Some(to) => {
@@ -707,8 +718,18 @@ pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
 }
 
 async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
+    // A missing program (put back by this update) resolves through its folder.
     #[cfg(unix)]
-    let exe = &std::fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    let exe = &match std::fs::canonicalize(exe) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && exe.file_name().is_some() => {
+            let dir = exe.parent().ok_or("this program has no folder")?;
+            std::fs::canonicalize(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?
+                .join(exe.file_name().unwrap_or_default())
+        }
+        Err(e) => return Err(format!("{}: {e}", exe.display())),
+    };
     let data = fetch(&plan.source, plan.artifact.size).await?;
     if data.len() as u64 != plan.artifact.size {
         return Err(format!(
@@ -1012,6 +1033,22 @@ mod tests {
         ]);
         let e = root_program(bin, &fs).unwrap_err();
         assert!(e.contains("/home/svc belongs to user svc (1000)"), "{e}");
+        // The program itself missing: its folder passed, so a release may go
+        // there; a missing folder is said plainly.
+        let fs = FakeFs(
+            layout(&[])
+                .0
+                .into_iter()
+                .filter(|r| r.0 != "/usr/local/bin/pithagoras-sync")
+                .collect(),
+        );
+        assert_eq!(root_program(bin, &fs), Ok(bin.to_path_buf()));
+        let e = root_program(Path::new("/usr/local/sbin/pithagoras-sync"), &fs).unwrap_err();
+        assert!(
+            e.contains("/usr/local/sbin does not exist: install the program again"),
+            "{e}"
+        );
+        assert!(!e.contains("another user"), "{e}");
         // A loop of links ends.
         let fs = layout(&[(
             "/usr/local/bin/pithagoras-sync",

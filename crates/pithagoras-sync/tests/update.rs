@@ -395,6 +395,18 @@ async fn a_program_is_never_taken_below_what_this_user_installed() {
     assert!(check(manifest, fresh).await.is_ok());
 }
 
+/// A program that went missing (deleted by hand) is put back in its folder.
+#[tokio::test]
+async fn a_missing_program_is_put_back() {
+    let r = Release::new();
+    let exe = r.installed();
+    std::fs::remove_file(&exe).unwrap();
+    let manifest = r.publish("0.2.0", &program("0.2.0"), None);
+    let plan = check(&manifest, &r.pk(), "0.0.0").await.unwrap().unwrap();
+    update::install(&plan, &exe).await.unwrap();
+    assert_eq!(std::fs::read(&exe).unwrap(), program("0.2.0"));
+}
+
 /// A program reached through a link (/usr/local/bin/pithagoras-sync leading to
 /// /opt/...): the file it leads to is replaced and the link stays, so the
 /// program's record of releases is found again at the next update.
