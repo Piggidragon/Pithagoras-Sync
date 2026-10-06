@@ -206,6 +206,62 @@ fn find_matches_names_and_paths_and_honours_gitignore() {
     assert_eq!(r.paths.len(), 1);
 }
 
+/// The portal's pattern gets a matcher of a few MiB, not grep-regex's local
+/// defaults: `\w{2000}` (9 bytes) would compile to about 250 MB.
+#[test]
+fn grep_patterns_are_small_and_bounded() {
+    let f = fx();
+    let g = f.root.join("granted");
+    let opts = |pattern| GrepOptions {
+        pattern,
+        glob: None,
+        ignore_case: false,
+        literal: false,
+        context: 0,
+        limit: None,
+    };
+    let e = search::grep(&permit(g.clone(), Some(&g)), &opts(r"\w{2000}"), &all).unwrap_err();
+    assert_eq!(e.code, code::INVALID_PARAMS, "{e:?}");
+    let long = "a".repeat(search::MAX_PATTERN + 1);
+    let e = search::grep(&permit(g.clone(), Some(&g)), &opts(&long), &all).unwrap_err();
+    assert_eq!(e.code, code::INVALID_PARAMS, "{e:?}");
+    let e = search::find(&permit(g.clone(), Some(&g)), &long, None, &all).unwrap_err();
+    assert_eq!(e.code, code::INVALID_PARAMS, "{e:?}");
+    // Ordinary patterns still compile.
+    let r = search::grep(&permit(g.clone(), Some(&g)), &opts(r"\w{3}a\b"), &all).unwrap();
+    assert!(r.lines.iter().any(|l| l.text == "alpha"), "{r:?}");
+}
+
+/// No more than `MAX_SEARCHES` searches run at once; the next one waits.
+#[test]
+fn searches_wait_for_a_free_place() {
+    let f = fx();
+    let g = f.root.join("granted");
+    let held: Vec<_> = (0..search::MAX_SEARCHES)
+        .map(|_| search::search_slot())
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = permit(g.clone(), Some(&g));
+    std::thread::spawn(move || {
+        let opts = GrepOptions {
+            pattern: "beta",
+            glob: None,
+            ignore_case: false,
+            literal: false,
+            context: 0,
+            limit: None,
+        };
+        let _ = tx.send(search::grep(&p, &opts, &all).is_ok());
+    });
+    let waited = rx.recv_timeout(std::time::Duration::from_millis(500));
+    assert!(waited.is_err(), "a search ran past the limit");
+    drop(held);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true)
+    );
+}
+
 /// The protocol's limit for one message (`docs/protocol.md`, Limits): every
 /// answer fits below it.
 const _: () = assert!(search::MAX_ANSWER < 4 << 20);

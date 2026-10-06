@@ -266,7 +266,7 @@ All but `path`, `pattern` and `ctx` are optional. `path` is a file or a folder; 
 {"lines": [{"path": "/abs/file", "line": 12, "text": "...", "context": false}], "truncated": false, "skipped": 0}
 ```
 
-`limit` defaults to 100 match lines and is capped at 10 000; lines are cut at 2000 characters. The answer stops at about 3 MiB, context lines counted, and then says `truncated`, so it always fits one message. `skipped` counts files left out because they are protected, outside the granted folders, or unreadable.
+`limit` defaults to 100 match lines and is capped at 10 000; lines are cut at 2000 characters. `pattern` and `glob` have at most 4096 bytes, and the compiled pattern and its search cache are limited to 8 MiB each; a pattern beyond that (`\w{2000}`, say) is `INVALID_PARAMS`. The answer stops at about 3 MiB, context lines counted, and then says `truncated`, so it always fits one message. `skipped` counts files left out because they are protected, outside the granted folders, or unreadable.
 
 ### `fs.find`
 
@@ -472,6 +472,8 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | Calls at once | 64 |
 | Uploads at once | 4 (each holds its slot until the write is done, its approval included; more are `BUSY`) |
 | `fs.read` holding a file at once | 4 (more wait) |
+| `fs.grep` and `fs.find` running at once | 4 (more wait) |
+| grep pattern, grep or find glob | 4096 bytes; compiled pattern and search cache 8 MiB each |
 | Read or write size | 64 MiB |
 | Upload stall | 60 s |
 | Running commands | 16 (config `exec.max_running`) |

@@ -18,6 +18,42 @@ use sync_proto::{RpcError, code};
 
 use crate::fsops::{MAX_READ, OpenMode, io_error, open_checked};
 
+/// Longest pattern `fs.grep` takes.
+pub const MAX_PATTERN: usize = 4096;
+/// Size limits of a compiled pattern and of its lazy DFA's cache. grep-regex's
+/// defaults (100 MiB and 1000 MiB) suit a local user; the portal's pattern gets a
+/// few MiB, ample for ordinary searches (`\w{2000}` alone would take 250 MB).
+const REGEX_SIZE_LIMIT: usize = 8 << 20;
+const REGEX_DFA_LIMIT: usize = 8 << 20;
+/// Searches (grep and find) running at once in this process; more wait. Most of a
+/// search's memory is its matcher and the walk, which no answer budget bounds.
+pub const MAX_SEARCHES: usize = 4;
+
+static SEARCHES: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the `MAX_SEARCHES` places, held for a search's whole run.
+pub struct SearchSlot(());
+
+/// Waits for a free search place (blocking: searches run on blocking threads).
+pub fn search_slot() -> SearchSlot {
+    let (n, freed) = &SEARCHES;
+    let mut n = n.lock().unwrap_or_else(|e| e.into_inner());
+    while *n >= MAX_SEARCHES {
+        n = freed.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    *n += 1;
+    SearchSlot(())
+}
+
+impl Drop for SearchSlot {
+    fn drop(&mut self) {
+        let (n, freed) = &SEARCHES;
+        *n.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        freed.notify_one();
+    }
+}
+
 pub const GREP_DEFAULT_LIMIT: u32 = 100;
 pub const FIND_DEFAULT_LIMIT: u32 = 1000;
 pub const MAX_LIMIT: u32 = 10_000;
@@ -83,6 +119,12 @@ struct NameOrPath {
 
 impl NameOrPath {
     fn new(glob: &str) -> Result<NameOrPath, RpcError> {
+        if glob.len() > MAX_PATTERN {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                format!("a glob has at most {MAX_PATTERN} bytes"),
+            ));
+        }
         let full = glob.contains('/');
         let g = Glob::new(glob.trim_start_matches('/'))
             .map_err(|e| RpcError::new(code::INVALID_PARAMS, format!("bad glob: {e}")))?;
@@ -190,9 +232,18 @@ pub fn grep(
     allowed: &dyn Fn(&Path) -> bool,
 ) -> Result<GrepResult, RpcError> {
     let limit = opts.limit.unwrap_or(GREP_DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    if opts.pattern.len() > MAX_PATTERN {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            format!("a pattern has at most {MAX_PATTERN} bytes"),
+        ));
+    }
+    let _slot = search_slot();
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(opts.ignore_case)
         .fixed_strings(opts.literal)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_LIMIT)
         .build(opts.pattern)
         .map_err(|e| RpcError::new(code::INVALID_PARAMS, format!("bad pattern: {e}")))?;
     let glob = opts.glob.map(NameOrPath::new).transpose()?;
@@ -276,6 +327,7 @@ pub fn find(
 ) -> Result<FindResult, RpcError> {
     let limit = limit.unwrap_or(FIND_DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
     let glob = NameOrPath::new(pattern)?;
+    let _slot = search_slot();
     let root = &permit.path;
     if !std::fs::symlink_metadata(root).map_err(io_error)?.is_dir() {
         return Err(RpcError::new(code::IO, "not a directory"));
