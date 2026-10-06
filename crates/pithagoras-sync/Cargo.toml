@@ -1,0 +1,39 @@
+[package]
+name = "pithagoras-sync"
+description = "Pithagoras Sync: lets a Pithagoras portal's agent reach this computer's files and shell."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Phase 2: overlay, audio, wake word, hotkeys and computer use. Nothing is behind it yet;
+# the phase 1 syncer is the build without it and links no GUI or audio libraries.
+overlay = []
+
+[dependencies]
+sync-proto.workspace = true
+sync-policy.workspace = true
+sync-ops.workspace = true
+sync-connector.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+minisign-verify.workspace = true
+ring.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+sync-testkit.workspace = true
+sync-release.workspace = true
+tempfile.workspace = true

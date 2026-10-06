@@ -1,0 +1,6 @@
+# The C runtime linked in statically: a fresh Windows has no VCRUNTIME140.dll (the
+# Visual C++ redistributable), and without this the program does not start there
+# (STATUS_DLL_NOT_FOUND, 0xC0000135) and prints nothing. The static CRT ships
+# without its PDBs, hence the linker warning 4099 turned off.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
