@@ -4,7 +4,7 @@ This page is for people who want to connect their computer to their Pithagoras p
 
 Pithagoras Sync works on Windows 10 and 11 and on Linux desktops (GNOME, KDE and others). On Linux it shows its windows with `zenity` or `kdialog`, which most desktops have; if neither is installed, install one of them (`sudo apt install zenity`) or use the command line. Only a copy the system installed counts (one root alone can change, as in `/usr/bin`): a `zenity` in your home folder is not used, since the windows ask for your passwords. For the same reason the program keeps other programs of your user out of its memory while its windows are open, and while something traces it (a debugger) it asks for no password: it says "Pithagoras Sync is being traced" and closes.
 
-The windows speak English or German, as your desktop does: on Linux the language settings of your session (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`), on Windows the display language. Any other language gets English. The quotes below are the English texts; the German windows say the same in German. The command line stays English.
+The windows speak English or German, as your desktop does: on Linux the language settings of your session (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`), on Windows the display language. Any other language gets English. The quotes below are the English texts; the German windows say the same in German. The command line stays English, and so do the details a window passes on from it: why a link was refused, the notes of a step, what failed (and what Windows or a program it ran said, in the system's language).
 
 ## 1. Download and start it
 
