@@ -6,7 +6,7 @@ The device defends itself from the portal. Everything the portal sends is parsed
 
 ## 1. Endpoints
 
-The portal has a base URL: `https://host[:port][/prefix]`. `http://` is accepted only when every address the host resolves to is a loopback address (checked on the resolved addresses, not the name). The URL has no user info, query or fragment, and no `.` or `..` path segments.
+The portal has a base URL: `https://host[:port][/prefix]`. `http://` is accepted only when every address the host resolves to is a loopback address (checked on the resolved addresses, not the name). Loopback does not tell one local user from another, so for plain http a host name takes only its IPv4 loopback addresses (`localhost` resolves to `::1` first, and a portal that listens on IPv4 leaves `[::1]` on its port free for any local user), a literal address is used as written, and on Linux the client checks in `/proc/net/tcp` that the socket that accepted its connection belongs to its own user or root before it sends anything (the pairing code, the token). On Windows plain http trusts every local account. The URL has no user info, query or fragment, and no `.` or `..` path segments.
 
 | Endpoint | Use |
 |---|---|

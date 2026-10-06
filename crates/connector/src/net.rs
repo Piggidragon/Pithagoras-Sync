@@ -4,6 +4,13 @@
 //! loopback address, checked after name resolution, so a name that resolves to
 //! another machine cannot get a plaintext link (which would hand a man in the middle
 //! a shell on this device).
+//!
+//! Loopback is not a channel between two users: any local account may listen on a
+//! free port, and gets the pairing code and the token. So a name (`localhost`)
+//! takes only its IPv4 loopback addresses (the portal listens on IPv4, which leaves
+//! `[::1]` on its port free for anyone), and on Linux the program that accepted the
+//! connection must belong to this user or root. What remains: on Windows plain HTTP
+//! trusts every local account; use https with a pinned certificate there.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -22,8 +29,13 @@ pub type BoxIo = Box<dyn Io>;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The addresses a connection may use. Without TLS only loopback ones, and none
-/// at all if the name resolves to anything else.
-pub fn usable_addrs(tls: bool, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String> {
+/// at all if the name resolves to anything else; for a name rather than an
+/// address (`named`), only its IPv4 loopback addresses.
+pub fn usable_addrs(
+    tls: bool,
+    named: bool,
+    addrs: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, String> {
     if tls {
         return Ok(addrs);
     }
@@ -32,7 +44,78 @@ pub fn usable_addrs(tls: bool, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>
             "plain http is only allowed to a portal on this machine (loopback); use https".into(),
         );
     }
+    if named {
+        // `localhost` resolves to ::1 first; a portal listening on IPv4 only
+        // leaves [::1] on its port to whoever binds it.
+        let v4: Vec<SocketAddr> = addrs
+            .into_iter()
+            .filter(|a| a.ip().to_canonical().is_ipv4())
+            .collect();
+        if v4.is_empty() {
+            return Err(
+                "plain http to a host name uses its IPv4 loopback address only, and this one has none: name the address (http://[::1]:<port>)".into(),
+            );
+        }
+        return Ok(v4);
+    }
     Ok(addrs)
+}
+
+/// The uid owning the socket at the other end of a loopback connection from
+/// `local` to `peer`: the server's accepted socket, which carries the uid of the
+/// program that listens. From `/proc/net/tcp` (or `tcp6`).
+#[cfg(target_os = "linux")]
+pub fn peer_owner(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
+    let file = if peer.is_ipv4() { "tcp" } else { "tcp6" };
+    let table = std::fs::read_to_string(format!("/proc/net/{file}")).ok()?;
+    let (want_local, want_remote) = (proc_addr(peer), proc_addr(local));
+    table.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (l, r, uid) = (f.get(1)?, f.get(2)?, f.get(7)?);
+        (l.eq_ignore_ascii_case(&want_local) && r.eq_ignore_ascii_case(&want_remote))
+            .then(|| uid.parse().ok())
+            .flatten()
+    })
+}
+
+/// An address as `/proc/net/tcp` writes it: the address words in the kernel's
+/// byte order, then the port.
+#[cfg(target_os = "linux")]
+fn proc_addr(a: SocketAddr) -> String {
+    let ip = match a.ip() {
+        std::net::IpAddr::V4(v4) => format!("{:08X}", u32::from_ne_bytes(v4.octets())),
+        std::net::IpAddr::V6(v6) => v6
+            .octets()
+            .chunks(4)
+            .map(|w| format!("{:08X}", u32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+            .collect(),
+    };
+    format!("{ip}:{:04X}", a.port())
+}
+
+/// Plain http on Linux: the program that accepted the connection must belong to
+/// this user or root, or it is not the portal this user paired with, and would
+/// get the pairing code and the token.
+#[cfg(target_os = "linux")]
+fn check_local_peer(tcp: &TcpStream) -> Result<(), String> {
+    let (local, peer) = (
+        tcp.local_addr().map_err(|e| e.to_string())?,
+        tcp.peer_addr().map_err(|e| e.to_string())?,
+    );
+    owner_verdict(peer_owner(local, peer), sync_ops::info::euid(), peer)
+}
+
+#[cfg(target_os = "linux")]
+fn owner_verdict(owner: Option<u32>, me: u32, peer: SocketAddr) -> Result<(), String> {
+    match owner {
+        Some(uid) if uid == me || uid == 0 => Ok(()),
+        Some(uid) => Err(format!(
+            "{peer} is answered by a program of another user (uid {uid}), not of this user or root: plain http would hand it the pairing code and the token. If the portal runs as another user, use https with its certificate pinned"
+        )),
+        None => Err(format!(
+            "cannot tell which user's program answers on {peer}, so plain http sends nothing there; use https with a pinned certificate"
+        )),
+    }
 }
 
 pub async fn open(url: &PortalUrl, pin: Option<&str>) -> Result<BoxIo, String> {
@@ -40,7 +123,8 @@ pub async fn open(url: &PortalUrl, pin: Option<&str>) -> Result<BoxIo, String> {
         .await
         .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
         .collect();
-    let addrs = usable_addrs(url.tls, addrs)?;
+    let named = url.host.parse::<std::net::IpAddr>().is_err();
+    let addrs = usable_addrs(url.tls, named, addrs)?;
     let mut last = String::from("no address");
     let mut tcp = None;
     for a in addrs {
@@ -56,6 +140,8 @@ pub async fn open(url: &PortalUrl, pin: Option<&str>) -> Result<BoxIo, String> {
     let tcp = tcp.ok_or_else(|| format!("cannot connect to {url}: {last}"))?;
     let _ = tcp.set_nodelay(true);
     if !url.tls {
+        #[cfg(target_os = "linux")]
+        check_local_peer(&tcp)?;
         return Ok(Box::new(tcp));
     }
     let config = crate::tls::client_config(pin)?;
@@ -81,12 +167,74 @@ mod tests {
 
     #[test]
     fn plain_http_only_reaches_loopback() {
-        assert!(usable_addrs(false, vec![a("127.0.0.1:80"), a("[::1]:80")]).is_ok());
-        assert!(usable_addrs(false, vec![a("[::ffff:127.0.0.1]:80")]).is_ok());
+        assert!(usable_addrs(false, false, vec![a("127.0.0.1:80")]).is_ok());
+        assert!(usable_addrs(false, false, vec![a("[::1]:80")]).is_ok());
+        assert!(usable_addrs(false, false, vec![a("[::ffff:127.0.0.1]:80")]).is_ok());
         // A name that resolves to loopback and to another machine is refused whole.
-        assert!(usable_addrs(false, vec![a("127.0.0.1:80"), a("192.0.2.7:80")]).is_err());
-        assert!(usable_addrs(false, vec![a("192.0.2.7:80")]).is_err());
-        assert!(usable_addrs(false, vec![]).is_err());
-        assert!(usable_addrs(true, vec![a("192.0.2.7:443")]).is_ok());
+        assert!(usable_addrs(false, true, vec![a("127.0.0.1:80"), a("192.0.2.7:80")]).is_err());
+        assert!(usable_addrs(false, true, vec![a("192.0.2.7:80")]).is_err());
+        assert!(usable_addrs(false, true, vec![]).is_err());
+        assert!(usable_addrs(true, true, vec![a("192.0.2.7:443")]).is_ok());
+    }
+
+    #[test]
+    fn a_name_takes_only_its_ipv4_loopback_address() {
+        // `localhost` as getaddrinfo gives it: ::1 first.
+        assert_eq!(
+            usable_addrs(false, true, vec![a("[::1]:80"), a("127.0.0.1:80")]).unwrap(),
+            vec![a("127.0.0.1:80")]
+        );
+        assert!(usable_addrs(false, true, vec![a("[::1]:80")]).is_err());
+    }
+
+    /// The reviewer's probe: the portal on 127.0.0.1, another user's program on
+    /// [::1] at the same port. `localhost` reaches the portal.
+    #[tokio::test]
+    async fn localhost_reaches_the_ipv4_portal_not_a_listener_on_ipv6() {
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await else {
+            eprintln!("  (no IPv6 loopback here; nothing to show)");
+            return;
+        };
+        let resolved: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", port))
+            .await
+            .unwrap()
+            .collect();
+        if !resolved.iter().any(SocketAddr::is_ipv6) {
+            eprintln!("  (localhost has no IPv6 address here; nothing to show)");
+            return;
+        }
+        let url = PortalUrl::parse(&format!("http://localhost:{port}")).unwrap();
+        let _io = open(&url, None).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), v4.accept()).await;
+        assert!(got.is_ok(), "the IPv4 listener was not reached");
+        let other = tokio::time::timeout(Duration::from_millis(200), v6.accept()).await;
+        assert!(other.is_err(), "the IPv6 listener got the connection");
+    }
+
+    /// The owner of the far end of a loopback connection is read right: here this
+    /// process, so this user.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_far_end_of_a_loopback_connection_has_an_owner() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (local, peer) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
+        assert_eq!(peer_owner(local, peer), Some(sync_ops::info::euid()));
+        assert!(check_local_peer(&c).is_ok());
+        // Another connection's addresses are not this one.
+        let other = SocketAddr::new(local.ip(), local.port().wrapping_add(1).max(1));
+        assert_eq!(peer_owner(other, peer), None);
+        // A program of another user is refused, one of root taken.
+        let me = sync_ops::info::euid();
+        assert!(owner_verdict(Some(me + 1), me, peer).is_err());
+        assert!(owner_verdict(None, me, peer).is_err());
+        assert!(owner_verdict(Some(0), me, peer).is_ok());
+        if let Ok(l6) = tokio::net::TcpListener::bind("[::1]:0").await {
+            let c = TcpStream::connect(l6.local_addr().unwrap()).await.unwrap();
+            let (local, peer) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
+            assert_eq!(peer_owner(local, peer), Some(sync_ops::info::euid()));
+        }
     }
 }

@@ -13,6 +13,10 @@ Phase 1 on Windows gives the same remote access as on Linux: the agent's file, s
 - A shell that is not PowerShell gets `-c <command>`, as on Linux.
 - The environment is scrubbed as on Linux, with a Windows list (`PATH`, `PATHEXT`, `SystemRoot`, `ComSpec`, `TEMP`, `USERPROFILE`, `APPDATA` and similar). `PORTAL_*` never passes.
 
+## Plain http to a local portal
+
+On Linux the client sends nothing over plain http to a loopback port unless the program that accepted the connection belongs to its user or root (from `/proc/net/tcp`). Windows has no such check yet (it would need `GetExtendedTcpTable` and the owning process's token): any local account that listens on the portal's port while the portal is down gets the pairing code or the token. On a Windows machine shared with other accounts, use https with a pinned certificate.
+
 ## Process trees: Job Objects
 
 - Each command runs under a small shim (`pithagoras-sync __exec-shim`). The client creates a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts the shim, assigns it to the job, and only then lets it go on (the shim waits for its spec on stdin, which the client writes only after that; the spec is never in the command line). Everything the command starts itself is in the job, `Start-Process` children included.

@@ -17,6 +17,13 @@ pub fn arch() -> &'static str {
     std::env::consts::ARCH
 }
 
+/// The effective uid of this process.
+#[cfg(unix)]
+pub fn euid() -> u32 {
+    // SAFETY: geteuid cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// The OS user name and uid (0 on Windows, which has no uids).
 pub fn user() -> (String, u32) {
     #[cfg(unix)]

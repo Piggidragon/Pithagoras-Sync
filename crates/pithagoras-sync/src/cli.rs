@@ -634,6 +634,16 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 "Paired with {} as {} (device {}).",
                 paired.portal.url, paired.portal.name, paired.portal.device_id
             );
+            if paired.portal.url.starts_with("http://") {
+                println!(
+                    "Note: plain http trusts whoever answers on the portal's port on this machine.{}",
+                    if cfg!(target_os = "linux") {
+                        " The client talks only to a program of this user or root there; a portal that runs as another user needs https."
+                    } else {
+                        " Any local account that listens there while the portal is down gets the token: on a machine shared with other accounts, use https."
+                    }
+                );
+            }
             println!("Mode: {:?}.", cfg.policy.mode);
             if cfg.policy.mode == Mode::Ask {
                 println!(
