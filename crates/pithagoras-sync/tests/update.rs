@@ -319,8 +319,9 @@ async fn this_build_updates_only_with_a_release_key_and_restarts_on_request() {
     );
 }
 
-/// A program in a folder this user cannot write to (root's /usr/local/bin, for
-/// the dedicated user `setup` makes): the error says who updates it.
+/// A program in a folder this user cannot write to: the error says who updates
+/// it. Here the folder is this user's own, so not root (root's /usr/local/bin,
+/// for the dedicated user `setup` makes, is in the unit tests).
 #[tokio::test]
 async fn a_program_this_user_cannot_replace_says_who_updates_it() {
     use std::os::unix::fs::PermissionsExt;
@@ -336,7 +337,11 @@ async fn a_program_this_user_cannot_replace_says_who_updates_it() {
     let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
     let e = update::install(&plan, &exe).await.unwrap_err();
     std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(e.contains("sudo pithagoras-sync update"), "{e}");
+    assert!(
+        e.contains(&format!("so make it writable: chmod u+w {}", bin.display())),
+        "{e}"
+    );
+    assert!(!e.contains("sudo"), "{e}");
     assert!(e.contains(&exe.display().to_string()), "{e}");
     assert!(!e.contains("os error"), "{e}");
     assert_eq!(std::fs::read(&exe).unwrap(), program("0.1.0"));
