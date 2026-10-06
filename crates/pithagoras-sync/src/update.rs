@@ -357,42 +357,162 @@ pub enum Runs {
     Other(PathBuf),
 }
 
-/// Whether only root can change `exe`: the file and every folder above it
-/// belong to root and are not writable by group or others. Root runs and
-/// replaces the system unit's program only then: one another user can change
-/// would let that user, and the agent's commands running as it, run code as root.
-#[cfg(unix)]
-pub fn only_root_changes(exe: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    only_owner_changes(exe, 0, |p| {
-        std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode(), m.file_type().is_symlink()))
-    })
+/// What `lstat` tells about one path, for `root_program`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    /// Where it leads, when it is a symbolic link.
+    pub link: Option<PathBuf>,
 }
 
-/// `only_root_changes` for an `owner` and a way to `lstat` a path (uid, mode,
-/// whether it is a symbolic link). The path is resolved first, then every part
-/// of it is checked as it is, so no link can lead elsewhere.
-#[cfg(unix)]
-fn only_owner_changes(
-    exe: &Path,
-    owner: u32,
-    lstat: impl Fn(&Path) -> std::io::Result<(u32, u32, bool)>,
-) -> Result<(), String> {
-    let real = std::fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
-    for p in real.ancestors() {
-        let (uid, mode, link) = lstat(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        let why = if link {
-            "is a symbolic link".to_string()
-        } else if uid != owner {
-            format!("belongs to uid {uid}")
-        } else if mode & 0o022 != 0 {
-            "is writable by its group or by others".to_string()
-        } else {
-            continue;
+/// The file system as `root_program` sees it, so tests can give owners and
+/// modes a test cannot make for real.
+pub trait Fs {
+    /// `None` when nothing is at `path`.
+    fn lstat(&self, path: &Path) -> std::io::Result<Option<Node>>;
+}
+
+/// The real file system.
+pub struct RealFs;
+
+impl Fs for RealFs {
+    #[cfg(unix)]
+    fn lstat(&self, path: &Path) -> std::io::Result<Option<Node>> {
+        use std::os::unix::fs::MetadataExt;
+        let m = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
         };
-        return Err(format!("{} {why}", p.display()));
+        let link = if m.file_type().is_symlink() {
+            Some(std::fs::read_link(path)?)
+        } else {
+            None
+        };
+        Ok(Some(Node {
+            uid: m.uid(),
+            gid: m.gid(),
+            mode: m.mode(),
+            link,
+        }))
     }
-    Ok(())
+
+    #[cfg(not(unix))]
+    fn lstat(&self, _path: &Path) -> std::io::Result<Option<Node>> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// The program `update` replaces, and whether it is the system unit's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub exe: PathBuf,
+    pub unit: bool,
+}
+
+/// `target_exe`, and when that is the system unit's program (`system`, as
+/// root), the path `root_program` checked and resolved: only that path is run,
+/// replaced and compared from then on, so no link can be turned elsewhere
+/// between the check and its use.
+pub fn choose_target(
+    running: Option<&Path>,
+    system: Option<&Path>,
+    me: &Path,
+    fs: &dyn Fs,
+) -> Result<Target, String> {
+    let exe = target_exe(running, system, me);
+    match system.filter(|s| same_program(s, &exe)) {
+        Some(s) => Ok(Target {
+            exe: root_program(s, fs)?,
+            unit: true,
+        }),
+        None => Ok(Target { exe, unit: false }),
+    }
+}
+
+/// The system unit's program `given` with every link resolved, if only root can
+/// change what it leads to: every folder on the way, every folder that holds a
+/// link on the way, and the file belong to root and are not writable by group
+/// or others. Root runs and replaces the unit's program only then: one another
+/// user can change (or a link they can turn) would let that user, and the
+/// agent's commands running as it, run code as root.
+pub fn root_program(given: &Path, fs: &dyn Fs) -> Result<PathBuf, String> {
+    use std::path::Component;
+    enum Part {
+        Up,
+        Name(std::ffi::OsString),
+    }
+    let parts = |p: &Path| -> Vec<Part> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::ParentDir => Some(Part::Up),
+                Component::Normal(n) => Some(Part::Name(n.to_owned())),
+                _ => None,
+            })
+            .collect()
+    };
+    let refuse = |part: &Path, why: &str| {
+        format!(
+            "the system unit starts {}, but {} {why}, so another user could change what root runs: root neither runs nor replaces it",
+            given.display(),
+            part.display()
+        )
+    };
+    let stat = |p: &Path| fs.lstat(p).map_err(|e| format!("{}: {e}", p.display()));
+    let root_only = |p: &Path, n: &Node| -> Result<(), String> {
+        if n.uid != 0 {
+            Err(refuse(p, &format!("belongs to uid {}", n.uid)))
+        } else if n.mode & 0o022 != 0 {
+            Err(refuse(p, "is writable by its group or by others"))
+        } else {
+            Ok(())
+        }
+    };
+    if !given.is_absolute() {
+        return Err(format!(
+            "the system unit's program {} is not an absolute path",
+            given.display()
+        ));
+    }
+    let mut cur = PathBuf::from("/");
+    let top = stat(&cur)?.ok_or("/ is missing")?;
+    root_only(&cur, &top)?;
+    let mut todo: std::collections::VecDeque<Part> = parts(given).into();
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        let name = match part {
+            // `cur` is a real folder already checked, and so is its parent.
+            Part::Up => {
+                cur.pop();
+                continue;
+            }
+            Part::Name(n) => n,
+        };
+        let p = cur.join(&name);
+        let node = stat(&p)?.ok_or_else(|| format!("{} does not exist", p.display()))?;
+        match node.link {
+            // The link's folder, `cur`, passed: only root can turn it.
+            Some(to) => {
+                links += 1;
+                if links > 40 {
+                    return Err(format!("{}: too many links", given.display()));
+                }
+                if to.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                for (i, part) in parts(&to).into_iter().enumerate() {
+                    todo.insert(i, part);
+                }
+            }
+            None => {
+                root_only(&p, &node)?;
+                cur = p;
+            }
+        }
+    }
+    Ok(cur)
 }
 
 /// After `update` as root, for the system unit that starts `exe`: restarts it
@@ -701,45 +821,162 @@ mod tests {
         std::fs::rename(&tmp, path).unwrap();
     }
 
+    /// A file system given as (path, uid, gid, mode, link) rows.
+    struct FakeFs(Vec<(&'static str, u32, u32, u32, Option<&'static str>)>);
+
+    impl Fs for FakeFs {
+        fn lstat(&self, path: &Path) -> std::io::Result<Option<Node>> {
+            Ok(self
+                .0
+                .iter()
+                .find(|r| Path::new(r.0) == path)
+                .map(|&(_, uid, gid, mode, link)| Node {
+                    uid,
+                    gid,
+                    mode,
+                    link: link.map(PathBuf::from),
+                }))
+        }
+    }
+
+    /// The layout `setup` makes, plus `extra` rows (which come first).
+    #[cfg(unix)]
+    fn layout(extra: &[(&'static str, u32, u32, u32, Option<&'static str>)]) -> FakeFs {
+        let mut v = extra.to_vec();
+        v.extend([
+            ("/", 0, 0, 0o40755, None),
+            ("/usr", 0, 0, 0o40755, None),
+            ("/usr/local", 0, 0, 0o40755, None),
+            ("/usr/local/bin", 0, 0, 0o40755, None),
+            ("/usr/local/bin/pithagoras-sync", 0, 0, 0o100755, None),
+            ("/opt", 0, 0, 0o40755, None),
+            ("/home", 0, 0, 0o40755, None),
+            ("/home/svc", 1000, 1000, 0o40700, None),
+            ("/home/svc/bin", 1000, 1000, 0o40755, None),
+        ]);
+        FakeFs(v)
+    }
+
     #[cfg(unix)]
     #[test]
     fn root_takes_only_a_program_no_one_else_can_change() {
-        let t = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(t.path()).unwrap();
-        let exe = base.join("bin").join("pithagoras-sync");
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, "x").unwrap();
-        std::os::unix::fs::symlink(&exe, base.join("link")).unwrap();
-        // Owners and modes as given here, for every path.
-        let check = |at: &Path, uid: u32, mode: u32| {
-            only_owner_changes(&base.join("link"), 0, |p| {
-                Ok(if p == at {
-                    (uid, mode, false)
-                } else {
-                    (0, 0o755, false)
-                })
-            })
-        };
-        assert_eq!(check(Path::new("/nowhere"), 0, 0o755), Ok(()));
-        // The link is followed, and the file it leads to is what counts.
-        let e = check(&exe, 1000, 0o755).unwrap_err();
-        assert!(e.contains("pithagoras-sync belongs to uid 1000"), "{e}");
-        let e = check(exe.parent().unwrap(), 0, 0o775).unwrap_err();
-        assert!(
-            e.ends_with("bin is writable by its group or by others"),
-            "{e}"
-        );
-        let e = check(&base, 0, 0o1777).unwrap_err();
-        assert!(e.contains("writable by its group or by others"), "{e}");
-        assert!(check(Path::new("/"), 0, 0o757).is_err());
-        // A part that is a link when checked (swapped in meanwhile).
-        let e = only_owner_changes(&exe, 0, |p| Ok((0, 0o755, p == exe.parent().unwrap())))
-            .unwrap_err();
-        assert!(e.contains("is a symbolic link"), "{e}");
-        // For real: a file of this test's user, below /var/tmp or /tmp.
-        if unsafe { libc::geteuid() } != 0 {
-            assert!(only_root_changes(&exe).is_err());
+        let bin = Path::new("/usr/local/bin/pithagoras-sync");
+        assert_eq!(root_program(bin, &layout(&[])), Ok(bin.to_path_buf()));
+        // The file, or a folder above it, of another user or writable by others.
+        for (row, part) in [
+            (
+                ("/usr/local/bin/pithagoras-sync", 1000, 0, 0o100755, None),
+                "pithagoras-sync belongs to uid 1000",
+            ),
+            (
+                ("/usr/local/bin", 0, 50, 0o42775, None),
+                "/usr/local/bin is writable",
+            ),
+            (("/usr", 0, 0, 0o40757, None), "/usr is writable"),
+        ] {
+            let e = root_program(bin, &layout(&[row])).unwrap_err();
+            assert!(e.contains(part), "{e}");
         }
+        // A link in a folder of uid 1000 leading to a root-only file: that user
+        // could turn the link anywhere, so it is refused.
+        let fs = layout(&[(
+            "/home/svc/bin/pithagoras-sync",
+            1000,
+            1000,
+            0o120777,
+            Some("/usr/local/bin/pithagoras-sync"),
+        )]);
+        let e = root_program(Path::new("/home/svc/bin/pithagoras-sync"), &fs).unwrap_err();
+        assert!(e.contains("/home/svc belongs to uid 1000"), "{e}");
+        // A link in root's folders is followed, and the file it leads to is
+        // what root runs and replaces; relative links and `..` too.
+        let fs = layout(&[
+            ("/opt/ps", 0, 0, 0o40755, None),
+            ("/opt/ps/pithagoras-sync", 0, 0, 0o100755, None),
+            (
+                "/usr/local/bin/pithagoras-sync",
+                0,
+                0,
+                0o120777,
+                Some("../../../opt/ps/pithagoras-sync"),
+            ),
+        ]);
+        assert_eq!(
+            root_program(bin, &fs),
+            Ok(PathBuf::from("/opt/ps/pithagoras-sync"))
+        );
+        // ... but a link that leads into another user's folder is refused there.
+        let fs = layout(&[
+            ("/home/svc/bin/pithagoras-sync", 1000, 1000, 0o100755, None),
+            (
+                "/usr/local/bin/pithagoras-sync",
+                0,
+                0,
+                0o120777,
+                Some("/home/svc/bin/pithagoras-sync"),
+            ),
+        ]);
+        let e = root_program(bin, &fs).unwrap_err();
+        assert!(e.contains("/home/svc belongs to uid 1000"), "{e}");
+        // A loop of links ends.
+        let fs = layout(&[(
+            "/usr/local/bin/pithagoras-sync",
+            0,
+            0,
+            0o120777,
+            Some("pithagoras-sync"),
+        )]);
+        assert!(
+            root_program(bin, &fs)
+                .unwrap_err()
+                .contains("too many links")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_uses_only_the_checked_path_of_the_units_program() {
+        let fs = layout(&[
+            ("/opt/ps", 0, 0, 0o40755, None),
+            ("/opt/ps/pithagoras-sync", 0, 0, 0o100755, None),
+            (
+                "/usr/local/bin/pithagoras-sync",
+                0,
+                0,
+                0o120777,
+                Some("/opt/ps/pithagoras-sync"),
+            ),
+        ]);
+        let unit = Path::new("/usr/local/bin/pithagoras-sync");
+        let me = Path::new("/nowhere/pithagoras-sync");
+        // `sudo pithagoras-sync update` with no client of root's own: the unit's
+        // program, checked and resolved.
+        assert_eq!(
+            choose_target(None, Some(unit), me, &fs),
+            Ok(Target {
+                exe: PathBuf::from("/opt/ps/pithagoras-sync"),
+                unit: true
+            })
+        );
+        // Refused before anything runs it.
+        let bad = layout(&[("/usr/local/bin", 0, 50, 0o42775, None)]);
+        assert!(choose_target(None, Some(unit), me, &bad).is_err());
+        // Root's own client from elsewhere, not the unit's: not checked.
+        let roots = Path::new("/root/pithagoras-sync");
+        assert_eq!(
+            choose_target(Some(roots), Some(unit), roots, &bad),
+            Ok(Target {
+                exe: roots.to_path_buf(),
+                unit: false
+            })
+        );
+        assert_eq!(
+            choose_target(None, None, me, &bad),
+            Ok(Target {
+                exe: me.to_path_buf(),
+                unit: false
+            })
+        );
     }
 
     #[test]
