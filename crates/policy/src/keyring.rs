@@ -225,6 +225,8 @@ pub mod secret_service {
     trait Prompt {
         fn prompt(&self, window_id: &str) -> zbus::Result<()>;
 
+        fn dismiss(&self) -> zbus::Result<()>;
+
         #[zbus(signal)]
         fn completed(&self, dismissed: bool, result: Value<'_>) -> zbus::Result<()>;
     }
@@ -294,6 +296,28 @@ pub mod secret_service {
         p.as_str() == "/"
     }
 
+    /// A prompt shown to the owner, dismissed when dropped unanswered: one the
+    /// client gave up on (its time ran out, or the request it was for was cut
+    /// off) does nothing when the owner answers it later.
+    struct OpenPrompt {
+        proxy: PromptProxy<'static>,
+        answered: bool,
+    }
+
+    impl Drop for OpenPrompt {
+        fn drop(&mut self) {
+            if self.answered {
+                return;
+            }
+            let proxy = self.proxy.clone();
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(async move {
+                    let _ = proxy.dismiss().await;
+                });
+            }
+        }
+    }
+
     /// Lets the service ask the owner (an unlock password, a confirmation) and
     /// waits for the answer. Dismissed or unanswered is an error.
     async fn prompt(conn: &zbus::Connection, path: &ObjectPath<'_>) -> Result<(), String> {
@@ -306,8 +330,14 @@ pub mod secret_service {
         .await?;
         // Subscribed before the prompt shows, so a quick answer is not missed.
         let mut done = timed(p.receive_completed()).await?;
+        let mut open = OpenPrompt {
+            proxy: p.clone(),
+            answered: false,
+        };
         timed(p.prompt("")).await?;
-        match tokio::time::timeout(PROMPT, done.next()).await {
+        let answer = tokio::time::timeout(PROMPT, done.next()).await;
+        open.answered = matches!(answer, Ok(Some(_)));
+        match answer {
             Ok(Some(s)) => match s.args() {
                 Ok(a) if !a.dismissed => Ok(()),
                 Ok(_) => Err("the keyring prompt was cancelled".into()),

@@ -42,7 +42,7 @@ Check that this is your portal. **Yes** pairs; **No** changes nothing. A link th
 
 On a Linux desktop it then asks for your password (the one you log in with), as `pithagoras-sync pair` does in a terminal: pairing decides whose agent may use this computer, and a program of the agent that clicks through the windows does not know it. It is checked with `su` and not kept. A wrong one, or a cancel, changes nothing. When `su` fails for another reason (an expired password, say), the window shows what it said instead of calling the password wrong. If it cannot be checked (some login setups ask for a fingerprint or a security key instead), pair in a terminal: `pithagoras-sync pair '<link>'`. Windows asks no password here; the Windows login is the check there ([windows.md](windows.md)).
 
-After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is. Notes come with it, for example that the keyring did not take the pairing's token and it is kept in a file instead. Notes of the install (for example that pairing links may not open the program, so paste them) are shown right after installing.
+After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is. A connection to the portal of an earlier pairing, still open while the client switches, does not count as connected. Notes come with it, for example that the keyring did not take the pairing's token and it is kept in a file instead. Notes of the install (for example that pairing links may not open the program, so paste them) are shown right after installing.
 
 From now on the portal's agent can ask to use this computer. Until you change it, every file access and command asks you first; you answer in the portal's Devices tab. What else you can allow (folders, a mode without questions) is in [permissions.md](permissions.md).
 
@@ -79,7 +79,7 @@ Choose **Uninstall** in the menu. It asks twice:
 1. "Uninstall Pithagoras Sync?" **No** changes nothing.
 2. "Also remove the pairing and all settings?" **Yes** removes everything the client keeps: the pairing, the settings with their folders, the logs, a password or token in the keyring. **No** keeps them, so a later install picks up where you left off.
 
-Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Remove the device in the portal as well (Settings, Devices).
+Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login). Remove the device in the portal as well (Settings, Devices).
 
 ## What the windows never do
 

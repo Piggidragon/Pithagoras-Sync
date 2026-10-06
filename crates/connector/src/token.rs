@@ -211,11 +211,19 @@ impl TokenStore {
     /// the token and the setting as they were. Once the setting is saved the
     /// switch has happened: an old place that cannot be cleared is a note for
     /// the owner, not an error, so the caller still tells the running client.
+    /// Not `paired`, there is no token to move: only the setting changes, and
+    /// the old place is not asked, so a keyring that is gone or keeps being
+    /// cancelled does not hold the owner to it.
     pub async fn switch(
         &self,
         to: &TokenStore,
+        paired: bool,
         commit: impl FnOnce() -> Result<(), String>,
     ) -> Result<Vec<String>, String> {
+        if !paired {
+            commit()?;
+            return Ok(Vec::new());
+        }
         let Some(token) = self.current().await? else {
             commit()?;
             return Ok(Vec::new());
@@ -338,7 +346,7 @@ mod tests {
         let keyring = store(t.path(), Some(TokenStorage::Keyring), &ks, false);
         file.save(T1).await.unwrap();
         let mut committed = false;
-        file.switch(&keyring, || {
+        file.switch(&keyring, true, || {
             // The new place has it before the setting changes.
             assert_eq!(in_keyring(&ks).as_deref(), Some(T1));
             assert!(t.path().join("token").exists());
@@ -351,7 +359,7 @@ mod tests {
         assert!(!t.path().join("token").exists());
         assert_eq!(keyring.load().await.unwrap(), T1);
         keyring
-            .switch(&file, || {
+            .switch(&file, true, || {
                 assert!(t.path().join("token").exists());
                 Ok(())
             })
@@ -370,7 +378,7 @@ mod tests {
         file.save(T1).await.unwrap();
         *ks.fail.lock().unwrap() = Some("locked".into());
         let e = file
-            .switch(&keyring, || panic!("the setting must not change"))
+            .switch(&keyring, true, || panic!("the setting must not change"))
             .await
             .unwrap_err();
         assert!(e.contains("locked"), "{e}");
@@ -378,22 +386,39 @@ mod tests {
         // The setting cannot be saved: the old place keeps it.
         *ks.fail.lock().unwrap() = None;
         let e = file
-            .switch(&keyring, || Err("disk full".into()))
+            .switch(&keyring, true, || Err("disk full".into()))
             .await
             .unwrap_err();
         assert_eq!(e, "disk full");
         assert_eq!(file.load().await.unwrap(), T1);
-        // Not paired: only the setting changes.
+        // No token: only the setting changes.
         let empty = tempfile::tempdir().unwrap();
         let none = store(empty.path(), Some(TokenStorage::File), &ks, false);
         let mut committed = false;
-        none.switch(&keyring, || {
+        none.switch(&keyring, true, || {
             committed = true;
             Ok(())
         })
         .await
         .unwrap();
         assert!(committed);
+        // Not paired (`unpair` cleared the portal), the setting changes away
+        // from a keyring that fails: it is not asked for a token.
+        *ks.fail.lock().unwrap() = Some("no keyring service".into());
+        let mut committed = false;
+        keyring
+            .switch(&file, false, || {
+                committed = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(committed);
+        let e = keyring
+            .switch(&file, true, || panic!("the setting must not change"))
+            .await
+            .unwrap_err();
+        assert!(e.contains("no keyring service"), "{e}");
     }
 
     /// The setting saved, the switch has happened: an old keyring entry that
@@ -408,7 +433,7 @@ mod tests {
         keyring.save(T1).await.unwrap();
         let mut committed = false;
         let notes = keyring
-            .switch(&file, || {
+            .switch(&file, true, || {
                 committed = true;
                 // The keyring fails from here: its delete prompt is dismissed.
                 *ks.fail.lock().unwrap() = Some("prompt dismissed".into());
@@ -427,7 +452,7 @@ mod tests {
         // What the note says to run removes the entry once the keyring lets it.
         *ks.fail.lock().unwrap() = None;
         assert!(in_keyring(&ks).is_some());
-        let notes = file.switch(&file, || Ok(())).await.unwrap();
+        let notes = file.switch(&file, true, || Ok(())).await.unwrap();
         assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(in_keyring(&ks), None);
         assert_eq!(file.load().await.unwrap(), T1);
@@ -444,7 +469,7 @@ mod tests {
         keyring.save(T1).await.unwrap();
         save_token(&t.path().join("token"), T2).unwrap();
         assert_eq!(keyring.load().await.unwrap(), T1);
-        keyring.switch(&file, || Ok(())).await.unwrap();
+        keyring.switch(&file, true, || Ok(())).await.unwrap();
         assert_eq!(file.load().await.unwrap(), T1);
         assert_eq!(in_keyring(&ks), None);
     }

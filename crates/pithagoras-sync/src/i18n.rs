@@ -261,7 +261,7 @@ impl Lang {
         }
     }
 
-    /// The notes of `install` or `pair` (escaped), one per line.
+    /// The notes of `install`, `pair` or `uninstall` (escaped), one per line.
     pub fn notes(self, notes: &[String]) -> String {
         let word = self.pick("Note", "Hinweis");
         notes

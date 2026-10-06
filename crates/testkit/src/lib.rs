@@ -5,11 +5,11 @@
 //! It implements only what the protocol document says; it is not a model of the
 //! real portal's behaviour beyond that.
 
-/// The release signer, under the name the tests know it by: tests sign their
-/// releases with throwaway keys the same way a real release is signed.
 #[cfg(unix)]
 pub mod keyring;
 
+/// The release signer, under the name the tests know it by: tests sign their
+/// releases with throwaway keys the same way a real release is signed.
 pub mod minisign {
     pub use sync_release::minisign::SigningKey as TestKey;
 }

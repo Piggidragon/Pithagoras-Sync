@@ -28,6 +28,8 @@ pub struct State {
     /// The prompts waiting for that.
     pub waiting: Vec<SignalEmitter<'static>>,
     pub prompts: u32,
+    /// The prompts the client dismissed.
+    pub dismissed: u32,
     /// Set: deleting an item fails with this (a delete prompt dismissed).
     pub refuse_delete: Option<String>,
     pub next: u32,
@@ -200,6 +202,17 @@ impl Prompt {
             }
             let _ = Prompt::completed(&emitter, !unlock, Value::from("")).await;
         });
+    }
+
+    async fn dismiss(&self) {
+        let waiting = {
+            let mut s = self.0.lock().unwrap();
+            s.dismissed += 1;
+            std::mem::take(&mut s.waiting)
+        };
+        for e in waiting {
+            let _ = Prompt::completed(&e, true, Value::from("")).await;
+        }
     }
 
     #[zbus(signal)]

@@ -2912,6 +2912,128 @@ async fn panic_or_clear_while_sudo_set_waits_on_the_keyring_wins() {
     stop(daemon).await;
 }
 
+/// Right after the pairing changes, the link to the old portal may still be up:
+/// `status` does not call that connected to the new one, so the window that
+/// paired does not report a portal that turns the client away as connected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_link_is_not_reported_as_the_new_pairing() {
+    let env = Env::new();
+    let old = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    // Knows no token of this device: it refuses the link.
+    let new = MockPortal::start(MockOptions::default()).await;
+    env.ok(&["pair", &old.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let _dl = old.next_device(WAIT).await.expect("the client connects");
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains(&old.url), "{cfg}");
+    std::fs::write(env.config(), cfg.replace(&old.url, &new.url)).unwrap();
+    // Any edit by the owner reloads the config.
+    env.ok(&["mode", "ask"]).await;
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < end {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        assert_eq!(s["portal"], new.url.as_str());
+        assert_ne!(s["link"]["state"], "connected", "{s}");
+    }
+    assert!(new.refused() > 0);
+    stop(daemon).await;
+}
+
+/// A keyring prompt the owner leaves open ends the request within the client's
+/// time for it (shortened here): the CLI hears an error before it stops
+/// waiting, the prompt is dismissed, and nothing is taken, cleared or loaded
+/// after that answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyring_prompt_left_open_ends_the_request_in_time() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    env.vars
+        .push(("PITHAGORAS_SYNC_TEST_KEYRING_WORK_MS".into(), "1500".into()));
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let daemon = env.start();
+    let end = std::time::Instant::now() + WAIT;
+    while !env
+        .run(&["status", "--json"])
+        .await
+        .out
+        .contains("\"paused\"")
+    {
+        assert!(std::time::Instant::now() < end, "the client never answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stored = || {
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .any(|(_, a, _)| a.get("name").map(String::as_str) == Some("elevation"))
+    };
+    let held = || async {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        s["elevation_password"].as_bool().unwrap()
+    };
+    let lock = || {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = None;
+    };
+    let dismissed = || state.lock().unwrap().dismissed;
+    let line = format!("{PW}\n");
+
+    lock();
+    let started = std::time::Instant::now();
+    let set = env.run_with(&["sudo", "set", "--stdin"], &line).await;
+    assert_ne!(set.code, 0);
+    assert!(set.err.contains("did not finish in time"), "{}", set.err);
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+    eventually("the set's prompt is dismissed", || dismissed() == 1).await;
+    assert!(!stored());
+    assert!(!held().await);
+
+    state.lock().unwrap().locked = false;
+    let set = env.run_with(&["sudo", "set", "--stdin"], &line).await;
+    assert_eq!(set.code, 0, "{}", set.err);
+    assert!(stored() && held().await);
+    lock();
+    let clear = env.run(&["sudo", "clear"]).await;
+    assert_ne!(clear.code, 0);
+    assert!(clear.err.contains("sudo clear` again"), "{}", clear.err);
+    eventually("the clear's prompt is dismissed", || dismissed() == 2).await;
+    assert!(!held().await, "forgotten in memory all the same");
+    assert!(stored());
+    let unlock = env.run(&["unlock"]).await;
+    assert_ne!(unlock.code, 0);
+    assert!(
+        unlock.err.contains("did not finish in time"),
+        "{}",
+        unlock.err
+    );
+    eventually("the unlock's prompt is dismissed", || dismissed() == 3).await;
+    // The owner answers at last: nothing waits on it any more.
+    keyring::answer_waiting(&state, true).await;
+    assert!(!held().await);
+    stop(daemon).await;
+}
+
 /// The owner kept the password and the token in the keyring, then switched
 /// both away from it (the token's old entry could not be removed then):
 /// `sudo clear` and `uninstall --purge` still take out what is left there,
@@ -3003,6 +3125,20 @@ async fn what_an_earlier_setting_left_in_the_keyring_is_removed_too() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(names().is_empty(), "{:?}", names());
+
+    // Both set to the keyring, which holds nothing: there is nothing to
+    // remove from it.
+    env.ok(&["config", "set", secret_storage, "keyring"]).await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    let out = env
+        .cmd(&["uninstall", "--purge", "--print"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("from the keyring"), "{text}");
 }
 
 /// A test without the fake keyring reaches no keyring at all: the harness

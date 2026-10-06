@@ -27,10 +27,30 @@ pub trait Runner {
 /// Runs real programs.
 pub struct System;
 
+/// Without a console of its own (`gui` and a detached `run` let go of it), a
+/// console program the client starts (`schtasks`, the program's own
+/// `--version`) gets none either: Windows would open a window for each one
+/// over the dialogs. With a console it shares that one, its errors shown there.
+#[cfg(windows)]
+pub fn no_console_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // SAFETY: GetConsoleWindow has no preconditions.
+    if unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null() {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+#[cfg(not(windows))]
+pub fn no_console_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
 impl System {
     fn run_with(&self, argv: &[String], stderr: std::process::Stdio) -> Result<String, String> {
         let (prog, args) = argv.split_first().ok_or("empty command")?;
-        let out = std::process::Command::new(prog)
+        let out = no_console_window(&mut std::process::Command::new(prog))
             .args(args)
             .stdin(std::process::Stdio::null())
             .stderr(stderr)

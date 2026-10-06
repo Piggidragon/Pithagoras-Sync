@@ -39,9 +39,33 @@ KillMode=control-group
 UMask=0077
 ";
 
+/// Where `install` puts the program on Windows, below `%LOCALAPPDATA%`.
+pub const WINDOWS_PROGRAM: &str = r"Programs\pithagoras-sync\pithagoras-sync.exe";
+/// Where `install` puts the user unit on Linux, below the home directory.
+const USER_UNIT_FOLDER: &str = ".config/systemd/user";
+
 /// The program `install` puts in `home` (`USER_PROGRAM`).
 pub fn user_program(home: &Path) -> PathBuf {
     home.join(USER_PROGRAM)
+}
+
+/// The folder of the user unit in `home`.
+pub fn user_unit_folder(home: &Path) -> PathBuf {
+    home.join(USER_UNIT_FOLDER)
+}
+
+/// The user unit `install` writes in `home`.
+pub fn user_unit_file(home: &Path) -> PathBuf {
+    user_unit_folder(home).join(UNIT_NAME)
+}
+
+/// The program `install` puts in `local_app_data` (`%LOCALAPPDATA%`), built with
+/// `\` whichever platform computes it (tests run on Linux).
+pub fn windows_program(local_app_data: &str) -> String {
+    format!(
+        r"{}\{WINDOWS_PROGRAM}",
+        local_app_data.trim_end_matches('\\')
+    )
 }
 
 /// The user unit. The program lives in `~/.local/bin` (`USER_PROGRAM`).
@@ -111,7 +135,7 @@ pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Actio
             mode: 0o755,
         },
         Action::Write {
-            path: home.join(".config/systemd/user").join(UNIT_NAME),
+            path: user_unit_file(home),
             content: user_unit().into_bytes(),
             mode: 0o644,
         },
@@ -258,7 +282,7 @@ pub fn user_uninstall_plan(home: &Path) -> Vec<Action> {
             hint: "the unit was not enabled".into(),
         },
         Action::Remove {
-            path: home.join(".config/systemd/user").join(UNIT_NAME),
+            path: user_unit_file(home),
         },
         Action::Run {
             argv: argv(&["systemctl", "--user", "daemon-reload"]),
@@ -468,7 +492,7 @@ pub fn current_user_sid() -> Result<String, String> {
 /// same whichever platform computes it (tests run it on Linux).
 pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Action> {
     let base = local_app_data.trim_end_matches('\\');
-    let target = format!(r"{base}\Programs\pithagoras-sync\pithagoras-sync.exe");
+    let target = windows_program(base);
     let xml_path = format!(r"{base}\pithagoras-sync\logon-task.xml");
     let mut plan = vec![
         // A running client holds its program open, and the copy over it would fail:

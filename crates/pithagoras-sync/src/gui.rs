@@ -128,8 +128,9 @@ pub trait Host {
     /// What `status` reports.
     async fn status(&self) -> StatusView;
     fn open_log(&self) -> Result<(), String>;
-    /// `uninstall`, or `uninstall --purge`; returns the program, which stays.
-    async fn uninstall(&self, purge: bool) -> Result<String, String>;
+    /// `uninstall`, or `uninstall --purge`; returns the program, which stays,
+    /// and the notes of its steps.
+    async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String>;
     /// Whether sudo access can be set up here (Linux, not as root).
     fn sudo_available(&self) -> bool;
     /// As `sudo status` finds it.
@@ -514,8 +515,13 @@ async fn uninstall(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         return Outcome::Failed;
     }
     match h.uninstall(purge).await {
-        Ok(program) => {
-            d.info(&t.uninstalled(purge, &shown(&program)));
+        Ok((program, notes)) => {
+            let mut text = t.uninstalled(purge, &shown(&program));
+            if !notes.is_empty() {
+                let notes: Vec<String> = notes.iter().map(|n| shown(n)).collect();
+                text = format!("{text}\n\n{}", t.notes(&notes));
+            }
+            d.info(&text);
             Outcome::Done
         }
         Err(e) => {
@@ -542,11 +548,7 @@ fn linux_install(
     system_unit: &std::path::Path,
     me: &str,
 ) -> LinuxInstall {
-    if home.is_some_and(|h| {
-        h.join(".config/systemd/user")
-            .join(crate::install::UNIT_NAME)
-            .is_file()
-    }) {
+    if home.is_some_and(|h| crate::install::user_unit_file(h).is_file()) {
         return LinuxInstall::User;
     }
     let runs_as_me = std::fs::read_to_string(system_unit)
@@ -610,12 +612,9 @@ impl Host for RealHost {
     fn install_target(&self) -> (String, Option<String>) {
         let user = sync_ops::info::user().0;
         let path = if cfg!(windows) {
-            std::env::var("LOCALAPPDATA").ok().map(|l| {
-                format!(
-                    r"{}\Programs\pithagoras-sync\pithagoras-sync.exe",
-                    l.trim_end_matches('\\')
-                )
-            })
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|l| crate::install::windows_program(&l))
         } else {
             Some(
                 sync_ops::info::home()
@@ -783,7 +782,7 @@ impl Host for RealHost {
             .map_err(|e| format!("{prog}: {e}"))
     }
 
-    async fn uninstall(&self, purge: bool) -> Result<String, String> {
+    async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String> {
         if cfg!(target_os = "linux")
             && linux_install(
                 sync_ops::info::home().as_deref(),
@@ -799,13 +798,15 @@ impl Host for RealHost {
         let program = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        if purge {
-            crate::cli::purge(&self.dirs, false, false, true).await?;
+        let notes = if purge {
+            let mut hints = Vec::new();
+            crate::cli::purge(&self.dirs, false, false, true, &mut hints).await?;
+            hints
         } else {
             let plan = crate::cli::uninstall_plan(false)?;
-            crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)?;
-        }
-        Ok(program)
+            crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)?
+        };
+        Ok((program, notes))
     }
 
     fn sudo_available(&self) -> bool {
@@ -931,6 +932,7 @@ mod tests {
         desktop: bool,
         install_notes: Vec<String>,
         pair_notes: Vec<String>,
+        uninstall_notes: Vec<String>,
         did: Mutex<Vec<String>>,
     }
 
@@ -957,6 +959,7 @@ mod tests {
                 desktop: false,
                 install_notes: Vec::new(),
                 pair_notes: Vec::new(),
+                uninstall_notes: Vec::new(),
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -1053,13 +1056,16 @@ mod tests {
         fn open_log(&self) -> Result<(), String> {
             self.step("log")
         }
-        async fn uninstall(&self, purge: bool) -> Result<String, String> {
+        async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String> {
             self.step(if purge { "purge" } else { "uninstall" })?;
             *self.installed.lock().unwrap() = false;
             if purge {
                 *self.paired.lock().unwrap() = None;
             }
-            Ok("/home/alice/.local/bin/pithagoras-sync".into())
+            Ok((
+                "/home/alice/.local/bin/pithagoras-sync".into(),
+                self.uninstall_notes.clone(),
+            ))
         }
         fn sudo_available(&self) -> bool {
             self.sudo
@@ -1501,10 +1507,20 @@ mod tests {
             "{seen:?}"
         );
         assert!(last.contains("The program itself stays: /home/alice/.local/bin/pithagoras-sync"));
-        // Yes to "also remove the pairing" purges.
-        let h = paired();
-        run(&h, &["pick:uninstall", "yes", "yes"], None).await;
+        assert!(!last.contains("Note:"), "{seen:?}");
+        // Yes to "also remove the pairing" purges; the notes of its steps are
+        // shown, as the CLI prints them.
+        let h = FakeHost {
+            uninstall_notes: vec!["the menu may show Pithagoras Sync until the next login".into()],
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:uninstall", "yes", "yes"], None).await;
         assert_eq!(h.did(), ["purge"]);
+        let last = seen.last().unwrap();
+        assert!(
+            last.contains("\n\nNote: the menu may show Pithagoras Sync until the next login"),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -1873,9 +1889,7 @@ mod tests {
             LinuxInstall::System
         );
         assert_eq!(linux_install(None, &unit, "me"), LinuxInstall::System);
-        let user_unit = home
-            .join(".config/systemd/user")
-            .join(crate::install::UNIT_NAME);
+        let user_unit = crate::install::user_unit_file(&home);
         std::fs::create_dir_all(user_unit.parent().unwrap()).unwrap();
         std::fs::write(&user_unit, crate::install::user_unit()).unwrap();
         assert_eq!(linux_install(Some(&home), &unit, "me"), LinuxInstall::User);

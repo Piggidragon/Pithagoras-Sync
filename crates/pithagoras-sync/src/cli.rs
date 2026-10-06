@@ -644,12 +644,7 @@ fn start_hint() -> String {
     let system = linux
         .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
         .flatten();
-    let user_unit = linux
-        && info::home().is_some_and(|h| {
-            h.join(".config/systemd/user")
-                .join(install::UNIT_NAME)
-                .is_file()
-        });
+    let user_unit = linux && info::home().is_some_and(|h| install::user_unit_file(&h).is_file());
     install::start_hint(system.as_deref(), &info::user().0, user_unit)
 }
 
@@ -1141,6 +1136,9 @@ async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
         }
     };
     let host = crate::gui::RealHost { dirs: dirs.clone() };
+    // Awaited here, on the thread in `block_on`, never spawned: its dialogs and
+    // programs block for minutes, and this way hold none of the runtime's
+    // workers.
     Ok(
         match crate::gui::flow(d.as_ref(), &host, lang, link.as_deref()).await {
             crate::gui::Outcome::Done => ExitCode::SUCCESS,
@@ -1405,7 +1403,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 // the setting, then away from the old place.
                 let from = token_store(&dirs, &cfg);
                 let to = token_store(&dirs, &next);
-                for n in from.switch(&to, || next.save(&dirs.config_file())).await? {
+                let paired = cfg.portal.is_some();
+                for n in from
+                    .switch(&to, paired, || next.save(&dirs.config_file()))
+                    .await?
+                {
                     eprintln!("note: {n}");
                 }
             } else {
@@ -1639,7 +1641,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             purge: true,
             yes,
             print,
-        } => return purge(&dirs, system, print, yes).await,
+        } => {
+            let mut hints = Vec::new();
+            let r = purge(&dirs, system, print, yes, &mut hints).await;
+            for h in hints {
+                eprintln!("note: {h}");
+            }
+            return r;
+        }
         Cmd::Uninstall { system, print, .. } => {
             let plan = uninstall_plan(system)?;
             println!("Uninstall:");
@@ -1845,12 +1854,14 @@ fn delete_hint(path: &Path) -> String {
 
 /// `uninstall --purge`: stops the client, undoes `install`, and removes what the
 /// client wrote for this user. The program stays: it may be the owner's only
-/// copy, and on Windows the running one cannot be deleted anyway.
+/// copy, and on Windows the running one cannot be deleted anyway. The hints of
+/// the steps it ran go to `hints`, also when it fails.
 pub(crate) async fn purge(
     dirs: &Dirs,
     system: bool,
     print: bool,
     yes: bool,
+    hints: &mut Vec<String>,
 ) -> Result<ExitCode, String> {
     let linux = cfg!(target_os = "linux");
     if cfg!(windows) && system {
@@ -1909,7 +1920,7 @@ pub(crate) async fn purge(
     let unit_folder = if system {
         Some(Path::new("/etc/systemd/system").to_path_buf())
     } else {
-        home.as_ref().map(|h| h.join(".config/systemd/user"))
+        home.as_ref().map(|h| install::user_unit_folder(h))
     };
     let installed = if cfg!(windows) {
         runner
@@ -1969,19 +1980,22 @@ pub(crate) async fn purge(
         .and_then(|r| r.status);
     let config = DeviceConfig::load(&dirs.config_file()).ok();
     let portal = config.as_ref().and_then(|c| c.portal.clone());
-    // What the keyring keeps for the client: where the config puts it there,
-    // and an entry left from an earlier setting (found without a prompt).
+    // What the keyring keeps for the client, asked without a prompt: an entry
+    // where the config puts it, or one an earlier setting left. A keyring that
+    // cannot answer is taken to hold what the config puts there; removing it
+    // then fails with the reason.
     let keyring = sync_policy::keyring::system();
-    let left_in_keyring = |name: &'static str| {
+    let in_keyring = |name: &'static str, setting: bool| {
         let keyring = keyring.clone();
-        async move { keyring.has(name).await == Ok(true) }
+        async move { keyring.has(name).await.unwrap_or(setting) }
     };
     let tokens = config.as_ref().map(|c| token_store(dirs, c));
     let token_setting = tokens.as_ref().is_some_and(|t| t.uses_keyring());
-    let keyring_token = token_setting || left_in_keyring(sync_connector::token::KEYRING_NAME).await;
-    let keyring_password = config.as_ref().is_some_and(|c| {
+    let keyring_token = in_keyring(sync_connector::token::KEYRING_NAME, token_setting).await;
+    let password_setting = config.as_ref().is_some_and(|c| {
         c.policy.privilege.secret_storage == sync_policy::config::SecretStorage::Keyring
-    }) || (linux && left_in_keyring(crate::secrets::ELEVATION).await);
+    });
+    let keyring_password = linux && in_keyring(crate::secrets::ELEVATION, password_setting).await;
 
     let mut notes = Vec::new();
     if let Some(p) = &portal {
@@ -2079,7 +2093,11 @@ pub(crate) async fn purge(
         println!("Nothing changed.");
         return Ok(ExitCode::from(1));
     }
-    apply_plan(&stop)?;
+    let mut apply = |plan: &[Action]| -> Result<(), String> {
+        hints.extend(actions::apply(plan, Path::new("/"), &actions::System)?);
+        Ok(())
+    };
+    apply(&stop)?;
     // From here on an error comes after the unit or task was stopped, and may
     // come after part of it was removed: it says so, and that running this again
     // goes on. Once the unit or task is deleted it says that instead.
@@ -2092,10 +2110,10 @@ pub(crate) async fn purge(
     // What was made while the question waited and the client shut down is the
     // client's too.
     let found = crate::purge::find(dirs).map_err(after_stop)?;
-    apply_plan(&uninstall).map_err(after_stop)?;
+    apply(&uninstall).map_err(after_stop)?;
     deleted.set(true);
     // The keyring first: the config that says what is there goes with the files.
-    if let Some(t) = tokens.as_ref().filter(|_| token_setting) {
+    if let Some(t) = tokens.as_ref().filter(|_| token_setting && keyring_token) {
         t.delete().await.map_err(after_stop)?;
     } else if keyring_token {
         keyring

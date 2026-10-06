@@ -49,11 +49,34 @@ pub enum Request {
 
 /// How long the CLI waits for the client's answer.
 pub const REPLY_WAIT: Duration = Duration::from_secs(30);
-/// How long it waits on a request that may read or write the keyring: its
-/// unlock prompt waits up to two minutes for the owner, and the calls around it
-/// up to ten seconds each. Shorter, the CLI would report a failure while the
-/// client goes on to store or clear the password.
-pub const KEYRING_REPLY_WAIT: Duration = Duration::from_secs(30 + 120 + 60);
+/// How long the client works on one request that reads or writes the keyring,
+/// waiting for a `sudo set` before it included: two prompts (an unlock and a
+/// confirmation, up to two minutes each for the owner) and the calls around
+/// them. Then it gives up, dismisses a prompt still open and answers with an
+/// error; prompts left open longer, or one request waiting on another, end
+/// that way.
+pub const KEYRING_WORK: Duration = Duration::from_secs(300);
+/// How long the CLI waits on such a request: longer than the client works on
+/// it, so the CLI never reports a failure while the client goes on to store or
+/// clear the password.
+pub const KEYRING_REPLY_WAIT: Duration = Duration::from_secs(300 + 30);
+
+/// Set (debug builds only) to a shorter time in milliseconds for
+/// `KEYRING_WORK`: the tests' wait for it to run out. A release build ignores
+/// it, and it never makes the time longer.
+pub const TEST_KEYRING_WORK_MS: &str = "PITHAGORAS_SYNC_TEST_KEYRING_WORK_MS";
+
+/// `KEYRING_WORK`, or the tests' shorter time.
+pub fn keyring_work() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TEST_KEYRING_WORK_MS)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms).min(KEYRING_WORK);
+    }
+    KEYRING_WORK
+}
 
 impl Request {
     /// Whether a command the client itself runs (a descendant) may send this.
@@ -304,9 +327,11 @@ mod tests {
         let clear = Request::SecretClear {
             name: "elevation".into(),
         };
-        // A prompt, plus the calls before and after it.
+        // Two prompts (an unlock, then a confirmation), plus the calls around
+        // them; and the CLI waits longer than the client works.
+        assert!(KEYRING_WORK >= PROMPT * 2 + CALL * 6);
         for r in [secret, clear, Request::Unlock] {
-            assert!(r.reply_wait() >= PROMPT + CALL * 6, "{r:?}");
+            assert!(r.reply_wait() >= KEYRING_WORK + REPLY_WAIT, "{r:?}");
         }
         assert_eq!(Request::Status.reply_wait(), REPLY_WAIT);
     }
