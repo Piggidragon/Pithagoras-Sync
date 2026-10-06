@@ -81,10 +81,13 @@ pub fn peer_owner(local: SocketAddr, peer: SocketAddr, me: u32) -> Option<u32> {
 /// connection's own entry.
 ///
 /// A socket has the family of its listener, not of the client's: a listener on
-/// `[::]` (dual-stack) takes an IPv4 connection on an IPv6 socket, listed in
-/// `tcp6` under v4-mapped addresses, and a client that names
-/// `[::ffff:127.0.0.1]` reaches an IPv4 listener, listed in `tcp`. So an IPv4
-/// connection, in either form, is looked up in both tables.
+/// `[::]` (dual-stack) or `[::ffff:0.0.0.0]` takes an IPv4 connection on an
+/// IPv6 socket, listed in `tcp6` under v4-mapped addresses, and a client that
+/// names `[::ffff:127.0.0.1]` reaches an IPv4 listener, listed in `tcp`. So an
+/// IPv4 connection, in either form, is looked up in both tables. The table its
+/// entry is in says the family of the listener that took it, so only the
+/// listeners in that table count (another user's IPv6-only `[::]` cannot have
+/// taken a connection listed in `tcp`); an entry in both is a doubt, refused.
 #[cfg(target_os = "linux")]
 fn owner_in_tables(
     tcp: &str,
@@ -106,8 +109,17 @@ fn owner_in_tables(
     if v4(peer).is_ipv4() {
         let any4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         tables.push((tcp, v4(peer), v4(local), vec![v4(peer), any4]));
+        // An IPv6 socket on the mapped wildcard takes IPv4 connections to every
+        // local address, beside an IPv6-only one on `[::]`.
+        tables.push((
+            tcp6,
+            mapped(peer),
+            mapped(local),
+            vec![mapped(peer), mapped(any4), any6],
+        ));
+    } else {
+        tables.push((tcp6, peer, local, vec![peer, any6]));
     }
-    tables.push((tcp6, mapped(peer), mapped(local), vec![mapped(peer), any6]));
     let rows = |table: &'_ str| -> Vec<(String, String, String, u32)> {
         table
             .lines()
@@ -125,26 +137,36 @@ fn owner_in_tables(
             .collect()
     };
     let same = |a: &str, b: SocketAddr| a.eq_ignore_ascii_case(&proc_addr(b));
-    let mut connection = None;
-    let mut listeners = Vec::new();
-    for (table, server, client, listen_at) in tables {
-        for (l, r, state, uid) in rows(table) {
-            if connection.is_none() && same(&l, server) && same(&r, client) {
-                connection = Some(uid);
+    // Per table: the uids of the connection's entries and of the listeners.
+    let found: Vec<(Vec<u32>, Vec<u32>)> = tables
+        .into_iter()
+        .map(|(table, server, client, listen_at)| {
+            let (mut entries, mut listeners) = (Vec::new(), Vec::new());
+            for (l, r, state, uid) in rows(table) {
+                if same(&l, server) && same(&r, client) {
+                    entries.push(uid);
+                }
+                // State 0A is LISTEN.
+                if state == "0A" && listen_at.iter().any(|&a| same(&l, a)) {
+                    listeners.push(uid);
+                }
             }
-            // State 0A is LISTEN.
-            if state == "0A" && listen_at.iter().any(|&a| same(&l, a)) {
-                listeners.push(uid);
-            }
-        }
-    }
-    let connection = connection?;
+            (entries, listeners)
+        })
+        .filter(|(entries, _)| !entries.is_empty())
+        .collect();
+    let [(entries, listeners)] = found.as_slice() else {
+        return None;
+    };
     if listeners.is_empty() {
         return None;
     }
+    let connection = entries[0];
     Some(
-        std::iter::once(connection)
+        entries
+            .iter()
             .chain(listeners)
+            .copied()
             .find(|&u| u != me && u != 0)
             .unwrap_or(connection),
     )
@@ -354,14 +376,24 @@ mod tests {
         const OTHER: u32 = 1001;
         let (client, server) = ("127.0.0.1:50000", "127.0.0.1:8080");
         let conn = |uid| row(server, client, "01", uid);
+        // The same connection taken by an IPv6 listener, listed in tcp6.
+        let conn_m = |uid| {
+            row(
+                "[::ffff:127.0.0.1]:8080",
+                "[::ffff:127.0.0.1]:50000",
+                "01",
+                uid,
+            )
+        };
         let mine = row(client, server, "01", ME);
         let listen = |at: &str, uid| row(at, "0.0.0.0:0", "0A", uid);
         let listen6 = |at: &str, uid| row(at, "[::]:0", "0A", uid);
         let owner = |tcp: &[String], tcp6: &[String]| {
             owner_in_tables(&table(tcp), &table(tcp6), a(client), a(server), ME)
         };
-        // Another user's listener, on the address, on 0.0.0.0, or dual-stack on
-        // [::] or the v4-mapped address.
+        // Another user's listener, on the address or on 0.0.0.0, or for an IPv6
+        // socket dual-stack on [::], on the v4-mapped address or on the mapped
+        // wildcard (beside this user's IPv6-only [::]).
         assert_eq!(
             owner(&[mine.clone(), conn(0), listen(server, OTHER)], &[]),
             Some(OTHER)
@@ -371,12 +403,44 @@ mod tests {
             Some(OTHER)
         );
         assert_eq!(
-            owner(&[conn(0)], &[listen6("[::]:8080", OTHER)]),
+            owner(
+                std::slice::from_ref(&mine),
+                &[conn_m(0), listen6("[::]:8080", OTHER)]
+            ),
             Some(OTHER)
         );
         assert_eq!(
-            owner(&[conn(0)], &[listen6("[::ffff:127.0.0.1]:8080", OTHER)]),
+            owner(&[], &[conn_m(0), listen6("[::ffff:127.0.0.1]:8080", OTHER)]),
             Some(OTHER)
+        );
+        assert_eq!(
+            owner(
+                std::slice::from_ref(&mine),
+                &[
+                    conn_m(0),
+                    listen6("[::]:8080", ME),
+                    listen6("[::ffff:0.0.0.0]:8080", OTHER)
+                ]
+            ),
+            Some(OTHER)
+        );
+        // The family of the connection's entry is its listener's: another user's
+        // IPv6 listener cannot have taken a connection listed in tcp.
+        assert_eq!(
+            owner(
+                &[conn(0), listen(server, ME)],
+                &[listen6("[::]:8080", OTHER)]
+            ),
+            Some(0)
+        );
+        assert_eq!(owner(&[conn(0)], &[listen6("[::]:8080", ME)]), None);
+        // An entry in both tables is a doubt.
+        assert_eq!(
+            owner(
+                &[conn(0), listen(server, ME)],
+                &[conn_m(0), listen6("[::]:8080", ME)]
+            ),
+            None
         );
         // SO_REUSEPORT: every listener on the port counts.
         assert_eq!(
