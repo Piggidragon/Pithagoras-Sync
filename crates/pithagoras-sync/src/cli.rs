@@ -973,6 +973,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let runs_exe = |p: &Path| p.is_absolute() && crate::update::same_program(p, &exe);
             let client = running.filter(|(p, _)| runs_exe(p));
             let unit_runs_exe = system.as_deref().is_some_and(runs_exe);
+            // Checked before root runs the program to learn its version.
+            #[cfg(unix)]
+            if unit_runs_exe {
+                crate::update::only_root_changes(&exe).map_err(|why| {
+                    format!(
+                        "the system unit starts {}, but {why}: root neither runs nor replaces a program another user can change. Put the program where only root can change it ({}, where `setup` and `install --system` put it) and point the unit at it",
+                        exe.display(),
+                        crate::install::SYSTEM_BIN
+                    )
+                })?;
+            }
             // Whether a release is newer is decided by the program it replaces,
             // as it is on disk.
             let mine = env!("CARGO_PKG_VERSION");

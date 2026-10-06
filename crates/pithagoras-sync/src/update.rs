@@ -316,6 +316,44 @@ pub fn unit_program(unit: &str) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// Whether only root can change `exe`: the file and every folder above it
+/// belong to root and are not writable by group or others. Root runs and
+/// replaces the system unit's program only then: one another user can change
+/// would let that user, and the agent's commands running as it, run code as root.
+#[cfg(unix)]
+pub fn only_root_changes(exe: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    only_owner_changes(exe, 0, |p| {
+        std::fs::symlink_metadata(p).map(|m| (m.uid(), m.mode(), m.file_type().is_symlink()))
+    })
+}
+
+/// `only_root_changes` for an `owner` and a way to `lstat` a path (uid, mode,
+/// whether it is a symbolic link). The path is resolved first, then every part
+/// of it is checked as it is, so no link can lead elsewhere.
+#[cfg(unix)]
+fn only_owner_changes(
+    exe: &Path,
+    owner: u32,
+    lstat: impl Fn(&Path) -> std::io::Result<(u32, u32, bool)>,
+) -> Result<(), String> {
+    let real = std::fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    for p in real.ancestors() {
+        let (uid, mode, link) = lstat(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let why = if link {
+            "is a symbolic link".to_string()
+        } else if uid != owner {
+            format!("belongs to uid {uid}")
+        } else if mode & 0o022 != 0 {
+            "is writable by its group or by others".to_string()
+        } else {
+            continue;
+        };
+        return Err(format!("{} {why}", p.display()));
+    }
+    Ok(())
+}
+
 /// After `update` as root, for the system unit that starts `exe`: restarts it
 /// when it runs and `stale` says its process runs an older file than `exe` is
 /// now. A system unit's client cannot be asked to restart itself (its control
@@ -572,6 +610,47 @@ mod tests {
         let tmp = path.with_extension("new");
         write_new(&tmp, format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
         std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_takes_only_a_program_no_one_else_can_change() {
+        let t = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(t.path()).unwrap();
+        let exe = base.join("bin").join("pithagoras-sync");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "x").unwrap();
+        std::os::unix::fs::symlink(&exe, base.join("link")).unwrap();
+        // Owners and modes as given here, for every path.
+        let check = |at: &Path, uid: u32, mode: u32| {
+            only_owner_changes(&base.join("link"), 0, |p| {
+                Ok(if p == at {
+                    (uid, mode, false)
+                } else {
+                    (0, 0o755, false)
+                })
+            })
+        };
+        assert_eq!(check(Path::new("/nowhere"), 0, 0o755), Ok(()));
+        // The link is followed, and the file it leads to is what counts.
+        let e = check(&exe, 1000, 0o755).unwrap_err();
+        assert!(e.contains("pithagoras-sync belongs to uid 1000"), "{e}");
+        let e = check(exe.parent().unwrap(), 0, 0o775).unwrap_err();
+        assert!(
+            e.ends_with("bin is writable by its group or by others"),
+            "{e}"
+        );
+        let e = check(&base, 0, 0o1777).unwrap_err();
+        assert!(e.contains("writable by its group or by others"), "{e}");
+        assert!(check(Path::new("/"), 0, 0o757).is_err());
+        // A part that is a link when checked (swapped in meanwhile).
+        let e = only_owner_changes(&exe, 0, |p| Ok((0, 0o755, p == exe.parent().unwrap())))
+            .unwrap_err();
+        assert!(e.contains("is a symbolic link"), "{e}");
+        // For real: a file of this test's user, below /var/tmp or /tmp.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(only_root_changes(&exe).is_err());
+        }
     }
 
     #[test]
