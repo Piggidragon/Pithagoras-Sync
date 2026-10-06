@@ -89,7 +89,7 @@ pithagoras-sync deny 12
 
 The first answer wins. "Of its kind" means reads or writes from the same chat, and is offered only for Ask mode's own question about a read or a write; commands ask every time in Ask mode (a standing approval of the shell would cover any command), and so do protected paths, patterns, taint and elevated commands.
 
-`approvals` and the desktop notifications show the command, path, chat and preview with every control character as a visible escape (`\u{1b}`, `\n`), so text from the portal cannot move the cursor or redraw what you read; the further lines of a command come indented under its header. A notification whose command or path is too long to show whole offers only Deny: answer it with `approvals` or in the portal.
+`approvals` and the desktop notifications show the command, path, chat and preview with every control character as a visible escape (`\u{1b}`, `\n`), so text from the portal cannot move the cursor or redraw what you read; the further lines of a command come indented under its header, and `approvals` shows a write's whole preview (up to 2000 bytes, then how many bytes the write holds in all). Line and paragraph separators (U+2028, U+2029) are escaped too, and a notification counts a target's length as shown, escapes included. A notification whose command or path is too long to show whole offers only Deny: answer it with `approvals` or in the portal.
 
 | Setting | Values | Default | What it does | CLI | Portal |
 |---|---|---|---|---|---|
