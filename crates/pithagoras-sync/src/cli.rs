@@ -1649,7 +1649,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             print,
         } => {
             let mut hints = Vec::new();
-            let r = purge(&dirs, system, print, yes, &mut hints).await;
+            let r = purge(&dirs, system, print, yes, false, &mut hints).await;
             for h in hints {
                 eprintln!("note: {h}");
             }
@@ -1858,17 +1858,53 @@ fn delete_hint(path: &Path) -> String {
     }
 }
 
+/// What an error of `uninstall --purge` after the stop says, once it put back
+/// what the stop did where the unit or task is still `installed`: switched on
+/// and started again, so a purge that failed does not leave the device
+/// offline. Only when that fails too, how to do it by hand.
+fn after_stop_note(
+    stopped: bool,
+    installed: bool,
+    windows: bool,
+    system: bool,
+    runner: &dyn actions::Runner,
+) -> String {
+    if !stopped || !installed {
+        return stop_note(stopped, !installed, windows, system);
+    }
+    match actions::apply(
+        &install::restart_plan(windows, system),
+        Path::new("/"),
+        runner,
+    ) {
+        Ok(_) if windows => "\nThe logon task was switched on again and starts the client.".into(),
+        Ok(_) => "\nThe unit was started again.".into(),
+        Err(_) => stop_note(true, false, windows, system),
+    }
+}
+
 /// `uninstall --purge`: stops the client, undoes `install`, and removes what the
 /// client wrote for this user. The program stays: it may be the owner's only
 /// copy, and on Windows the running one cannot be deleted anyway. The hints of
-/// the steps it ran go to `hints`, also when it fails.
+/// the steps it ran go to `hints`, also when it fails. In the `window` nothing
+/// is printed: what it would print for the owner goes to `hints`, but the plan,
+/// the pairing and the program, which the window says in its own words.
 pub(crate) async fn purge(
     dirs: &Dirs,
     system: bool,
     print: bool,
     yes: bool,
+    window: bool,
     hints: &mut Vec<String>,
 ) -> Result<ExitCode, String> {
+    // A window has no terminal to print to.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            if !window {
+                println!($($arg)*);
+            }
+        };
+    }
     let linux = cfg!(target_os = "linux");
     if cfg!(windows) && system {
         return Err(
@@ -1928,13 +1964,16 @@ pub(crate) async fn purge(
     } else {
         home.as_ref().map(|h| install::user_unit_folder(h))
     };
-    let installed = if cfg!(windows) {
-        install::task_installed(&runner)
-    } else {
-        unit_folder
-            .as_ref()
-            .is_some_and(|d| d.join(install::UNIT_NAME).exists())
+    let is_installed = || {
+        if cfg!(windows) {
+            install::task_installed(&runner)
+        } else {
+            unit_folder
+                .as_ref()
+                .is_some_and(|d| d.join(install::UNIT_NAME).exists())
+        }
     };
+    let installed = is_installed();
     let (stop, uninstall) = if !installed {
         // A link handler left without the unit or task (removed by hand).
         let mut links = Vec::new();
@@ -1997,14 +2036,20 @@ pub(crate) async fn purge(
             .unwrap_or(password_setting);
 
     let mut notes = Vec::new();
+    // The window says these two in its own words: the pairing ends, the
+    // program stays.
+    let mut own_words = 0;
     if let Some(p) = &portal {
+        own_words += 1;
         notes.push(format!(
             "The pairing with {} (device {}) ends here: remove the device in the portal as well (Settings, Devices).",
             sync_policy::approve::visible(&p.url),
             sync_policy::approve::visible(&p.device_id)
         ));
     }
-    if let Some(d) = unit_folder.map(|d| d.join(format!("{}.d", install::UNIT_NAME)))
+    if let Some(d) = unit_folder
+        .as_ref()
+        .map(|d| d.join(format!("{}.d", install::UNIT_NAME)))
         && d.exists()
     {
         notes.push(format!(
@@ -2028,12 +2073,16 @@ pub(crate) async fn purge(
             "The user {u} and the files of its client stay: `sudo pithagoras-sync setup --remove --name {u}` removes them."
         ));
     }
+    let extra = own_words..notes.len();
     for p in &programs {
         notes.push(format!(
             "The program itself stays: {}. Delete it with `{}` when you no longer need it.",
             p.display(),
             delete_hint(p)
         ));
+    }
+    if window {
+        hints.extend(notes[extra].iter().cloned());
     }
 
     if running.is_none()
@@ -2044,20 +2093,22 @@ pub(crate) async fn purge(
         && !keyring_token
         && !keyring_password
     {
-        println!("Nothing to remove.");
+        say!("Nothing to remove.");
         for n in &notes {
-            println!("{n}");
+            say!("{n}");
         }
         return Ok(ExitCode::SUCCESS);
     }
-    println!("This removes:");
+    say!("This removes:");
     if let Some(s) = &running {
-        println!("  - stop the running client (pid {})", s.pid);
+        say!("  - stop the running client (pid {})", s.pid);
     }
-    show_plan(&stop);
-    show_plan(&uninstall);
+    if !window {
+        show_plan(&stop);
+        show_plan(&uninstall);
+    }
     for e in &found.entries {
-        println!(
+        say!(
             "  - remove {}{}",
             e.display(),
             if std::fs::symlink_metadata(e).is_ok_and(|m| m.is_dir()) {
@@ -2068,28 +2119,28 @@ pub(crate) async fn purge(
         );
     }
     for p in &olds {
-        println!("  - remove {}", p.display());
+        say!("  - remove {}", p.display());
     }
     if keyring_token {
-        println!("  - remove the connector token from the keyring");
+        say!("  - remove the connector token from the keyring");
     }
     if keyring_password {
-        println!("  - remove the elevation password from the keyring");
+        say!("  - remove the elevation password from the keyring");
     }
     for f in &found.folders {
-        println!(
+        say!(
             "  - remove the folder {} once nothing else is in it",
             f.display()
         );
     }
     for n in &notes {
-        println!("{n}");
+        say!("{n}");
     }
     if print {
         return Ok(ExitCode::SUCCESS);
     }
     if !yes && !ask("Go ahead?") {
-        println!("Nothing changed.");
+        say!("Nothing changed.");
         return Ok(ExitCode::from(1));
     }
     let mut apply = |plan: &[Action]| -> Result<(), String> {
@@ -2102,7 +2153,13 @@ pub(crate) async fn purge(
     // goes on. Once the unit or task is deleted it says that instead.
     let deleted = std::cell::Cell::new(false);
     let after_stop = |e: String| {
-        let note = stop_note(!stop.is_empty(), deleted.get(), cfg!(windows), system);
+        let note = after_stop_note(
+            !stop.is_empty(),
+            !deleted.get() && is_installed(),
+            cfg!(windows),
+            system,
+            &runner,
+        );
         format!("{e}{note}\nRun this again to go on with what is left.")
     };
     stop_client(dirs).await.map_err(after_stop)?;
@@ -2133,9 +2190,14 @@ pub(crate) async fn purge(
         }
     }
     for f in crate::purge::remove(&found).map_err(after_stop)? {
-        println!("Kept {}: something in it is not the client's.", f.display());
+        let kept = format!("Kept {}: something in it is not the client's.", f.display());
+        if window {
+            hints.push(kept);
+        } else {
+            println!("{kept}");
+        }
     }
-    println!("Removed.");
+    say!("Removed.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2371,6 +2433,58 @@ mod tests {
             assert!(help.contains(word), "{word}: {help}");
         }
         assert!(cmd.find_subcommand("secret").is_none());
+    }
+
+    /// A purge that fails after the stop while the unit or task is still there
+    /// switches it on and starts it again; only when that fails too it says how.
+    #[test]
+    fn a_failed_purge_starts_the_client_again() {
+        use super::after_stop_note;
+        use crate::actions::{Fake, argv};
+        let task = |a: &str| argv(&["schtasks", a, "/TN", "Pithagoras Sync"]);
+        let fake = Fake::default();
+        let n = after_stop_note(true, true, true, false, &fake);
+        assert!(n.contains("switched on again"), "{n}");
+        let mut enable = task("/Change");
+        enable.push("/ENABLE".into());
+        assert_eq!(*fake.ran.lock().unwrap(), [enable, task("/Run")]);
+        let fake = Fake {
+            answers: vec![("schtasks /Change".into(), Err("refused".into()))],
+            ..Fake::default()
+        };
+        let n = after_stop_note(true, true, true, false, &fake);
+        assert!(
+            n.contains("/TN \"Pithagoras Sync\" /ENABLE` turns it on"),
+            "{n}"
+        );
+        for (system, start) in [
+            (
+                false,
+                argv(&[
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    "pithagoras-sync.service",
+                ]),
+            ),
+            (
+                true,
+                argv(&["systemctl", "enable", "--now", "pithagoras-sync.service"]),
+            ),
+        ] {
+            let fake = Fake::default();
+            let n = after_stop_note(true, true, false, system, &fake);
+            assert_eq!(n, "\nThe unit was started again.");
+            assert_eq!(*fake.ran.lock().unwrap(), [start]);
+        }
+        // Not stopped, or deleted already: nothing to start.
+        for (stopped, installed) in [(false, true), (true, false)] {
+            let fake = Fake::default();
+            let n = after_stop_note(stopped, installed, true, false, &fake);
+            assert_eq!(n, stop_note(stopped, !installed, true, false));
+            assert!(fake.ran.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

@@ -353,6 +353,31 @@ pub fn system_stop_plan() -> Vec<Action> {
     }]
 }
 
+/// Puts back what the stop of `uninstall --purge` (and the `disable` of the
+/// uninstall after it) did, when the purge fails while the unit or task is
+/// still there: switched on, and the client started.
+pub fn restart_plan(windows: bool, system: bool) -> Vec<Action> {
+    if windows {
+        return vec![
+            Action::Run {
+                argv: argv(&["schtasks", "/Change", "/TN", TASK_NAME, "/ENABLE"]),
+            },
+            Action::Try {
+                argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
+                hint: "the task starts it within a minute".into(),
+            },
+        ];
+    }
+    let mut systemctl = vec!["systemctl"];
+    if !system {
+        systemctl.push("--user");
+    }
+    systemctl.extend(["enable", "--now", UNIT_NAME]);
+    vec![Action::Run {
+        argv: argv(&systemctl),
+    }]
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

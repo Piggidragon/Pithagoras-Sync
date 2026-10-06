@@ -575,6 +575,89 @@ async fn purge_removes_what_the_client_left_but_the_program() {
     assert!(text.contains("The program itself stays"), "{text}");
 }
 
+/// A purge that fails while the unit is still there starts it again, so the
+/// device is not left offline, and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_that_fails_starts_the_unit_again() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        // Root removes the unit file anyway.
+        return;
+    }
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    env.ok(&["mode", "ask"]).await;
+    let unit = env
+        .home
+        .join(".config/systemd/user/pithagoras-sync.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "installed").unwrap();
+    // The unit file cannot be removed: the uninstall fails after the stop.
+    let folder = unit.parent().unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = env
+        .cmd(&["uninstall", "--purge", "--yes"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("The unit was started again."), "{err}");
+    assert!(err.contains("Run this again"), "{err}");
+    assert!(unit.exists());
+    let calls = std::fs::read_to_string(env.root.join("systemctl.log")).unwrap();
+    let disable = calls.find("systemctl --user disable --now pithagoras-sync.service");
+    let enable = calls.find("systemctl --user enable --now pithagoras-sync.service");
+    assert!(disable.is_some() && disable < enable, "{calls}");
+}
+
+/// Uninstalling in the window prints nothing (there is no terminal): what
+/// the purge would print for the owner comes as a note in the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_windows_purge_shows_its_notes_in_the_window() {
+    let env = Env::new();
+    fake_systemd(&env);
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "winpurge"])
+        .await;
+    looks_installed(&env);
+    // Not the client's: the folder stays, and the window says so.
+    let config = env.home.join(".config/pithagoras-sync");
+    std::fs::write(config.join("mine.txt"), "keep").unwrap();
+    let path = fake_dialogs(&env, &["0|uninstall", "0|", "0|", "0|"]);
+    let out = env
+        .cmd(&["gui"])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 4, "{shown:#?}");
+    let last = &shown[3];
+    assert!(last.contains("Pithagoras Sync is uninstalled"), "{last}");
+    assert!(
+        last.contains(&format!(
+            "Note: Kept {}: something in it is not the client's.",
+            config.display()
+        )),
+        "{last}"
+    );
+    assert!(config.join("mine.txt").exists());
+    assert!(!config.join("config.toml").exists());
+}
+
 /// A client folder that is a link leads to files that are not the client's to
 /// delete: the purge refuses before anything goes.
 #[tokio::test]

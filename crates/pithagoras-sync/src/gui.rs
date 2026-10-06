@@ -792,7 +792,7 @@ impl Host for RealHost {
             .unwrap_or_default();
         let notes = if purge {
             let mut hints = Vec::new();
-            crate::cli::purge(&self.dirs, false, false, true, &mut hints).await?;
+            crate::cli::purge(&self.dirs, false, false, true, true, &mut hints).await?;
             hints
         } else {
             let plan = crate::cli::uninstall_plan(false)?;
