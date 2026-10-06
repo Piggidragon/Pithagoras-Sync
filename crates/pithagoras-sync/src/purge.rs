@@ -125,7 +125,7 @@ pub fn find(dirs: &Dirs) -> Result<Found, String> {
             // SAFETY: geteuid has no preconditions.
             if meta.uid() != unsafe { libc::geteuid() } {
                 return Err(format!(
-                    "{} belongs to another user, not to whoever runs this: nothing was removed. Run it as that user",
+                    "{} belongs to another user than the one running this: nothing was removed. Run it as the user it belongs to, with that user's own home folder",
                     folder.display()
                 ));
             }
@@ -181,9 +181,21 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
 /// them is deleted in the folders `find` listed, not in whatever a link put at
 /// their path since. A path `/proc/self/fd/<n>/<name>` leads into the held folder
 /// itself, whatever is at its old path now.
-// Only Linux holds the folders open; elsewhere they are looked at again.
+// Only Linux holds the folders open; elsewhere they are looked at again right
+// before each deletion.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct Held(Vec<(PathBuf, Option<std::fs::File>)>);
+struct Held(Vec<(PathBuf, Hold)>);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum Hold {
+    /// Open: deleted in through its descriptor.
+    Open(std::fs::File),
+    /// Not there when it was held: nothing in it to delete, and nothing at that
+    /// path is touched, whatever is put there since.
+    Gone,
+    /// Cannot be held here: looked at again right before each deletion.
+    ByPath,
+}
 
 impl Held {
     fn open(found: &Found) -> Result<Held, String> {
@@ -196,10 +208,10 @@ impl Held {
     }
 
     #[cfg(target_os = "linux")]
-    fn hold(found: &Found, folder: &Path) -> Result<Option<std::fs::File>, String> {
+    fn hold(found: &Found, folder: &Path) -> Result<Hold, String> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         if !Path::new("/proc/self/fd").is_dir() {
-            return Self::recheck(found, folder).map(|_| None);
+            return Self::recheck(found, folder).map(|_| Hold::ByPath);
         }
         let file = match std::fs::OpenOptions::new()
             .read(true)
@@ -207,7 +219,7 @@ impl Held {
             .open(folder)
         {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Hold::Gone),
             // O_NOFOLLOW on a link, or a file where the folder was.
             Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
                 return Err(Self::replaced(folder));
@@ -218,13 +230,12 @@ impl Held {
             .metadata()
             .map_err(|e| format!("{}: {e}", folder.display()))?;
         Self::same(found, folder, (m.dev(), m.ino()))?;
-        Ok(Some(file))
+        Ok(Hold::Open(file))
     }
 
-    /// Where no folder can be held, it is looked at again right before.
     #[cfg(not(target_os = "linux"))]
-    fn hold(found: &Found, folder: &Path) -> Result<Option<std::fs::File>, String> {
-        Self::recheck(found, folder).map(|_| None)
+    fn hold(found: &Found, folder: &Path) -> Result<Hold, String> {
+        Self::recheck(found, folder).map(|_| Hold::ByPath)
     }
 
     fn recheck(found: &Found, folder: &Path) -> Result<(), String> {
@@ -261,16 +272,31 @@ impl Held {
         )
     }
 
-    /// Where `entry` is deleted: inside the held folder when there is one.
-    fn path_of(&self, entry: &Path) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        if let (Some(parent), Some(name)) = (entry.parent(), entry.file_name())
-            && let Some((_, Some(file))) = self.0.iter().find(|(f, _)| f == parent)
-        {
-            use std::os::fd::AsRawFd;
-            return PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).join(name);
+    fn state_of(&self, folder: &Path) -> Option<&Hold> {
+        self.0.iter().find(|(f, _)| f == folder).map(|(_, h)| h)
+    }
+
+    /// Where `entry` is deleted: inside the held folder, or by its path after the
+    /// folder was looked at again; `None` when its folder was not there.
+    fn path_of(&self, found: &Found, entry: &Path) -> Result<Option<PathBuf>, String> {
+        let Some(parent) = entry.parent() else {
+            return Ok(Some(entry.to_path_buf()));
+        };
+        match self.state_of(parent) {
+            Some(Hold::Gone) => Ok(None),
+            #[cfg(target_os = "linux")]
+            Some(Hold::Open(file)) => {
+                use std::os::fd::AsRawFd;
+                let name = entry.file_name().unwrap_or_default();
+                Ok(Some(
+                    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).join(name),
+                ))
+            }
+            _ => {
+                Self::recheck(found, parent)?;
+                Ok(Some(entry.to_path_buf()))
+            }
         }
-        entry.to_path_buf()
     }
 }
 
@@ -279,10 +305,15 @@ impl Held {
 pub fn remove(found: &Found) -> Result<Vec<PathBuf>, String> {
     let held = Held::open(found)?;
     for e in &found.entries {
-        remove_entry(&held.path_of(e)).map_err(|err| format!("{}: {err}", e.display()))?;
+        if let Some(path) = held.path_of(found, e)? {
+            remove_entry(&path).map_err(|err| format!("{}: {err}", e.display()))?;
+        }
     }
     let mut kept = Vec::new();
     for f in &found.folders {
+        if matches!(held.state_of(f), Some(Hold::Gone)) {
+            continue;
+        }
         let left = match std::fs::read_dir(f) {
             Ok(mut d) => d.next().is_some(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -476,10 +507,50 @@ mod tests {
         std::fs::create_dir_all(victim.join("tmp")).unwrap();
         std::fs::write(victim.join("audit.jsonl"), "keep").unwrap();
         std::os::unix::fs::symlink(&victim, &dirs.state).unwrap();
-        remove_entry(&held.path_of(&dirs.state.join("audit.jsonl"))).unwrap();
-        remove_entry(&held.path_of(&dirs.state.join("tmp"))).unwrap();
+        remove_entry(
+            &held
+                .path_of(&found, &dirs.state.join("audit.jsonl"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        remove_entry(
+            &held
+                .path_of(&found, &dirs.state.join("tmp"))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert!(victim.join("audit.jsonl").exists() && victim.join("tmp").exists());
         assert!(!away.join("audit.jsonl").exists() && !away.join("tmp").exists());
+    }
+
+    /// The folder was not there when it was held; a link put there afterwards
+    /// must not be followed by a fall back to its path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_that_was_gone_is_not_deleted_by_its_path_later() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = client(t.path());
+        let found = find(&dirs).unwrap();
+        let away = t.path().join("away");
+        std::fs::rename(&dirs.state, &away).unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir_all(victim.join("tmp/deep")).unwrap();
+        for f in ["audit.jsonl", "token", "tmp/deep/precious"] {
+            std::fs::write(victim.join(f), "keep").unwrap();
+        }
+        // Gone when held (the state and runtime folders), put back as a link after.
+        let held = Held::open(&found).unwrap();
+        std::os::unix::fs::symlink(&victim, &dirs.state).unwrap();
+        for e in &found.entries {
+            if let Some(path) = held.path_of(&found, e).unwrap() {
+                remove_entry(&path).unwrap();
+            }
+        }
+        for f in ["audit.jsonl", "token", "tmp/deep/precious"] {
+            assert!(victim.join(f).exists(), "{f}");
+        }
     }
 
     /// Files made after the list (a command's temporary folder, a record) are the

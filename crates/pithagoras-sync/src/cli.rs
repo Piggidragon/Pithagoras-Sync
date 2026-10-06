@@ -1261,7 +1261,7 @@ async fn stop_client(dirs: &Dirs) -> Result<(), String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Err("the running client did not stop within 15 s: nothing was removed. Stop it, then run this again".into())
+    Err("the running client did not stop within 15 s: nothing was removed. Stop it first".into())
 }
 
 /// How to delete `path` by hand, for the owner to copy.
@@ -1287,6 +1287,11 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     }
     if system && !is_root() {
         return Err("--system needs root".into());
+    }
+    // An agent's commands have the same account and can turn a client folder
+    // into a junction while an elevated purge deletes in it.
+    if cfg!(windows) && is_root() {
+        return Err("run this from a normal shell, not an elevated one: the commands an agent runs could turn the client's folders into links while it deletes in them".into());
     }
     owner::not_from_own_command(dirs).await?;
     let runner = actions::System;
@@ -1467,18 +1472,20 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
         return Ok(ExitCode::from(1));
     }
     apply_plan(&stop)?;
-    if let Err(e) = stop_client(dirs).await {
-        // The stop plan ran already: the owner is told how to undo it.
-        return Err(if stop.is_empty() {
-            e
+    // From here on an error comes after the unit or task was stopped, and may
+    // come after part of it was removed: it says so, and that running this again
+    // goes on.
+    let after_stop = |e: String| {
+        let stopped = if stop.is_empty() {
+            String::new()
         } else if cfg!(windows) {
             format!(
-                "{e}\nThe logon task was switched off: `schtasks /Change /TN {} /ENABLE` turns it on again",
+                "\nThe logon task was switched off: `schtasks /Change /TN {} /ENABLE` turns it on again.",
                 install::TASK_NAME
             )
         } else {
             format!(
-                "{e}\nThe unit was stopped: `{} {}` starts it again",
+                "\nThe unit was stopped: `{} {}` starts it again.",
                 if system {
                     "sudo systemctl start"
                 } else {
@@ -1486,21 +1493,23 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
                 },
                 install::UNIT_NAME
             )
-        });
-    }
+        };
+        format!("{e}{stopped}\nRun this again to go on with what is left.")
+    };
+    stop_client(dirs).await.map_err(after_stop)?;
     // What was made while the question waited and the client shut down is the
     // client's too.
-    let found = crate::purge::find(dirs)?;
-    apply_plan(&uninstall)?;
+    let found = crate::purge::find(dirs).map_err(after_stop)?;
+    apply_plan(&uninstall).map_err(after_stop)?;
     for p in &olds {
         match std::fs::remove_file(p) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(format!("{}: {e}", p.display()));
+                return Err(after_stop(format!("{}: {e}", p.display())));
             }
             _ => {}
         }
     }
-    for f in crate::purge::remove(&found)? {
+    for f in crate::purge::remove(&found).map_err(after_stop)? {
         println!("Kept {}: something in it is not the client's.", f.display());
     }
     println!("Removed.");
