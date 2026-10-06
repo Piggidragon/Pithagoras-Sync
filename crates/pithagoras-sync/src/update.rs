@@ -461,13 +461,25 @@ pub fn choose_target(
     fs: &dyn Fs,
 ) -> Result<Target, String> {
     let exe = target_exe(running, system, me);
-    match system.filter(|s| same_program(s, &exe)) {
-        Some(s) => Ok(Target {
-            exe: root_program(s, fs)?,
-            unit: true,
-        }),
-        None => Ok(Target { exe, unit: false }),
+    let Some(s) = system else {
+        return Ok(Target { exe, unit: false });
+    };
+    let checked = root_program(s, fs);
+    // The unit's program is the path `target_exe` took from it as given. A second
+    // look at the file system must not decide that: a link its user turns between
+    // two looks would make the two answers differ and skip the check.
+    let is_unit = exe == s
+        || match &checked {
+            Ok(resolved) => std::fs::canonicalize(&exe).is_ok_and(|e| &e == resolved),
+            Err(_) => same_program(s, &exe),
+        };
+    if !is_unit {
+        return Ok(Target { exe, unit: false });
     }
+    Ok(Target {
+        exe: checked?,
+        unit: true,
+    })
 }
 
 /// The system unit's program `given` with every link resolved, if only root can
@@ -498,8 +510,9 @@ pub fn root_program(given: &Path, fs: &dyn Fs) -> Result<PathBuf, String> {
             part.display()
         )
     };
+    // A name comes from the account database and goes to root's terminal.
     let named = |name: Option<String>, id: u32| match name {
-        Some(n) => format!("{n} ({id})"),
+        Some(n) => format!("{} ({id})", sync_policy::approve::visible(&n)),
         None => id.to_string(),
     };
     let stat = |p: &Path| fs.lstat(p).map_err(|e| format!("{}: {e}", p.display()));
@@ -808,6 +821,13 @@ fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
         opts.mode(0o755);
     }
     let mut f = opts.open(path)?;
+    // The umask masks the mode above: under root's 077 the dedicated user could
+    // not start the program.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
     f.write_all(data)?;
     f.sync_all()
 }
@@ -1221,7 +1241,8 @@ mod tests {
     /// What the LXC retest did: the unit starts a link in a user's folder, and
     /// the user flips it by an atomic rename between a root-owned program and a
     /// script of their own. Whichever way it points, root neither runs it nor
-    /// writes there.
+    /// writes there, and the check does not depend on two looks at the link
+    /// agreeing: a thread turns it all the while.
     #[cfg(unix)]
     #[test]
     fn a_link_its_user_flips_is_refused_either_way() {
@@ -1232,18 +1253,42 @@ mod tests {
         let script = t.path().join("evil");
         write_script(&script, "exit 1");
         let prog = t.path().join("prog");
-        let flip = |to: &Path| {
-            let tmp = t.path().join("prog.new");
+        let flip = |dir: &Path, to: &Path| {
+            let tmp = dir.join("prog.new");
             std::os::unix::fs::symlink(to, &tmp).unwrap();
-            std::fs::rename(&tmp, &prog).unwrap();
+            std::fs::rename(&tmp, dir.join("prog")).unwrap();
         };
         let me = Path::new("/nowhere/pithagoras-sync");
         for to in [Path::new("/bin/sh"), script.as_path()] {
-            flip(to);
+            flip(t.path(), to);
             let e = choose_target(None, Some(&prog), me, &RealFs).unwrap_err();
             assert!(e.contains("root neither runs nor replaces it"), "{e}");
             assert!(root_program(&prog, &RealFs).is_err());
         }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turner = {
+            let (stop, dir, script) = (stop.clone(), t.path().to_path_buf(), script.clone());
+            std::thread::spawn(move || {
+                let mut n = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    flip(
+                        &dir,
+                        if n % 2 == 0 {
+                            Path::new("/bin/sh")
+                        } else {
+                            &script
+                        },
+                    );
+                    n += 1;
+                }
+            })
+        };
+        // Every call is refused: none returns the unchecked path for root to run.
+        for _ in 0..3000 {
+            assert!(choose_target(None, Some(&prog), me, &RealFs).is_err());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        turner.join().unwrap();
         // The same in the fake layout, where the link's folder belongs to uid 1000.
         for to in ["/usr/local/bin/pithagoras-sync", "/home/svc/bin/evil"] {
             let fs = layout(&[
@@ -1253,6 +1298,47 @@ mod tests {
             let e = choose_target(None, Some(Path::new("/home/svc/prog")), me, &fs).unwrap_err();
             assert!(e.contains("/home/svc belongs to user svc (1000)"), "{e}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_from_the_account_database_is_escaped_in_a_refusal() {
+        struct Named(FakeFs);
+        impl Fs for Named {
+            fn lstat(&self, p: &Path) -> std::io::Result<Option<Node>> {
+                self.0.lstat(p)
+            }
+            fn user_name(&self, _uid: u32) -> Option<String> {
+                Some("evil\x1b[2J".into())
+            }
+            fn group_name(&self, _gid: u32) -> Option<String> {
+                Some("grp\x1b[2J".into())
+            }
+        }
+        let bin = Path::new("/usr/local/bin/pithagoras-sync");
+        for rows in [
+            &[("/usr/local/bin", 1000, 0, 0o40755, None)],
+            &[("/usr/local/bin", 0, 50, 0o40775, None)],
+        ] {
+            let e = root_program(bin, &Named(layout(rows))).unwrap_err();
+            assert!(!e.contains('\x1b'), "{e:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_written_under_a_strict_umask_is_still_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let old = unsafe { libc::umask(0o077) };
+        let r = write_new(&t.path().join("p"), b"x");
+        unsafe { libc::umask(old) };
+        r.unwrap();
+        let mode = std::fs::metadata(t.path().join("p"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[test]
