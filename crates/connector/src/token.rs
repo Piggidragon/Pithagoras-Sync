@@ -163,14 +163,16 @@ impl TokenStore {
 
     /// Forgets the token (`unpair`, `uninstall --purge`): the file, and the
     /// keyring entry where this store uses the keyring. A store on the file
-    /// leaves the keyring alone, so it never asks to unlock one.
+    /// leaves the keyring alone, so it never asks to unlock one. Where the
+    /// keyring is only the default (Windows), one that fails cannot hold the
+    /// token either, since saving there fell back to the file: that is no error.
     pub async fn delete(&self) -> Result<(), String> {
         self.remove_file()?;
-        if self.uses_keyring() {
-            self.keyring
-                .delete(KEYRING_NAME)
-                .await
-                .map_err(|e| format!("cannot remove the token from the keyring: {e}"))?;
+        if let Place::Keyring { explicit } = self.place
+            && let Err(e) = self.keyring.delete(KEYRING_NAME).await
+            && explicit
+        {
+            return Err(format!("cannot remove the token from the keyring: {e}"));
         }
         Ok(())
     }
@@ -365,5 +367,14 @@ mod tests {
             .insert(KEYRING_NAME.into(), Secret::new(T2.into()));
         store(t.path(), None, &ks, false).delete().await.unwrap();
         assert_eq!(in_keyring(&ks).as_deref(), Some(T2));
+        // A keyring that fails: an error where the owner chose it, nothing to
+        // remove where it is only the default (the token went to the file).
+        *ks.fail.lock().unwrap() = Some("no service".into());
+        let e = store(t.path(), Some(TokenStorage::Keyring), &ks, false)
+            .delete()
+            .await
+            .unwrap_err();
+        assert!(e.contains("no service"), "{e}");
+        store(t.path(), None, &ks, true).delete().await.unwrap();
     }
 }

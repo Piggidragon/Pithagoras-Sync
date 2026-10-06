@@ -253,9 +253,7 @@ async fn menu(d: &dyn Dialogs, h: &impl Host) -> Outcome {
                 d.info(&s);
             }
             Some("pair") => {
-                if ask_and_pair(d, h).await == Outcome::Failed {
-                    continue;
-                }
+                ask_and_pair(d, h).await;
             }
             Some("log") => {
                 if let Err(e) = h.open_log() {

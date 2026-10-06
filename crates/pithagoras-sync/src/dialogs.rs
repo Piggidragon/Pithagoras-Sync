@@ -272,10 +272,15 @@ impl Native {
             return (None, None);
         };
         let mut out = Vec::new();
-        let read = child
-            .stdout
-            .take()
-            .map(|s| s.take(MAX_ANSWER as u64 + 1).read_to_end(&mut out).is_ok());
+        let read = child.stdout.take().map(|mut s| {
+            let ok = (&mut s)
+                .take(MAX_ANSWER as u64 + 1)
+                .read_to_end(&mut out)
+                .is_ok();
+            // The rest unread, the program would wait on a full pipe forever.
+            let _ = std::io::copy(&mut s, &mut std::io::sink());
+            ok
+        });
         let status = child.wait().ok().and_then(|s| s.code());
         let text = (read == Some(true) && out.len() <= MAX_ANSWER)
             .then(|| String::from_utf8(std::mem::take(&mut out)).ok())
@@ -329,7 +334,7 @@ mod win {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
         MB_SETFOREGROUND, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
@@ -366,7 +371,8 @@ mod win {
     /// The clipboard's text, if it holds some of at most `MAX_ANSWER` units.
     fn clipboard() -> Option<String> {
         // SAFETY: the clipboard is opened and closed here; the data is read
-        // under GlobalLock, up to its NUL and never past MAX_ANSWER units.
+        // under GlobalLock, up to its NUL, never past the block's size or
+        // MAX_ANSWER units.
         unsafe {
             if OpenClipboard(std::ptr::null_mut()) == 0 {
                 return None;
@@ -376,9 +382,10 @@ mod win {
             if !h.is_null() {
                 let p = GlobalLock(h) as *const u16;
                 if !p.is_null() {
+                    let size = GlobalSize(h) / 2;
                     let mut units = Vec::new();
                     let mut i = 0;
-                    while i <= MAX_ANSWER {
+                    while i <= MAX_ANSWER && i < size {
                         let u = *p.add(i);
                         if u == 0 {
                             break;

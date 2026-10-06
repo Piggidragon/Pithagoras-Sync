@@ -1033,8 +1033,9 @@ pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
 }
 
 /// Whether a start without a command is a double click or the menu's: no
-/// terminal, a display to show windows on, and no systemd unit around it. On
-/// Windows: a console window that Windows opened for this program alone.
+/// terminal and a display to show windows on (the units `install` and `setup`
+/// write always name `run`). On Windows: a console window that Windows opened
+/// for this program alone.
 fn gui_without_command() -> bool {
     #[cfg(windows)]
     return console_is_ours_alone();
@@ -1042,7 +1043,7 @@ fn gui_without_command() -> bool {
     {
         use std::io::IsTerminal;
         let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        !terminal && std::env::var_os("INVOCATION_ID").is_none() && crate::dialogs::has_display()
+        !terminal && crate::dialogs::has_display()
     }
 }
 
@@ -1058,6 +1059,15 @@ fn console_is_ours_alone() -> bool {
 
 /// The graphical flow (`gui`, a pairing link, a double click).
 async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
+    // What the commands it runs print (the purge's list) is for a terminal;
+    // here nobody reads it, and a pipe closed meanwhile must not end an
+    // uninstall halfway.
+    #[cfg(unix)]
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        // SAFETY: points fd 1 at /dev/null; `null` stays open until then.
+        unsafe { libc::dup2(null.as_raw_fd(), 1) };
+    }
     #[cfg(windows)]
     if console_is_ours_alone() {
         // SAFETY: FreeConsole has no preconditions.
