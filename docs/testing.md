@@ -30,7 +30,7 @@ PITHAGORAS_SYNC_UPDATE_KEY="$pub" cargo build --release -p pithagoras-sync
 {"version": "0.1.1", "released": 1791244800, "artifacts": {"x86_64-linux": {"url": "pithagoras-sync-x86_64-linux", "size": 11206656, "sha256": "<hex>"}}}
 ```
 
-next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute. `released` is the time the manifest was made (Unix seconds, now unless `--released` names one); a client refuses a manifest released before the newest one it saw for that program (`~/.local/state/pithagoras-sync/update-released-<hash of the program's path>`) or the newest one this user installed (`update-released` beside it), with `update --check` as well, so a test folder made again needs a later time, or those files removed.
+next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute. `released` is the time the manifest was made (Unix seconds, now unless `--released` names one); a client refuses a manifest released before the newest one it saw for that program (`~/.local/state/pithagoras-sync/update-released-<hash of the program's path>`) or the newest one this user installed (`update-released` beside it), with `update --check` as well, so a test folder made again needs a later time, or those files removed. `pithagoras-sync uninstall --purge --yes` removes them together with the rest of the client's files (config, pairing, logs) and leaves the program, so a test machine starts afresh between versions; run it as each user that ran the client, and with `sudo … uninstall --system --purge --yes` for root and the system unit.
 
 ## The test machine
 

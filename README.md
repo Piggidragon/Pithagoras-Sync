@@ -50,7 +50,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
    pithagoras-sync mode folders
    ```
 
-`pithagoras-sync install --print` shows what `install` would do without doing it; `pithagoras-sync uninstall` undoes it.
+`pithagoras-sync install --print` shows what `install` would do without doing it; `pithagoras-sync uninstall` undoes it. `pithagoras-sync uninstall --purge` also removes everything else the client left: it stops the running client, then removes the pairing (remove the device in the portal as well), the config with its folders and policy, the token, a stored elevation password, the audit log, the client's log and the update records. Only files the client writes, inside its own folders, go; anything else there stays. It lists what it removes and asks first (`--yes` does not ask, `--print` only lists). The program itself stays, and `--purge` says where it is so you can delete it. With `sudo … uninstall --system --purge` it removes the system unit and root's own files; a dedicated user and its files go with `setup --remove`.
 
 ## Linux server
 
