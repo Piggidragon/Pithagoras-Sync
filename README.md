@@ -21,7 +21,13 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 `pithagoras-sync panic` stops everything at once: it closes the link and kills every command until you run `pithagoras-sync unlock`. Every decision goes to a local audit log, `~/.local/state/pithagoras-sync/audit.jsonl`, and every settings change with its old and new value.
 
-## Linux laptop or desktop
+## Install by double click
+
+On Windows 10/11 and a Linux desktop no terminal is needed: download the program, double click it, say Yes to install, then click the pairing link the portal shows under Settings, Devices (or paste it when the program asks). Every step asks first and shows the portal it pairs with. [docs/install.md](docs/install.md) shows each window, and how to uninstall the same way. On Linux the windows need `zenity` or `kdialog`; `pithagoras-sync gui` opens them again later, as does "Pithagoras Sync" in the menu.
+
+The terminal way below does the same and stays the way for servers.
+
+## Linux laptop or desktop, in a terminal
 
 1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); to build it yourself, see below.
 
@@ -30,7 +36,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
    chmod +x pithagoras-sync-x86_64-linux
    ```
 
-2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Until it is paired the client just waits (`status` says "not paired"). You do not start it yourself: `pithagoras-sync run`, which the unit runs, is only for starting it by hand in a terminal, to see its log while debugging.
+2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Run from a graphical session, it also adds "Pithagoras Sync" to the menu and makes `pithagoras-sync://` pairing links open it. Until it is paired the client just waits (`status` says "not paired"). You do not start it yourself: `pithagoras-sync run`, which the unit runs, is only for starting it by hand in a terminal, to see its log while debugging.
 
    ```sh
    ./pithagoras-sync-x86_64-linux install
@@ -69,16 +75,16 @@ sudo systemctl start pithagoras-sync
 
 `setfacl` comes with the `acl` package, which Debian and Ubuntu leave out (`sudo apt install acl`); `setup` says so when it is missing, and `sudo chown -R pithagoras-sync: /srv/project` works instead where the project need not stay another user's. `setup --create-user` creates the user with a locked password and installs the program to `/usr/local/bin` with a system unit, enabled but not started until you pair (`pair` then names the `systemctl start`); `sudo pithagoras-sync setup --remove` undoes it. For an existing user, use `sudo pithagoras-sync install --system --user <name>`; as your own user without root, use `pithagoras-sync install`, which turns on lingering so the unit runs without a login. Approvals work on a server as anywhere else, through the portal or `pithagoras-sync approve` over ssh.
 
-## Windows
+## Windows, in PowerShell
 
-Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases/tag/v0.0.1), save it as `pithagoras-sync.exe`, then in PowerShell:
+Double clicking the downloaded program installs and pairs it (above). In PowerShell instead: download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases/tag/v0.0.1), save it as `pithagoras-sync.exe`, then:
 
 ```powershell
 .\pithagoras-sync.exe install
 .\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. You never start it yourself (`pithagoras-sync run` is only for running it by hand in a terminal, for debugging). The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync`, adds a logon task that starts it at logon and again within a minute if it stops, and registers it for `pithagoras-sync://` links (under `HKEY_CURRENT_USER`); it needs no admin rights. The connector token is kept in the Windows Credential Manager (`token_storage`, [docs/permissions.md](docs/permissions.md)). The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. You never start it yourself (`pithagoras-sync run` is only for running it by hand in a terminal, for debugging). The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; the graphical install of 0.0.2 does not change that; a launcher without console is explored later (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 
@@ -93,7 +99,7 @@ pithagoras-sync sudo clear     # forget the password
 
 `sudo activate` switches sudo access on later (it offers to store a password first if there is none). On a headless machine (a server, `profile = headless`) `sudo set --stdin --activate` is the script route: it reads the password from stdin and switches sudo access on without asking. On a desktop profile every policy change checks your password in a terminal, so use `sudo set` there. `pithagoras-sync sudo --help` lists everything.
 
-The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
+The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file` or `keyring` (the desktop's keyring, so it survives a restart without a file). Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
 
 ## Updates
 
@@ -145,6 +151,7 @@ The tests use temporary folders and a mock portal. They never touch your real co
 
 ## Documentation
 
+- [docs/install.md](docs/install.md): installing, pairing and uninstalling by double click, window by window.
 - [docs/permissions.md](docs/permissions.md): every setting, its default, and who may change it.
 - [docs/protocol.md](docs/protocol.md): the wire protocol between portal and device, and the decisions still open.
 - [docs/testing.md](docs/testing.md): the tests, the tools for trying a client by hand, and the record of the test machine.

@@ -158,6 +158,15 @@ What the keyring protects against: other users of the machine, a copied disk or 
 
 A keyring the owner chose (`keyring` set explicitly) never falls back to the file or to memory; the only fallback is the Windows default for the token, described above. Tests and the test scripts set `PITHAGORAS_SYNC_NO_KEYRING=1`, which makes the client use no keyring at all.
 
+## The graphical flow
+
+`gui` changes the pairing and the install, nothing else: it sets no mode, folder, protection or expiry, and pairing by link pairs exactly as `pair` does (Ask mode stays the default). What it adds is a way in that is not a terminal, so:
+
+- A pairing link comes from a web page and is untrusted. It is parsed as strictly as `pair` parses it (unknown keys, a bad code or pin, a link over 4 KiB are refused), a plain-`http` portal on another machine is refused before anything is shown, and nothing happens until the owner answers Yes to a window that shows the parsed portal URL and device name, never the raw link. Every text from outside (the portal URL, a status line, an error) goes through the same escaping as the terminal (`\u{1b}` for an escape character) and is cut, and the dialog programs get it as plain text (`--no-markup`, or escaped markup).
+- On Linux, `gui` refuses to start when a command the client runs started it (the same ancestry check as the CLI), before it shows anything, and checks again before each change. The dialog program (`zenity` or `kdialog`, from `PATH`) runs with an argv, never a shell, and an environment cleaned to the display, the session bus, the language and the theme. Answers are read from its output only, bounded.
+- On a desktop profile `pair` asks for the user's password in a terminal; the graphical flow has no terminal, so the Yes in its window takes that place for the pairing (and for the install and uninstall, which never asked for a password). A command that escaped the client's process tree (started through `systemd-run --user`, say) and could send input to the X11 session could click that Yes; such an unconfined command could also edit `config.toml` directly (see "Who may change them" above), so the window adds no right it did not have. The windows never ask for a password: `sudo set` stays a terminal command.
+- It never starts by itself under `run`, from a systemd unit (`INVOCATION_ID` set), in a terminal (without a command the help shows, as before), or without a display (it says so on stderr, in `client.log` and as a notification).
+
 ## Other commands that change what the portal may do
 
 | Command | What it does |
@@ -166,4 +175,5 @@ A keyring the owner chose (`keyring` set explicitly) never falls back to the fil
 | `pithagoras-sync unlock` | Ends a pause; reloads the stored password when storage is `file`. |
 | `pithagoras-sync update [--check]` | Replaces the program the running client was started from (else the one you ran) with a newer signed release and restarts the client. Never changes a setting. |
 | `pithagoras-sync status` | Mode, folders, approvals, elevation, the connection. |
+| `pithagoras-sync gui [<link>]` | The graphical flow ([install.md](install.md)): install, pair (from a `pithagoras-sync://` link the browser hands over, or one pasted in), status, the log, uninstall with or without `--purge`. The program started with no command from a file manager or the menu, or with a pairing link alone, runs it too. It runs the code of `install`, `pair` and `uninstall` and changes no setting of its own; see "The graphical flow" below. |
 | `pithagoras-sync uninstall --purge [--yes] [--print]` | Stops the client, undoes `install` and removes its pairing, config (folders and policy included), token, stored password, audit log, log and update records; the program stays. On Linux refused from the commands the client runs; on Windows commands run unconfined and can run it (see `windows.md`). |

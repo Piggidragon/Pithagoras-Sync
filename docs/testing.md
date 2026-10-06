@@ -8,7 +8,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-They use temp dirs, fake roots, fake `sudo` scripts and the mock portal in `crates/testkit`; they never touch the real config, systemd, the user's notification service or a real portal. `crates/pithagoras-sync/tests/e2e.rs` runs the real binary against the mock portal, `tests/update.rs` runs the updater against releases in temp dirs and on a loopback HTTP server. The Windows tests run on a Windows machine with `scripts/windows-vm-test.sh <host>`.
+They use temp dirs, fake roots, fake `sudo` scripts and the mock portal in `crates/testkit`; they never touch the real config, systemd, the user's notification service, a real keyring, the registry or a real portal. `crates/pithagoras-sync/tests/e2e.rs` runs the real binary against the mock portal, `tests/update.rs` runs the updater against releases in temp dirs and on a loopback HTTP server. The Windows tests run on a Windows machine with `scripts/windows-vm-test.sh <host>`.
 
 ## Tools for trying a real client by hand
 
@@ -31,6 +31,47 @@ PITHAGORAS_SYNC_UPDATE_KEY="$pub" cargo build --release -p pithagoras-sync
 ```
 
 next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute. `released` is the time the manifest was made (Unix seconds, now unless `--released` names one); a client refuses a manifest released before the newest one it saw for that program (`~/.local/state/pithagoras-sync/update-released-<hash of the program's path>`) or the newest one this user installed (`update-released` beside it), with `update --check` as well, so a test folder made again needs a later time, or those files removed. `pithagoras-sync uninstall --purge --yes` removes them together with the rest of the client's files (config, pairing, logs) and leaves the program, so a test machine starts afresh between versions; run it as each user that ran the client, and with `sudo … uninstall --system --purge --yes` for root and the system unit.
+
+## The graphical flow and the keyring without a desktop
+
+The tests never show a window or touch a keyring: the flow (`gui.rs`) runs against fake dialogs and a fake host, the dialog programs' arguments are checked as built, `tests/e2e.rs` runs the real binary with stand-in `zenity`/`kdialog` scripts on `PATH`, and the Secret Service code runs against a fake service of the testkit (`sync_testkit::keyring`) on a private `dbus-daemon`. To try them by hand on a machine without a display:
+
+- **A fake dialog program.** Put a script named `zenity` (or `kdialog`) first on `PATH` that prints its arguments and answers, and run with any `DISPLAY` set:
+
+  ```sh
+  mkdir -p /tmp/fakegui && cat > /tmp/fakegui/zenity <<'SH'
+  #!/bin/sh
+  printf '%s\n' "$@" >&2      # what the dialog would show
+  exit 0                     # 0: Yes/OK; 1: No/Cancel. An --entry or --list answer goes to stdout.
+  SH
+  chmod +x /tmp/fakegui/zenity
+  DISPLAY=:99 PATH=/tmp/fakegui:$PATH pithagoras-sync 'pithagoras-sync://pair?portal=http://127.0.0.1:18080&code=ABC123'
+  ```
+
+  With the mock portal (`sync-mock-portal 18080`, then `code ABC123`) this pairs after the stand-in's "Yes". `tests/e2e.rs` (`fake_dialogs`) has a stand-in that answers from a file, line by line.
+- **Real zenity under Xvfb.** With `xvfb`, `zenity` and `xdotool` installed: `xvfb-run -a pithagoras-sync gui &`, then `xdotool search --name 'Pithagoras Sync'` finds the window and `xdotool key Return` answers its default button (Yes, OK, the first row of the menu). `import -window root shot.png` (ImageMagick) shows what is on the screen.
+- **A real keyring, headless.** With `dbus`, `gnome-keyring` and `libsecret-tools`:
+
+  ```sh
+  dbus-run-session -- sh -c 'echo "" | gnome-keyring-daemon --unlock --components=secrets; \
+    pithagoras-sync config set token_storage keyring; pithagoras-sync pair "<link>"; \
+    secret-tool lookup application pithagoras-sync name token'
+  ```
+
+  Locked again (`gdbus call --session --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets --method org.freedesktop.Secret.Service.Lock "['/org/freedesktop/secrets/collection/login']"`), GNOME Keyring wants its unlock prompt, which needs a display: without one the prompt counts as cancelled and the client says so.
+- **The link handler.** `install` from a session with `DISPLAY` set (a stand-in `systemctl` on `PATH` keeps the real systemd out; `XDG_DATA_HOME` and `HOME` pointed into a temporary folder keep the real `~/.local` out), then `xdg-mime query default x-scheme-handler/pithagoras-sync` says `pithagoras-sync.desktop`, and under Xvfb `gio open 'pithagoras-sync://pair?...'` starts `pithagoras-sync gui <link>`. `xdg-open` without a desktop environment (its "generic" mode) did not open the link on the build machine; on GNOME and KDE it hands it to `gio` or `kde-open`.
+
+`PITHAGORAS_SYNC_NO_KEYRING=1` makes the client use no keyring at all, so a test run on Windows never writes to the machine's Credential Manager.
+
+## Linux evidence for 0.0.2 (the build machine, headless)
+
+Run on 2026-10-06 in a cloud container (Ubuntu 24.04, no desktop, no systemd user manager, no IPv6), as an unprivileged user in a user namespace (`unshare --user --map-user=1000`), with the debug build. No real portal and no machine of the owner's was touched.
+
+- **GNOME Keyring 46 through the Secret Service**, on a private session bus: `config set token_storage keyring`, then `pair` against the mock portal put the 43-byte token in the keyring (`secret-tool lookup application pithagoras-sync name token`) and no `token` file in the config folder; `status` said "token kept in the keyring". `config set token_storage file` wrote the file and removed the keyring entry; `keyring` moved it back. `secret_storage = keyring` with `sudo set --stdin` stored the password there (`secret-tool` showed it), `sudo status` said "set (kept in keyring)", `sudo clear` and `unpair` removed the entries. The running client connected with the token from the keyring. With the login collection locked over D-Bus and no display for GNOME Keyring's prompter, `pair` failed with "cannot keep the token in the keyring (token_storage = keyring): the keyring stayed locked: the keyring prompt was cancelled", wrote no token file, and the running client stayed connected with its old token.
+- **zenity 4 under Xvfb**, answered with `xdotool`: the pairing question (screenshot: the parsed portal URL and device name, No and Yes), the info after pairing ("Installed, not connected yet: the client is not running", since no client ran in that test), the entry for a pasted link, the menu of a paired device with all five items, and the status text. Each answer did what the flow says; the pasted link paired.
+- **The link handler**: `install` with `DISPLAY` set wrote the desktop entry and the icon and ran the real `update-desktop-database` and `xdg-mime`; `xdg-mime query default x-scheme-handler/pithagoras-sync` said `pithagoras-sync.desktop`, the `mimeinfo.cache` had the line, `desktop-file-validate` found the entry valid, and `gio open` on a pairing link started `~/.local/bin/pithagoras-sync gui <link>`, which asked before pairing. `uninstall` removed the entry and the icon.
+- **Windows**: cross-built and linted for `x86_64-pc-windows-gnu` only (`cargo clippy --workspace --target x86_64-pc-windows-gnu --all-targets -- -D warnings`), since `cargo xwin` could not fetch the MSVC SDK there. Nothing ran on Windows.
+- `connector::net::tests::plain_http_reaches_this_users_portal_in_either_address_family` fails on that machine, before these changes too: it has no IPv6.
 
 ## The test machine
 

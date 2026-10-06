@@ -37,7 +37,7 @@ The check that notices a command naming a protected path knows the PowerShell sp
 
 ## Elevation: Linux only
 
-Elevation is `sudo` on Linux and nothing else: Windows has none, and none is planned (no UAC prompt, no stored administrator password, no Credential Manager). On Windows, with `policy.privilege.elevation = "sudo"`, a `sudo ...` command is denied (with it off, `sudo` is just a word of the command), and `pithagoras-sync sudo ...` says "sudo access is Linux only" and fails. A command that needs administrator rights fails with Windows' own "access denied"; the owner runs it in an elevated PowerShell of his own.
+Elevation is `sudo` on Linux and nothing else: Windows has none, and none is planned (no UAC prompt, no stored administrator password). `policy.privilege.secret_storage = keyring` is refused on Windows for the same reason; the Credential Manager keeps only the connector token (below). On Windows, with `policy.privilege.elevation = "sudo"`, a `sudo ...` command is denied (with it off, `sudo` is just a word of the command), and `pithagoras-sync sudo ...` says "sudo access is Linux only" and fails. A command that needs administrator rights fails with Windows' own "access denied"; the owner runs it in an elevated PowerShell of his own.
 
 `policy.privilege.allow_root` (off by default) also covers an elevated administrator: the client refuses to start in an elevated session unless it is on, and warns "running as an elevated administrator" when it is. An administrator's ssh session is always elevated (the High mandatory level), so a client started over ssh needs it; the logon task runs the client unelevated (Medium level, tested).
 
@@ -65,14 +65,25 @@ Elevation is `sudo` on Linux and nothing else: Windows has none, and none is pla
 | What | Where |
 |---|---|
 | Config | `%APPDATA%\pithagoras-sync\config.toml` |
-| Connector token | `%APPDATA%\pithagoras-sync\token` |
+| Connector token | the Credential Manager, `pithagoras-sync/token` (default); `%APPDATA%\pithagoras-sync\token` with `token_storage = "file"` or when the Credential Manager failed at pairing |
+| Link handler | `HKEY_CURRENT_USER\Software\Classes\pithagoras-sync` |
 | Audit log, pause flag | `%LOCALAPPDATA%\pithagoras-sync\` |
 | Log of the logon task's client | `%LOCALAPPDATA%\pithagoras-sync\client.log` (and `client.log.1`) |
 | Program (after `install`) | `%LOCALAPPDATA%\Programs\pithagoras-sync\pithagoras-sync.exe` |
 
-The token file relies on the profile folder's default permissions (the user, SYSTEM and Administrators). Linux refuses a token file others can read; Windows has no such check yet. The architecture's OS credential store (Credential Manager) is not used in phase 1 on either platform.
+The token is kept in the Credential Manager by default (`token_storage` unset): a generic credential `pithagoras-sync/token`, persisted on this machine only (`CRED_PERSIST_LOCAL_MACHINE`, not roamed with the profile), which `cmdkey /list` shows. It protects the token against other users and a copied disk, not against a command the agent runs as the same user, which can read it back as it could read a file. When the Credential Manager does not take it at pairing, the token goes to `%APPDATA%\pithagoras-sync\token` and `pair` says so once; a token file from before 0.0.2 keeps working, and `config set token_storage keyring` moves it into the Credential Manager (`file` moves it back). With `token_storage = "keyring"` set explicitly there is no fallback: a failure is an error. The token file relies on the profile folder's default permissions (the user, SYSTEM and Administrators). Linux refuses a token file others can read; Windows has no such check yet. The Credential Manager calls (`CredWriteW`, `CredReadW`, `CredDeleteW`) are cross-built and linted but have not run on Windows yet (**unverified**). The Windows tests set `PITHAGORAS_SYNC_NO_KEYRING=1`, so they keep the token in their own temporary files and never touch the machine's Credential Manager.
 
 The client the logon task starts (`run --detach`) has no console, so it writes its log to `%LOCALAPPDATA%\pithagoras-sync\client.log`, plain text, with the elevation password scrubbed as everywhere. The file is capped at 1 MiB: past that it moves to `client.log.1`, replacing the one before, and a new file starts, so the log never takes more than about 2 MiB. Why the client stopped (refusing an elevated session, a broken config) is the last line there. Started in a terminal, it logs to the terminal.
+
+## Graphical install and pairing links
+
+Double clicking the downloaded `.exe` (or starting it with no arguments from Explorer) runs the graphical flow of [install.md](install.md) instead of printing the help. The program is a console program, so Windows opens a console window for it; when that console holds this process alone (`GetConsoleProcessList` reports one process), the program lets it go (`FreeConsole`) before the first window shows. Started from a terminal, a console has more processes and the help shows as before. Started with no arguments over ssh without a terminal it was not tried (**unverified**); `gui` there would show windows nobody sees.
+
+- **Windows.** `MessageBoxW` only: Yes/No questions, information and error boxes. There is no input box, so where the flow asks for the pairing link it says to copy the link and press OK, and reads the clipboard (at most 4096 characters, text only). The menu of a paired device is a row of Yes/No/Cancel questions, one per item. No `.ico` is built into the program (that needs a resource compiler), so the windows and the file show the default icon; a Start Menu shortcut is not created (that needs COM's `IShellLink`, not in the plain bindings): both are follow-ups.
+- **Link handler.** `install` writes `HKEY_CURRENT_USER\Software\Classes\pithagoras-sync` (default value `URL:Pithagoras Sync pairing link`, an empty `URL Protocol`) and `shell\open\command` = `"<installed program>" "%1"`, never under `HKEY_LOCAL_MACHINE`; `uninstall` and `uninstall --purge` remove the key with everything under it. A browser then hands `pithagoras-sync://pair?...` to the installed program, which asks before it pairs. `install --print` lists the values.
+- **SmartScreen.** The program is not signed (issue #7), so the first double click of a download shows "Windows protected your PC"; "More info", "Run anyway" starts it. That is documented, not fixed.
+- **Not run on Windows yet** (**unverified**, cross-built and linted with `x86_64-pc-windows-gnu` only, since the MSVC SDK could not be fetched in the build environment): `MessageBoxW`, the clipboard, `GetConsoleProcessList`/`FreeConsole` at a double click, the registry writes (`RegCreateKeyExW`, `RegSetValueExW`, `RegDeleteTreeW`) and the browser hand-over. The owner's checklist in the pull request lists the steps.
+- Windows has no ancestry check on the control channel (below), so the graphical flow cannot refuse a command the agent runs, as the command line cannot on Windows.
 
 ## Start at logon: a scheduled task, not a service
 
@@ -98,6 +109,7 @@ The task runs `pithagoras-sync.exe run --detach` (a hidden form of `run`, which 
 - Keeping processes started through WMI, the Task Scheduler or other services within the job.
 - The ancestry check on the control channel (above).
 - A password check before policy changes.
-- A permission check on the token file.
+- A permission check on the token file (the token is in the Credential Manager by default since 0.0.2).
+- A password dialog: there is no `sudo`, so the graphical flow asks for none.
 - `setup --create-user` and system-wide install.
-- Each time the task starts the client (at logon, and when it starts it again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6).
+- Each time the task starts the client (at logon, and when it starts it again after a stop or an update) a console window can flash for a fraction of a second; the graphical install of 0.0.2 does not change that; a launcher without console is explored later (issue #6).
