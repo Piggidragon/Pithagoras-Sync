@@ -716,12 +716,52 @@ pub fn what_runs(pid: u32, exe: &Path) -> Option<Runs> {
 /// of the releases taken. On failure the program is left as it was, and the
 /// error says so: no client is restarted either.
 pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
-    put_in_place(plan, exe)
-        .await
-        .map_err(|e| format!("{e} (nothing was replaced, and no client was restarted)"))
+    put_in_place(plan, exe).await.map_err(Failed::text)
 }
 
-async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
+/// Why an install failed: before the program was touched, or halfway (on
+/// Windows, moved aside and not back), which the owner must hear about.
+#[derive(Debug)]
+enum Failed {
+    Before(String),
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Halfway(String),
+}
+
+impl Failed {
+    fn text(self) -> String {
+        match self {
+            Failed::Before(e) => format!("{e} (nothing was replaced, and no client was restarted)"),
+            Failed::Halfway(e) => e,
+        }
+    }
+}
+
+impl From<String> for Failed {
+    fn from(e: String) -> Failed {
+        Failed::Before(e)
+    }
+}
+
+impl From<&str> for Failed {
+    fn from(e: &str) -> Failed {
+        Failed::Before(e.to_string())
+    }
+}
+
+/// The program was moved aside to `old` and the new one did not take its place
+/// (`e`), and moving it back failed too (`back`): it is gone from `exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn not_moved_back(exe: &Path, old: &Path, e: &std::io::Error, back: &std::io::Error) -> Failed {
+    Failed::Halfway(format!(
+        "cannot replace {}: {e}; moving the old program back failed as well ({back}), so it is now {}: move it back to {} by hand, or its logon task finds no program (no client was restarted)",
+        exe.display(),
+        old.display(),
+        exe.display()
+    ))
+}
+
+async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), Failed> {
     // A missing program (put back by this update) resolves through its folder.
     #[cfg(unix)]
     let exe = &match std::fs::canonicalize(exe) {
@@ -732,7 +772,7 @@ async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
                 .map_err(|e| format!("{}: {e}", dir.display()))?
                 .join(exe.file_name().unwrap_or_default())
         }
-        Err(e) => return Err(format!("{}: {e}", exe.display())),
+        Err(e) => return Err(format!("{}: {e}", exe.display()).into()),
     };
     let data = fetch(&plan.source, plan.artifact.size).await?;
     if data.len() as u64 != plan.artifact.size {
@@ -740,7 +780,8 @@ async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
             "the download has {} bytes, the manifest says {}",
             data.len(),
             plan.artifact.size
-        ));
+        )
+        .into());
     }
     let digest = ring::digest::digest(&ring::digest::SHA256, &data);
     let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
@@ -755,7 +796,7 @@ async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
         .and_then(|()| check_runs(&tmp, &plan.version));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(e.into());
     }
     replace(&tmp, exe).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -843,7 +884,7 @@ fn text_busy(_e: &std::io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn replace(new: &Path, exe: &Path) -> Result<(), String> {
+fn replace(new: &Path, exe: &Path) -> Result<(), Failed> {
     std::fs::rename(new, exe).map_err(|e| format!("cannot replace {}: {e}", exe.display()))?;
     if let Some(dir) = exe.parent()
         && let Ok(d) = std::fs::File::open(dir)
@@ -854,13 +895,15 @@ fn replace(new: &Path, exe: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn replace(new: &Path, exe: &Path) -> Result<(), String> {
+fn replace(new: &Path, exe: &Path) -> Result<(), Failed> {
     let old = old_path(exe);
     let _ = std::fs::remove_file(&old);
     std::fs::rename(exe, &old).map_err(|e| format!("cannot move {} aside: {e}", exe.display()))?;
     if let Err(e) = std::fs::rename(new, exe) {
-        let _ = std::fs::rename(&old, exe);
-        return Err(format!("cannot replace {}: {e}", exe.display()));
+        if let Err(back) = std::fs::rename(&old, exe) {
+            return Err(not_moved_back(exe, &old, &e, &back));
+        }
+        return Err(format!("cannot replace {}: {e}", exe.display()).into());
     }
     Ok(())
 }
@@ -1430,6 +1473,25 @@ mod tests {
         // A client newer than the file is not restarted onto the older file.
         assert!(!is_older("0.3.0", "0.2.0"));
         assert!(!is_older("dev", "0.2.0"));
+    }
+
+    #[test]
+    fn a_program_not_moved_back_is_not_called_unreplaced() {
+        let exe = Path::new("pithagoras-sync.exe");
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let said = not_moved_back(exe, &old_path(exe), &e, &e).text();
+        assert!(!said.contains("nothing was replaced"), "{said}");
+        assert!(
+            said.contains(
+                "it is now pithagoras-sync.exe.old: move it back to pithagoras-sync.exe by hand"
+            ),
+            "{said}"
+        );
+        let said = Failed::from("the download does not match").text();
+        assert!(
+            said.ends_with("(nothing was replaced, and no client was restarted)"),
+            "{said}"
+        );
     }
 
     #[test]
