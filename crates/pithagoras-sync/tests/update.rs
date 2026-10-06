@@ -47,10 +47,22 @@ impl Release {
     /// Publishes `version` with `binary`; the manifest claims `claimed` as its
     /// sha256 (the real one when `None`).
     fn publish(&self, version: &str, binary: &[u8], claimed: Option<&str>) -> String {
+        self.publish_at(version, 1_000, binary, claimed)
+    }
+
+    /// Publishes as `publish`, released at `released`.
+    fn publish_at(
+        &self,
+        version: &str,
+        released: u64,
+        binary: &[u8],
+        claimed: Option<&str>,
+    ) -> String {
         std::fs::create_dir_all(self.dir.join("rel")).unwrap();
         std::fs::write(self.dir.join("rel/pithagoras-sync-bin"), binary).unwrap();
         let manifest = json!({
             "version": version,
+            "released": released,
             "artifacts": {
                 update::target(): {
                     "url": "pithagoras-sync-bin",
@@ -83,6 +95,11 @@ impl Release {
     }
 }
 
+/// What `check` offers to install, with no record of earlier manifests.
+async fn check(source: &str, key: &str, current: &str) -> Result<Option<Plan>, String> {
+    Ok(update::check(source, key, current, None).await?.plan)
+}
+
 fn leftovers(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .unwrap()
@@ -97,7 +114,7 @@ async fn a_signed_newer_release_replaces_the_program() {
     let r = Release::new();
     let manifest = r.publish("0.2.0", &program("0.2.0"), None);
     let exe = r.installed();
-    let plan = update::check(&manifest, &r.pk(), "0.1.0")
+    let plan = check(&manifest, &r.pk(), "0.1.0")
         .await
         .unwrap()
         .expect("0.2.0 is newer");
@@ -111,14 +128,8 @@ async fn a_signed_newer_release_replaces_the_program() {
     }
     assert!(leftovers(exe.parent().unwrap()).is_empty());
     // The same or an older version is not taken: no downgrades.
-    assert_eq!(
-        update::check(&manifest, &r.pk(), "0.2.0").await.unwrap(),
-        None
-    );
-    assert_eq!(
-        update::check(&manifest, &r.pk(), "0.10.0").await.unwrap(),
-        None
-    );
+    assert_eq!(check(&manifest, &r.pk(), "0.2.0").await.unwrap(), None);
+    assert_eq!(check(&manifest, &r.pk(), "0.10.0").await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -127,21 +138,19 @@ async fn a_manifest_that_does_not_verify_is_refused() {
     let manifest = r.publish("0.2.0", &program("0.2.0"), None);
     // Signed by another key.
     let other = TestKey::generate();
-    let e = update::check(&manifest, &other.public_base64(), "0.1.0")
+    let e = check(&manifest, &other.public_base64(), "0.1.0")
         .await
         .unwrap_err();
     assert!(e.contains("does not verify"), "{e}");
     // Changed after signing.
     let text = std::fs::read_to_string(&manifest).unwrap();
     std::fs::write(&manifest, text.replace("0.2.0", "0.9.0")).unwrap();
-    let e = update::check(&manifest, &r.pk(), "0.1.0")
-        .await
-        .unwrap_err();
+    let e = check(&manifest, &r.pk(), "0.1.0").await.unwrap_err();
     assert!(e.contains("does not verify"), "{e}");
     // No signature at all.
     r.publish("0.2.0", &program("0.2.0"), None);
     std::fs::remove_file(format!("{manifest}.minisig")).unwrap();
-    assert!(update::check(&manifest, &r.pk(), "0.1.0").await.is_err());
+    assert!(check(&manifest, &r.pk(), "0.1.0").await.is_err());
 }
 
 #[tokio::test]
@@ -151,18 +160,12 @@ async fn a_binary_that_does_not_match_stays_out() {
     let before = std::fs::read(&exe).unwrap();
     // The manifest names another sha256.
     let manifest = r.publish("0.2.0", &program("0.2.0"), Some(&sha256(b"other")));
-    let plan = update::check(&manifest, &r.pk(), "0.1.0")
-        .await
-        .unwrap()
-        .unwrap();
+    let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
     let e = update::install(&plan, &exe).await.unwrap_err();
     assert!(e.contains("sha256"), "{e}");
     // A different size than the manifest says, the sha256 right.
     let manifest = r.publish("0.2.0", &program("0.2.0"), None);
-    let plan = update::check(&manifest, &r.pk(), "0.1.0")
-        .await
-        .unwrap()
-        .unwrap();
+    let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
     let bad = Plan {
         artifact: update::Artifact {
             size: plan.artifact.size + 1,
@@ -173,10 +176,7 @@ async fn a_binary_that_does_not_match_stays_out() {
     assert!(update::install(&bad, &exe).await.is_err());
     // Signed and matching, but it is not the version the manifest promised.
     let manifest = r.publish("0.2.0", &program("0.3.0"), None);
-    let plan = update::check(&manifest, &r.pk(), "0.1.0")
-        .await
-        .unwrap()
-        .unwrap();
+    let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
     let e = update::install(&plan, &exe).await.unwrap_err();
     assert!(e.contains("reports"), "{e}");
     assert_eq!(std::fs::read(&exe).unwrap(), before);
@@ -237,13 +237,13 @@ async fn updates_over_http_follow_redirects() {
     let _ = manifest;
     let exe = r.installed();
     // The manifest's relative URL resolves against where it was fetched from.
-    let plan = update::check(&format!("{base}/latest/manifest.json"), &r.pk(), "0.1.0")
+    let plan = check(&format!("{base}/latest/manifest.json"), &r.pk(), "0.1.0")
         .await
         .unwrap()
         .unwrap();
     update::install(&plan, &exe).await.unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), program("0.2.0"));
-    let e = update::check(&format!("{base}/missing.json"), &r.pk(), "0.1.0")
+    let e = check(&format!("{base}/missing.json"), &r.pk(), "0.1.0")
         .await
         .unwrap_err();
     assert!(e.contains("404"), "{e}");
@@ -318,6 +318,7 @@ async fn a_release_made_by_the_release_tool_updates_the_client() {
     let target = update::target();
     let text = sync_release::manifest(
         "0.3.0",
+        1_000,
         None,
         &[
             sync_release::Binary {
@@ -339,10 +340,52 @@ async fn a_release_made_by_the_release_tool_updates_the_client() {
     )
     .unwrap();
     let exe = r.installed();
-    let plan = update::check(&manifest.to_string_lossy(), &r.pk(), "0.1.0")
+    let plan = check(&manifest.to_string_lossy(), &r.pk(), "0.1.0")
         .await
         .unwrap()
         .expect("0.3.0 is newer");
     update::install(&plan, &exe).await.unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), program("0.3.0"));
+}
+
+/// Whoever controls the release listing but not the key can serve an older signed
+/// manifest again; a client that took a newer one refuses it.
+#[tokio::test]
+async fn an_older_signed_manifest_served_again_is_refused() {
+    let r = Release::new();
+    let seen = r.dir.join("state/update-released");
+    let old =
+        std::fs::read_to_string(r.publish_at("0.2.0", 1_000, &program("0.2.0"), None)).unwrap();
+    let old_sig = std::fs::read_to_string(r.dir.join("rel/manifest.json.minisig")).unwrap();
+    let manifest = r.publish_at("0.3.0", 2_000, &program("0.3.0"), None);
+    let offer = update::check(&manifest, &r.pk(), "0.1.0", Some(&seen))
+        .await
+        .unwrap();
+    assert_eq!(offer.released, 2_000);
+    assert_eq!(offer.plan.unwrap().version, "0.3.0");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "2000");
+    // The same manifest again is fine.
+    assert!(
+        update::check(&manifest, &r.pk(), "0.1.0", Some(&seen))
+            .await
+            .is_ok()
+    );
+    // The older one, validly signed, comes back: refused, also for a client that
+    // still runs a version below it, and the record keeps the newer time.
+    std::fs::write(&manifest, &old).unwrap();
+    std::fs::write(format!("{manifest}.minisig"), &old_sig).unwrap();
+    let e = update::check(&manifest, &r.pk(), "0.1.0", Some(&seen))
+        .await
+        .unwrap_err();
+    assert!(e.contains("older than one this client already took"), "{e}");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "2000");
+    // A manifest without a release time is not taken at all.
+    let bare = json!({"version": "0.4.0", "artifacts": {}}).to_string();
+    std::fs::write(&manifest, &bare).unwrap();
+    std::fs::write(
+        format!("{manifest}.minisig"),
+        r.key.sign(bare.as_bytes(), "file:manifest.json"),
+    )
+    .unwrap();
+    assert!(check(&manifest, &r.pk(), "0.1.0").await.is_err());
 }

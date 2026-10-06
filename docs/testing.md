@@ -27,10 +27,10 @@ PITHAGORAS_SYNC_UPDATE_KEY="$pub" cargo build --release -p pithagoras-sync
 `PITHAGORAS_SYNC_UPDATE_URL` sets the default manifest URL the same way (without it, the default is the stable release channel on GitHub); `update --manifest <url or file>` names another. A release folder holds `manifest.json`, which `sync-release manifest --version 0.1.1 --out manifest.json pithagoras-sync-x86_64-linux=x86_64-linux` writes (docs/releasing.md):
 
 ```json
-{"version": "0.1.1", "artifacts": {"x86_64-linux": {"url": "pithagoras-sync-x86_64-linux", "size": 11206656, "sha256": "<hex>"}}}
+{"version": "0.1.1", "released": 1791244800, "artifacts": {"x86_64-linux": {"url": "pithagoras-sync-x86_64-linux", "size": 11206656, "sha256": "<hex>"}}}
 ```
 
-next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute.
+next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute. `released` is the time the manifest was made (Unix seconds, now unless `--released` names one); a client refuses a manifest released before the newest one it took (in `~/.local/state/pithagoras-sync/update-released`), so a test folder made again needs a later time, or that file removed.
 
 ## The test machine
 

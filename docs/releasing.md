@@ -9,11 +9,11 @@ A release is a version tag. `.github/workflows/release.yml` then checks the work
 | `pithagoras-sync-x86_64-linux` | Static musl binary, x86_64 |
 | `pithagoras-sync-aarch64-linux` | Static musl binary, aarch64 (built on GitHub's arm64 runner) |
 | `pithagoras-sync-x86_64-windows.exe` | Windows x86_64, with the C runtime linked in |
-| `manifest.json` | The version and, per target (`x86_64-linux`, `aarch64-linux`, `x86_64-windows`), each binary's URL, size and sha256 |
+| `manifest.json` | The version, when it was released (`released`, Unix seconds) and, per target (`x86_64-linux`, `aarch64-linux`, `x86_64-windows`), each binary's URL, size and sha256 |
 | `manifest.json.minisig` | The manifest's signature by the release key |
 | `SHA256SUMS` | Checksums of everything above, for `sha256sum -c` |
 
-Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13).
+Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13). It also keeps the release time of the newest manifest it took and refuses one released before it: whoever can change what the release listing serves, but has no key, cannot hand a client an older signed manifest it already moved past. That does not help a client that never saw the newer one, and a manifest does not expire, so a listing frozen at an old release still verifies; `update --check` shows the release date, which makes a channel that stopped moving visible. Each release must be made later than the one before it, which a release made by the workflow is.
 
 ## One-time setup
 
@@ -55,13 +55,13 @@ sync-release keygen <key file>                     a new key; prints the public 
 sync-release public <key file>                     the public key of a key file
 sync-release sign (--key <key file> | --key-env <VAR>) <file>      writes <file>.minisig
 sync-release verify --public <public key> <file>   checks <file>.minisig
-sync-release manifest --version <x.y.z> [--base-url <url>] --out <file> <binary>=<target>...
+sync-release manifest --version <x.y.z> [--released <unix secs>] [--base-url <url>] --out <file> <binary>=<target>...
 sync-release sums --out <file> <file>...
 ```
 
 The public key and the signatures are in minisign's format (a legacy, not prehashed, Ed25519 signature with a trusted comment); the client checks them with the `minisign-verify` crate, and so does `sync-release verify`. Checking them with the minisign tool itself (`minisign -V -P <public key> -m manifest.json`) should work but was not tried. The secret key file is this tool's own format (the key id and the PKCS#8 key, base64, no password), not minisign's.
 
-A manifest made without `--base-url` names the binaries by file name, relative to the manifest: that is a local release folder, which `pithagoras-sync update --manifest <folder>/manifest.json` takes (testing.md).
+`manifest` writes the current time as `released` unless `--released` gives one. A manifest made without `--base-url` names the binaries by file name, relative to the manifest: that is a local release folder, which `pithagoras-sync update --manifest <folder>/manifest.json` takes (testing.md).
 
 ## What was checked, and what not
 

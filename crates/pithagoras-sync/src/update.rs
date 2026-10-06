@@ -9,6 +9,11 @@
 //! report that version, then it replaces this one in one rename, and the running
 //! client restarts with it. An update touches nothing but the program file: the
 //! config, the policy and the pairing stay as they are.
+//!
+//! The manifest says when it was released (signed with the rest). The client keeps
+//! the newest release time it has taken and refuses a manifest released before it,
+//! so whoever controls the release listing but not the key cannot serve an older
+//! signed manifest again to a client that already saw a newer one.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -42,6 +47,8 @@ const MAX_MANIFEST: usize = 64 << 10;
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: String,
+    /// When the release tool made it (Unix seconds, UTC).
+    pub released: u64,
     /// By target, as `target()` names it (`x86_64-linux`, `x86_64-windows`).
     pub artifacts: BTreeMap<String, Artifact>,
 }
@@ -84,6 +91,15 @@ pub fn verify(data: &[u8], sig: &str, key: &str) -> Result<Manifest, String> {
     serde_json::from_slice(data).map_err(|e| format!("the manifest is unreadable: {e}"))
 }
 
+/// What a checked manifest offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    /// When it was released (Unix seconds).
+    pub released: u64,
+    /// `None` when it offers nothing newer than this build.
+    pub plan: Option<Plan>,
+}
+
 /// What `update` would install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -94,8 +110,15 @@ pub struct Plan {
 }
 
 /// Fetches and checks the manifest at `source` (an https URL, or a local path
-/// for tests and offline updates). `None` when it offers nothing newer.
-pub async fn check(source: &str, key: &str, current: &str) -> Result<Option<Plan>, String> {
+/// for tests and offline updates). `seen` is the file with the newest release
+/// time this client took: a manifest released before it is refused, a newer one
+/// is written there.
+pub async fn check(
+    source: &str,
+    key: &str,
+    current: &str,
+    seen: Option<&Path>,
+) -> Result<Offer, String> {
     let data = fetch(source, MAX_MANIFEST as u64).await?;
     let sig = fetch(&format!("{source}.minisig"), 4096).await?;
     let sig = String::from_utf8(sig).map_err(|_| "the signature is not text".to_string())?;
@@ -103,8 +126,26 @@ pub async fn check(source: &str, key: &str, current: &str) -> Result<Option<Plan
     let new = parse_version(&manifest.version)
         .ok_or_else(|| format!("the manifest's version {:?} is not x.y.z", manifest.version))?;
     let cur = parse_version(current).ok_or("this build's version is not x.y.z")?;
+    if let Some(seen) = seen {
+        let last = read_seen(seen);
+        if manifest.released < last {
+            return Err(format!(
+                "the manifest (version {}, released {}) is older than one this client already took (released {}): an older release is being served again, so nothing is installed",
+                manifest.version,
+                utc(manifest.released),
+                utc(last)
+            ));
+        }
+        if manifest.released > last {
+            write_seen(seen, manifest.released)?;
+        }
+    }
+    let released = manifest.released;
     if new <= cur {
-        return Ok(None);
+        return Ok(Offer {
+            released,
+            plan: None,
+        });
     }
     let t = target();
     let artifact = manifest
@@ -118,11 +159,55 @@ pub async fn check(source: &str, key: &str, current: &str) -> Result<Option<Plan
     if artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("release {}: bad sha256", manifest.version));
     }
-    Ok(Some(Plan {
-        version: manifest.version,
-        source: resolve(source, &artifact.url),
-        artifact,
-    }))
+    Ok(Offer {
+        released,
+        plan: Some(Plan {
+            version: manifest.version,
+            source: resolve(source, &artifact.url),
+            artifact,
+        }),
+    })
+}
+
+/// The newest release time taken so far; 0 when none (or the file is unreadable,
+/// which only weakens this check, never an update's other checks).
+fn read_seen(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_seen(path: &Path, released: u64) -> Result<(), String> {
+    let err =
+        |e: std::io::Error| format!("cannot record the release time in {}: {e}", path.display());
+    if let Some(dir) = path.parent() {
+        sync_policy::private::private_dir(dir).map_err(err)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{released}\n")).map_err(err)?;
+    std::fs::rename(&tmp, path).map_err(err)
+}
+
+/// `secs` as `YYYY-MM-DD HH:MM UTC`.
+pub fn utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rest = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
 }
 
 fn is_url(s: &str) -> bool {
@@ -287,6 +372,13 @@ mod tests {
         if option_env!("PITHAGORAS_SYNC_UPDATE_URL").is_none() {
             assert_eq!(DEFAULT_MANIFEST, STABLE_MANIFEST);
         }
+    }
+
+    #[test]
+    fn release_times_read_as_dates() {
+        assert_eq!(utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc(951_782_400 + 3_660), "2000-02-29 01:01 UTC");
+        assert_eq!(utc(1_791_244_800), "2026-10-06 00:00 UTC");
     }
 
     #[test]

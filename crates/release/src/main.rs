@@ -5,7 +5,7 @@
 //! sync-release public <key file>
 //! sync-release sign (--key <key file> | --key-env <VAR>) <file>
 //! sync-release verify --public <public key> <file>
-//! sync-release manifest --version <x.y.z> [--base-url <url>] --out <file> <binary>=<target>...
+//! sync-release manifest --version <x.y.z> [--released <unix secs>] [--base-url <url>] --out <file> <binary>=<target>...
 //! sync-release sums --out <file> <file>...
 //! ```
 
@@ -19,7 +19,7 @@ const USAGE: &str = "usage:
   sync-release public <key file>
   sync-release sign (--key <key file> | --key-env <VAR>) <file>
   sync-release verify --public <public key> <file>
-  sync-release manifest --version <x.y.z> [--base-url <url>] --out <file> <binary>=<target>...
+  sync-release manifest --version <x.y.z> [--released <unix secs>] [--base-url <url>] --out <file> <binary>=<target>...
   sync-release sums --out <file> <file>...";
 
 fn main() {
@@ -145,7 +145,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{file}: the signature verifies");
         }
         "manifest" => {
-            let (opts, rest) = options(args, &["version", "base-url", "out"])?;
+            let (opts, rest) = options(args, &["version", "released", "base-url", "out"])?;
             let (Some(version), Some(out)) = (opt(&opts, "version"), opt(&opts, "out")) else {
                 return Err(USAGE.into());
             };
@@ -160,9 +160,19 @@ fn run(args: &[String]) -> Result<(), String> {
                 .iter()
                 .map(|(path, target)| Binary { path, target })
                 .collect();
+            // Now unless given: clients refuse a manifest older than one they took.
+            let released = match opt(&opts, "released") {
+                Some(r) => r
+                    .parse()
+                    .map_err(|_| format!("--released {r:?} is not Unix seconds"))?,
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_secs(),
+            };
             write(
                 Path::new(out),
-                &manifest(version, opt(&opts, "base-url"), &binaries)?,
+                &manifest(version, released, opt(&opts, "base-url"), &binaries)?,
             )?;
         }
         "sums" => {

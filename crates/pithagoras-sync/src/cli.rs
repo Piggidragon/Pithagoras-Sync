@@ -846,12 +846,19 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 .as_deref()
                 .unwrap_or(crate::update::DEFAULT_MANIFEST);
             let current = env!("CARGO_PKG_VERSION");
-            let Some(plan) = crate::update::check(source, key, current).await? else {
-                println!("Up to date ({current}).");
+            let offer =
+                crate::update::check(source, key, current, Some(&dirs.update_seen_file())).await?;
+            // The date shows a release listing that stopped moving.
+            let released = crate::update::utc(offer.released);
+            let Some(plan) = offer.plan else {
+                println!("Up to date ({current}; the newest release was made {released}).");
                 return Ok(ExitCode::SUCCESS);
             };
             if check {
-                println!("Version {} is available (this is {current}).", plan.version);
+                println!(
+                    "Version {} is available, released {released} (this is {current}).",
+                    plan.version
+                );
                 return Ok(ExitCode::SUCCESS);
             }
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;

@@ -43,6 +43,7 @@ async fn a_release_in_a_local_folder_replaces_the_running_program() {
     std::fs::write(rel.join("pithagoras-sync-bin"), &binary).unwrap();
     let manifest = json!({
         "version": VERSION,
+        "released": 1_000,
         "artifacts": {
             update::target(): {
                 "url": "pithagoras-sync-bin",
@@ -77,8 +78,10 @@ async fn a_release_in_a_local_folder_replaces_the_running_program() {
     // A path with backslashes: the binary is found beside the manifest.
     let source = rel.join("manifest.json").to_string_lossy().into_owned();
     let result = async {
-        let plan = update::check(&source, &key.public_base64(), "0.0.0")
+        let seen = dir.join(r"state\update-released");
+        let plan = update::check(&source, &key.public_base64(), "0.0.0", Some(&seen))
             .await?
+            .plan
             .ok_or_else(|| "nothing newer".to_string())?;
         update::install(&plan, &exe).await
     }

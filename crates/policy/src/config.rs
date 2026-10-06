@@ -544,6 +544,11 @@ impl Dirs {
         self.state.join("audit.jsonl")
     }
 
+    /// The release time of the newest update manifest this client took.
+    pub fn update_seen_file(&self) -> PathBuf {
+        self.state.join("update-released")
+    }
+
     /// Present while the client is paused by `panic`, until `unlock`.
     pub fn paused_file(&self) -> PathBuf {
         self.state.join("paused")

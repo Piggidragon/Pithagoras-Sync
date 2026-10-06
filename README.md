@@ -96,7 +96,7 @@ pithagoras-sync update --check
 pithagoras-sync update
 ```
 
-`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. Your config and policy stay as they are. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
+`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program and it was not released before one the client already took, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. Your config and policy stay as they are. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 

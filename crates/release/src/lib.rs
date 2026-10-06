@@ -1,6 +1,6 @@
 //! What a release of Pithagoras Sync publishes besides its binaries: the update
-//! manifest (`manifest.json`: the version and, per target, each binary's URL, size
-//! and sha256), its minisign signature by the release key, and `SHA256SUMS`.
+//! manifest (`manifest.json`: the version, when it was released and, per target,
+//! each binary's URL, size and sha256), its minisign signature by the release key, and `SHA256SUMS`.
 //! `pithagoras-sync update` checks the signature against the public key compiled
 //! into the client, then each binary against the manifest (`docs/releasing.md`).
 
@@ -45,11 +45,14 @@ pub struct Binary<'a> {
     pub target: &'a str,
 }
 
-/// The manifest for `binaries`. Each URL is `base_url/<file name>`, or the bare
-/// file name without a base (resolved against the manifest's own location, as for
-/// a release in a local folder).
+/// The manifest for `binaries`, released at `released` (Unix seconds). Each URL is
+/// `base_url/<file name>`, or the bare file name without a base (resolved against
+/// the manifest's own location, as for a release in a local folder). Clients
+/// refuse a manifest released before the newest one they took, so each release
+/// needs a later time than the one before it.
 pub fn manifest(
     version: &str,
+    released: u64,
     base_url: Option<&str>,
     binaries: &[Binary],
 ) -> Result<String, String> {
@@ -92,7 +95,7 @@ pub fn manifest(
             }),
         );
     }
-    let m = serde_json::json!({"version": version, "artifacts": artifacts});
+    let m = serde_json::json!({"version": version, "released": released, "artifacts": artifacts});
     Ok(serde_json::to_string_pretty(&m).map_err(|e| e.to_string())? + "\n")
 }
 
@@ -135,6 +138,7 @@ mod tests {
         std::fs::write(&win, b"windows binary!").unwrap();
         let text = manifest(
             "1.2.3",
+            1_791_244_800,
             Some("https://example.org/releases/download/v1.2.3/"),
             &[
                 Binary {
@@ -150,6 +154,7 @@ mod tests {
         .unwrap();
         let m: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(m["version"], "1.2.3");
+        assert_eq!(m["released"], 1_791_244_800u64);
         let a = &m["artifacts"]["x86_64-linux"];
         assert_eq!(
             a["url"],
@@ -160,6 +165,7 @@ mod tests {
         assert_eq!(m["artifacts"]["x86_64-windows"]["size"], 15);
         let local = manifest(
             "1.2.3",
+            1,
             None,
             &[Binary {
                 path: &linux,
@@ -185,17 +191,18 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         let one = |target| [Binary { path: &f, target }];
         for v in ["v1.2.3", "1.2", "1.2.3-rc1"] {
-            assert!(manifest(v, None, &one("x86_64-linux")).is_err(), "{v}");
+            assert!(manifest(v, 1, None, &one("x86_64-linux")).is_err(), "{v}");
         }
         for t in ["x86_64", "x86_64-linux-musl", "X86_64-Linux", ""] {
-            assert!(manifest("1.2.3", None, &one(t)).is_err(), "{t}");
+            assert!(manifest("1.2.3", 1, None, &one(t)).is_err(), "{t}");
         }
-        assert!(manifest("1.2.3", None, &[]).is_err());
+        assert!(manifest("1.2.3", 1, None, &[]).is_err());
         let empty = dir.path().join("empty");
         std::fs::write(&empty, b"").unwrap();
         assert!(
             manifest(
                 "1.2.3",
+                1,
                 None,
                 &[Binary {
                     path: &empty,
