@@ -234,12 +234,14 @@ pub fn is_root() -> bool {
 
 /// Restarts the system unit when its process runs the file that was at `exe`
 /// before (`replaced`: this update just replaced it), and says what happened.
-fn restart_unit(exe: &Path, replaced: bool) {
+fn restart_unit(exe: &Path, replaced: bool, restarting: Option<u32>) {
     #[cfg(target_os = "linux")]
     let look = |pid| crate::update::what_runs(pid, exe);
     #[cfg(not(target_os = "linux"))]
     let look = |_| None;
-    if let Some(said) = crate::update::restart_system_unit(&actions::System, exe, replaced, look) {
+    if let Some(said) =
+        crate::update::restart_system_unit(&actions::System, exe, replaced, restarting, look)
+    {
         println!("{said}");
     }
 }
@@ -951,10 +953,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             // logon task starts again, not necessarily the one run here (a
             // download, while the installed copy is not on PATH).
             let running = match control::send(&dirs.socket(), Request::Status).await {
-                Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version)),
+                Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version, s.pid)),
                 _ => None,
             };
-            let running = running.as_ref().map(|(p, v)| (p.as_path(), v.as_str()));
+            // This user's client's process, for the system unit's restart below.
+            let running_pid = running.as_ref().map(|r| r.2);
+            let running = running.as_ref().map(|(p, v, _)| (p.as_path(), v.as_str()));
             // As root, the program of the system unit (`setup`'s dedicated user),
             // whose client root cannot reach over its control socket.
             let system = if cfg!(target_os = "linux") && is_root() {
@@ -997,6 +1001,10 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 crate::update::check(source, key, &current, &[&records[0], &records[1]]).await?;
             // The date shows a release listing that stopped moving.
             let released = crate::update::utc(offer.released);
+            // The process of this user's client once it was asked to restart: it
+            // may be the system unit's own (a unit for root), which then needs
+            // no second restart.
+            let mut restarting = None;
             let Some(plan) = offer.plan else {
                 // The file is current, but this user's client may still run the
                 // one it replaced (`install` run again from a newer download).
@@ -1015,6 +1023,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                             control::send(&dirs.socket(), Request::Restart).await,
                             Ok(Some(r)) if r.ok
                         ) {
+                            restarting = running_pid;
                             println!(
                                 "It restarts with the current program (its unit or logon task starts it again)."
                             );
@@ -1028,7 +1037,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 // The file is current, but the unit may still run the one it
                 // replaced (an update whose restart failed, or a copy by hand).
                 if unit_runs_exe && !check {
-                    restart_unit(&exe, false);
+                    restart_unit(&exe, false, restarting);
                 }
                 return Ok(ExitCode::SUCCESS);
             };
@@ -1057,9 +1066,13 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 println!(
                     "The running client restarts with it (its unit or logon task starts it again)."
                 );
-            } else if unit_runs_exe {
-                restart_unit(&exe, true);
-            } else {
+                restarting = running_pid;
+            }
+            // Root's own client and the dedicated user's unit may run the same
+            // file: both restart.
+            if unit_runs_exe {
+                restart_unit(&exe, true, restarting);
+            } else if !restarted {
                 println!(
                     "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
                 );

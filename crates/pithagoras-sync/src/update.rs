@@ -399,7 +399,8 @@ fn only_owner_changes(
 /// when its process runs the file that was at `exe` before (`look` tells what
 /// it runs; when it cannot, `replaced` says whether this update replaced the
 /// file). A system unit's client cannot be asked to restart itself (its control
-/// socket answers its own user only), so systemd does it. A unit that runs
+/// socket answers its own user only), so systemd does it, unless its process is
+/// `restarting` (this user's client, already asked to restart). A unit that runs
 /// another program is left alone and the owner told, so `update` never restarts
 /// it over and over without effect. What happened, for the owner; `None` when
 /// there is nothing to say.
@@ -407,6 +408,7 @@ pub fn restart_system_unit(
     runner: &dyn Runner,
     exe: &Path,
     replaced: bool,
+    restarting: Option<u32>,
     look: impl Fn(u32) -> Option<Runs>,
 ) -> Option<String> {
     let pid = runner
@@ -429,6 +431,9 @@ pub fn restart_system_unit(
             )
         });
     };
+    if restarting == Some(pid) {
+        return None;
+    }
     match look(pid) {
         Some(Runs::Replaced) => {}
         None if replaced => {}
@@ -777,7 +782,7 @@ mod tests {
         // replaced it.
         for replaced in [true, false] {
             let r = runner("4242");
-            let said = restart_system_unit(&r, exe, replaced, |pid| {
+            let said = restart_system_unit(&r, exe, replaced, None, |pid| {
                 (pid == 4242).then_some(Runs::Replaced)
             })
             .unwrap();
@@ -794,24 +799,24 @@ mod tests {
         // Running the file as it is: left alone.
         let r = runner("4242");
         assert_eq!(
-            restart_system_unit(&r, exe, false, |_| Some(Runs::Same)),
+            restart_system_unit(&r, exe, false, None, |_| Some(Runs::Same)),
             None
         );
         assert_eq!(restarts(&r), 0);
         // What it runs cannot be told: restarted only after a replace.
         let r = runner("4242");
-        assert_eq!(restart_system_unit(&r, exe, false, |_| None), None);
+        assert_eq!(restart_system_unit(&r, exe, false, None, |_| None), None);
         assert_eq!(restarts(&r), 0);
         let r = runner("4242");
-        assert!(restart_system_unit(&r, exe, true, |_| None).is_some());
+        assert!(restart_system_unit(&r, exe, true, None, |_| None).is_some());
         assert_eq!(restarts(&r), 1);
         // Not running: said after a replace, nothing restarted.
         let r = runner("0");
-        let said = restart_system_unit(&r, exe, true, |_| Some(Runs::Replaced)).unwrap();
+        let said = restart_system_unit(&r, exe, true, None, |_| Some(Runs::Replaced)).unwrap();
         assert!(said.contains("is not running"), "{said}");
         assert_eq!(restarts(&r), 0);
         assert_eq!(
-            restart_system_unit(&runner("0"), exe, false, |_| None),
+            restart_system_unit(&runner("0"), exe, false, None, |_| None),
             None
         );
         // The restart fails: the owner is told how to do it.
@@ -822,11 +827,29 @@ mod tests {
             ],
             ..Default::default()
         };
-        let said = restart_system_unit(&r, exe, true, |_| Some(Runs::Replaced)).unwrap();
+        let said = restart_system_unit(&r, exe, true, None, |_| Some(Runs::Replaced)).unwrap();
         assert!(
             said.contains("sudo systemctl restart pithagoras-sync.service"),
             "{said}"
         );
+    }
+
+    #[test]
+    fn a_unit_whose_client_restarts_by_itself_is_not_restarted_again() {
+        let exe = Path::new("/usr/local/bin/pithagoras-sync");
+        let r = crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok("4242\n".into()))],
+            ..Default::default()
+        };
+        // Root's own client, run by a unit for root, took the request itself.
+        assert_eq!(
+            restart_system_unit(&r, exe, true, Some(4242), |_| Some(Runs::Replaced)),
+            None
+        );
+        // Another process (the dedicated user's client): restarted as well.
+        let said =
+            restart_system_unit(&r, exe, true, Some(1111), |_| Some(Runs::Replaced)).unwrap();
+        assert!(said.starts_with("Restarted"), "{said}");
     }
 
     #[test]
@@ -839,7 +862,7 @@ mod tests {
         // Neither after a replace nor when nothing was replaced: restarting would
         // not make it run `exe`, so every `update` would restart it again.
         for replaced in [true, false] {
-            let said = restart_system_unit(&r, exe, replaced, |_| {
+            let said = restart_system_unit(&r, exe, replaced, None, |_| {
                 Some(Runs::Other(PathBuf::from("/opt/ps/pithagoras-sync")))
             })
             .unwrap();
