@@ -641,7 +641,9 @@ pub fn restart_system_unit(
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|p| *p != 0);
     let Some(pid) = pid else {
-        return replaced.then(|| {
+        // A client that was just asked to restart has exited, and systemd
+        // starts it again after RestartSec: no main process meanwhile.
+        return (replaced && restarting.is_none()).then(|| {
             format!(
                 "{UNIT_NAME} is not running; it starts {} as it is now when it starts.",
                 exe.display()
@@ -1264,6 +1266,21 @@ mod tests {
         let said =
             restart_system_unit(&r, exe, true, Some(1111), |_| Some(Runs::Replaced)).unwrap();
         assert!(said.starts_with("Restarted"), "{said}");
+    }
+
+    #[test]
+    fn a_unit_whose_client_is_restarting_is_not_called_stopped() {
+        let exe = Path::new("/usr/local/bin/pithagoras-sync");
+        let r = crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok("0\n".into()))],
+            ..Default::default()
+        };
+        // Root's own client, run by the unit, exited to restart: MainPID is 0
+        // until systemd starts it again.
+        assert_eq!(
+            restart_system_unit(&r, exe, true, Some(4242), |_| None),
+            None
+        );
     }
 
     #[test]
