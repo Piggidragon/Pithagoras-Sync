@@ -412,7 +412,11 @@ async fn windows_purge_removes_what_the_client_left_but_the_program() {
     for f in ["client.log", "update-released", "logon-task.xml"] {
         std::fs::write(state.join(f), "1").unwrap();
     }
-    let programs = env.home.join("AppData/Local/Programs/pithagoras-sync");
+    // Spelled as the client builds it from LOCALAPPDATA, for the output below.
+    let programs = env
+        .home
+        .join("AppData/Local")
+        .join(r"Programs\pithagoras-sync");
     std::fs::create_dir_all(&programs).unwrap();
     let program = programs.join("pithagoras-sync.exe");
     let old = programs.join("pithagoras-sync.exe.old");
