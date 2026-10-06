@@ -458,6 +458,9 @@ fn status_text(s: &Status) -> String {
             let _ = writeln!(out, "Portal:    not paired");
         }
     }
+    if s.portal.is_some() && !s.token_storage.is_empty() {
+        let _ = writeln!(out, "Token:     kept in the {}", s.token_storage);
+    }
     let _ = writeln!(
         out,
         "Link:      {state}{}",
@@ -525,6 +528,102 @@ fn status_text(s: &Status) -> String {
     let _ = writeln!(out, "Config:    {}", visible(&s.config_file));
     let _ = writeln!(out, "Audit log: {}", visible(&s.audit_file));
     out
+}
+
+/// Where this config keeps the connector token.
+pub fn token_store(dirs: &Dirs, cfg: &DeviceConfig) -> sync_connector::token::TokenStore {
+    sync_connector::token::TokenStore::new(
+        dirs.token_file(),
+        cfg.token_storage,
+        sync_policy::keyring::system(),
+    )
+}
+
+/// What a pairing did, for `pair` to print and the GUI to show.
+pub struct Paired {
+    pub portal: sync_policy::PortalConfig,
+    pub mode: Mode,
+    pub folders_empty: bool,
+    /// The running client took the new pairing.
+    pub running: bool,
+    /// Said once to the owner: where the token went when the keyring failed.
+    pub notes: Vec<String>,
+}
+
+/// Pairs with the portal of `uri` and keeps the pairing: the code behind `pair`
+/// and the link handler. The caller has checked that the owner makes the change
+/// and passes the config it read then.
+pub async fn pair_device(
+    dirs: &Dirs,
+    mut cfg: DeviceConfig,
+    uri: &str,
+    name: Option<String>,
+) -> Result<Paired, String> {
+    let name = name
+        .or_else(|| cfg.portal.as_ref().map(|p| p.name.clone()))
+        .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
+    let paired = pair::pair(uri, &name).await?;
+    let notes = token_store(dirs, &cfg)
+        .save(&paired.token)
+        .await?
+        .into_iter()
+        .collect();
+    cfg.portal = Some(paired.portal.clone());
+    cfg.save(&dirs.config_file())?;
+    let running = matches!(
+        control::send(&dirs.socket(), Request::Reload).await,
+        Ok(Some(_))
+    );
+    Ok(Paired {
+        portal: paired.portal,
+        mode: cfg.policy.mode,
+        folders_empty: cfg.policy.folders.is_empty(),
+        running,
+        notes,
+    })
+}
+
+/// What `pair` says about a plain-http portal.
+pub fn http_note(url: &str) -> Option<String> {
+    url.starts_with("http://").then(|| {
+        format!(
+            "Note: plain http trusts whoever answers on the portal's port on this machine.{}",
+            if cfg!(target_os = "linux") {
+                " The client talks only to a program of this user or root there; a portal that runs as another user needs https."
+            } else {
+                " Any local account that listens there while the portal is down gets the token: on a machine shared with other accounts, use https."
+            }
+        )
+    })
+}
+
+/// What to do next in this mode, after pairing.
+pub fn mode_hint(mode: Mode, folders_empty: bool) -> Option<&'static str> {
+    match mode {
+        Mode::Ask => Some(
+            "Every call waits for your approval (in the portal, or `pithagoras-sync approve`). To let it work in folders of your choice: pithagoras-sync folder add <path> --rw --exec, then pithagoras-sync mode folders.",
+        ),
+        Mode::Folders if folders_empty => Some(
+            "Grant a folder next: pithagoras-sync folder add <path> --rw --exec (nothing is reachable until then).",
+        ),
+        _ => None,
+    }
+}
+
+/// How to start a client that does not run yet: the unit `setup` or `install`
+/// made for this user, if any.
+fn start_hint() -> String {
+    let linux = cfg!(target_os = "linux");
+    let system = linux
+        .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
+        .flatten();
+    let user_unit = linux
+        && info::home().is_some_and(|h| {
+            h.join(".config/systemd/user")
+                .join(install::UNIT_NAME)
+                .is_file()
+        });
+    install::start_hint(system.as_deref(), &info::user().0, user_unit)
 }
 
 /// Sends a request to the running client and wants an answer.
@@ -742,13 +841,20 @@ async fn set_elevation(dirs: &Dirs, to: Elevation) -> Result<(), String> {
 }
 
 /// Whether a password is stored: the running client holds one, or (when the
-/// client is not running) the file is there and the client will load it, which it
-/// does only with file storage.
+/// client is not running) the file or the keyring has one the client will load,
+/// which it does only with file or keyring storage.
 async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
     Ok(
         match control::send(&dirs.socket(), Request::Status).await? {
             Some(r) => r.status.is_some_and(|s| s.elevation_password),
-            None => storage == SecretStorage::File && crate::secrets::file(dirs).exists(),
+            None => match storage {
+                SecretStorage::Memory => false,
+                SecretStorage::File => crate::secrets::file(dirs).exists(),
+                SecretStorage::Keyring => sync_policy::keyring::system()
+                    .get(crate::secrets::ELEVATION)
+                    .await
+                    .is_ok_and(|s| s.is_some()),
+            },
         },
     )
 }
@@ -777,8 +883,10 @@ async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
     {
         Some(r) if r.ok => println!("Password stored in the client."),
         Some(r) => return Err(r.error.unwrap_or_default()),
-        None if load_config(dirs)?.policy.privilege.secret_storage == SecretStorage::File => {
-            secrets::save(&secrets::file(dirs), &value)?;
+        None if load_config(dirs)?.policy.privilege.secret_storage != SecretStorage::Memory => {
+            let storage = load_config(dirs)?.policy.privilege.secret_storage;
+            let keyring = sync_policy::keyring::system();
+            secrets::store(dirs, storage, keyring.as_ref(), &value).await?;
             println!("Password stored for the client's next start.");
         }
         None => {
@@ -866,7 +974,11 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
             {
                 Some(r) if !r.ok => return Err(r.error.unwrap_or_default()),
                 Some(_) => {}
-                None => secrets::remove(&secrets::file(dirs))?,
+                None => {
+                    let storage = load_config(dirs)?.policy.privilege.secret_storage;
+                    let keyring = sync_policy::keyring::system();
+                    secrets::forget(dirs, storage, keyring.as_ref()).await?;
+                }
             }
             println!("Password forgotten.");
             let cfg = load_config(dirs)?;
@@ -916,10 +1028,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Cmd::Pair { uri, name } => {
-            let mut cfg = owner_edit(&dirs).await?;
-            let name = name
-                .or_else(|| cfg.portal.as_ref().map(|p| p.name.clone()))
-                .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
+            let cfg = owner_edit(&dirs).await?;
             if let Some(old) = &cfg.portal {
                 println!("Replacing the pairing with {}.", old.url);
             }
@@ -929,66 +1038,35 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     root_warning(cfg!(windows), cfg.policy.privilege.allow_root)
                 );
             }
-            let paired = pair::pair(&uri, &name).await?;
-            pair::save_token(&dirs.token_file(), &paired.token)?;
-            cfg.portal = Some(paired.portal.clone());
-            cfg.save(&dirs.config_file())?;
+            let done = pair_device(&dirs, cfg, &uri, name).await?;
+            for n in &done.notes {
+                eprintln!("note: {n}");
+            }
+            let p = &done.portal;
             println!(
                 "Paired with {} as {} (device {}).",
-                paired.portal.url, paired.portal.name, paired.portal.device_id
+                p.url, p.name, p.device_id
             );
-            if paired.portal.url.starts_with("http://") {
-                println!(
-                    "Note: plain http trusts whoever answers on the portal's port on this machine.{}",
-                    if cfg!(target_os = "linux") {
-                        " The client talks only to a program of this user or root there; a portal that runs as another user needs https."
-                    } else {
-                        " Any local account that listens there while the portal is down gets the token: on a machine shared with other accounts, use https."
-                    }
-                );
+            if let Some(n) = http_note(&p.url) {
+                println!("{n}");
             }
-            println!("Mode: {:?}.", cfg.policy.mode);
-            if cfg.policy.mode == Mode::Ask {
-                println!(
-                    "Every call waits for your approval (in the portal, or `pithagoras-sync approve`). To let it work in folders of your choice: pithagoras-sync folder add <path> --rw --exec, then pithagoras-sync mode folders."
-                );
-            } else if cfg.policy.mode == Mode::Folders && cfg.policy.folders.is_empty() {
-                println!(
-                    "Grant a folder next: pithagoras-sync folder add <path> --rw --exec (nothing is reachable until then)."
-                );
+            println!("Mode: {:?}.", done.mode);
+            if let Some(n) = mode_hint(done.mode, done.folders_empty) {
+                println!("{n}");
             }
-            match control::send(&dirs.socket(), Request::Reload).await {
-                Ok(Some(_)) => println!("The running client connects now."),
-                _ => {
-                    // The unit `setup` or `install` made for this user, if any.
-                    let linux = cfg!(target_os = "linux");
-                    let system = linux
-                        .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
-                        .flatten();
-                    let user_unit = linux
-                        && info::home().is_some_and(|h| {
-                            h.join(".config/systemd/user")
-                                .join(install::UNIT_NAME)
-                                .is_file()
-                        });
-                    println!(
-                        "{}",
-                        install::start_hint(system.as_deref(), &info::user().0, user_unit)
-                    );
-                }
+            if done.running {
+                println!("The running client connects now.");
+            } else {
+                println!("{}", start_hint());
             }
         }
         Cmd::Unpair => {
             owner::not_from_own_command(&dirs).await?;
             let mut cfg = DeviceConfig::load(&dirs.config_file())?;
+            let tokens = token_store(&dirs, &cfg);
             cfg.portal = None;
             cfg.save(&dirs.config_file())?;
-            match std::fs::remove_file(dirs.token_file()) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(format!("{}: {e}", dirs.token_file().display()));
-                }
-                _ => {}
-            }
+            tokens.delete().await?;
             reload_running(&dirs).await;
             println!("Unpaired. Remove the device in the portal as well.");
         }
@@ -1007,7 +1085,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 } else {
                     println!("pithagoras-sync is not running.");
                     match &cfg.portal {
-                        Some(p) => println!("Paired with {} as {}.", p.url, p.name),
+                        Some(p) => println!(
+                            "Paired with {} as {} (token kept in the {}).",
+                            p.url,
+                            p.name,
+                            token_store(&dirs, &cfg).describe()
+                        ),
                         None => println!("Not paired."),
                     }
                     println!(
@@ -1156,7 +1239,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let cfg = owner_edit(&dirs).await?;
             let next = config_cmd::edit(&cfg, &key, op, now_ms())?;
-            next.save(&dirs.config_file())?;
+            if key == "token_storage" {
+                // The token moves with the setting: to its new place first, then
+                // the setting, then away from the old place.
+                let from = token_store(&dirs, &cfg);
+                let to = token_store(&dirs, &next);
+                if let Some(n) = from.switch(&to, || next.save(&dirs.config_file())).await? {
+                    eprintln!("note: {n}");
+                }
+            } else {
+                next.save(&dirs.config_file())?;
+            }
             let v = config_cmd::get(&next, Some(&key))?;
             println!("{key} = {v}");
             if key == "profile" {
@@ -1666,9 +1759,14 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     let running = control::send(&dirs.socket(), Request::Status)
         .await?
         .and_then(|r| r.status);
-    let portal = DeviceConfig::load(&dirs.config_file())
-        .ok()
-        .and_then(|c| c.portal);
+    let config = DeviceConfig::load(&dirs.config_file()).ok();
+    let portal = config.as_ref().and_then(|c| c.portal.clone());
+    // What the keyring keeps for the client, where the config puts it there.
+    let tokens = config.as_ref().map(|c| token_store(dirs, c));
+    let keyring_token = tokens.as_ref().is_some_and(|t| t.uses_keyring());
+    let keyring_password = config.as_ref().is_some_and(|c| {
+        c.policy.privilege.secret_storage == sync_policy::config::SecretStorage::Keyring
+    });
 
     let mut notes = Vec::new();
     if let Some(p) = &portal {
@@ -1715,6 +1813,8 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
         && uninstall.is_empty()
         && found.is_empty()
         && olds.is_empty()
+        && !keyring_token
+        && !keyring_password
     {
         println!("Nothing to remove.");
         for n in &notes {
@@ -1741,6 +1841,12 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     }
     for p in &olds {
         println!("  - remove {}", p.display());
+    }
+    if keyring_token {
+        println!("  - remove the connector token from the keyring");
+    }
+    if keyring_password {
+        println!("  - remove the elevation password from the keyring");
     }
     for f in &found.folders {
         println!(
@@ -1773,6 +1879,20 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     let found = crate::purge::find(dirs).map_err(after_stop)?;
     apply_plan(&uninstall).map_err(after_stop)?;
     deleted.set(true);
+    // The keyring first: the config that says what is there goes with the files.
+    if let Some(t) = tokens.as_ref().filter(|_| keyring_token) {
+        t.delete().await.map_err(after_stop)?;
+    }
+    if keyring_password {
+        let keyring = sync_policy::keyring::system();
+        crate::secrets::forget(
+            dirs,
+            sync_policy::config::SecretStorage::Keyring,
+            keyring.as_ref(),
+        )
+        .await
+        .map_err(after_stop)?;
+    }
     for p in &olds {
         match std::fs::remove_file(p) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -2040,6 +2160,7 @@ mod tests {
             portal_policy: "write".into(),
             elevation: "off".into(),
             elevation_password: false,
+            token_storage: "file".into(),
             running_commands: 0,
             cgroups: false,
             landlock: true,

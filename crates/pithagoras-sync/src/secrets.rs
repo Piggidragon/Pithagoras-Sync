@@ -1,19 +1,24 @@
 //! The elevation secret on the device: typed in a terminal (`sudo
-//! set`), handed to the running client over the control channel, and kept either
-//! in the client's memory only (the default; panic and restarts forget it) or in
-//! a file only this user can read. It never goes to the portal, into a
-//! command's argv or environment, the audit log or the client's own log.
+//! set`), handed to the running client over the control channel, and kept in the
+//! client's memory only (the default; panic and restarts forget it), in a file
+//! only this user can read, or in the OS keyring (`secret_storage = keyring`,
+//! Linux). It never goes to the portal, into a command's argv or environment, the
+//! audit log or the client's own log.
 //!
-//! The OS keyring is not used: a keyring unlocked for this user gives the secret to
-//! every process of the user, which is what a 0600 file does as well, and a server
-//! has none. Memory is the safer place: the client makes itself undumpable, so other
-//! processes of the user cannot read it there.
+//! Memory is the default because it is the only place other processes of the user
+//! cannot read: the client makes itself undumpable. A keyring unlocked for this
+//! user, like a 0600 file, gives the secret to any unconfined process of the user,
+//! and a server has none; it is there for owners who want the password to survive
+//! a restart without a file. A keyring the owner chose never falls back to the
+//! file or to memory: no keyring, a locked one or a cancelled prompt is an error.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use sync_policy::Dirs;
+use sync_policy::config::SecretStorage;
+use sync_policy::keyring::SecretStore;
 use sync_policy::secret::{Secret, SecretSlot};
 
 /// The only secret there is.
@@ -83,6 +88,63 @@ pub fn remove(path: &Path) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// The stored password, wherever `storage` keeps it; memory keeps none on disk.
+pub async fn load_stored(
+    dirs: &Dirs,
+    storage: SecretStorage,
+    keyring: &dyn SecretStore,
+) -> Result<Option<Secret>, String> {
+    match storage {
+        SecretStorage::Memory => Ok(None),
+        SecretStorage::File => load(&file(dirs)),
+        SecretStorage::Keyring => {
+            let s = keyring
+                .get(ELEVATION)
+                .await
+                .map_err(|e| format!("not loaded from the keyring: {e}"))?;
+            if let Some(s) = &s {
+                check(s.expose())?;
+            }
+            Ok(s)
+        }
+    }
+}
+
+/// Keeps the password where `storage` says (nothing to do for memory).
+pub async fn store(
+    dirs: &Dirs,
+    storage: SecretStorage,
+    keyring: &dyn SecretStore,
+    value: &Secret,
+) -> Result<(), String> {
+    match storage {
+        SecretStorage::Memory => Ok(()),
+        SecretStorage::File => save(&file(dirs), value),
+        SecretStorage::Keyring => keyring
+            .set(ELEVATION, value)
+            .await
+            .map_err(|e| format!("cannot keep the password in the keyring: {e}")),
+    }
+}
+
+/// Forgets the stored password: the file always (an old one may be left from
+/// another storage), the keyring entry where the keyring keeps it. Memory
+/// storage leaves the keyring alone, so it never asks to unlock one.
+pub async fn forget(
+    dirs: &Dirs,
+    storage: SecretStorage,
+    keyring: &dyn SecretStore,
+) -> Result<(), String> {
+    remove(&file(dirs))?;
+    if storage == SecretStorage::Keyring {
+        keyring
+            .delete(ELEVATION)
+            .await
+            .map_err(|e| format!("cannot remove the password from the keyring: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Reads a line from the terminal without echoing it. Never from a command line or
@@ -270,6 +332,42 @@ mod tests {
         assert_eq!(scrubbed_for_log(b"a pw1 b".to_vec()), b"a pw1 b");
         slot.set(Secret::new("pw1".into()));
         assert_eq!(scrubbed_for_log(b"a pw1 b".to_vec()), b"a [redacted] b");
+    }
+
+    #[tokio::test]
+    async fn the_keyring_keeps_the_password_only_when_chosen() {
+        use sync_policy::keyring::FakeStore;
+        let t = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(t.path());
+        let ks = FakeStore::default();
+        let pw = Secret::new("pw one".into());
+        store(&dirs, SecretStorage::Keyring, &ks, &pw)
+            .await
+            .unwrap();
+        assert!(!file(&dirs).exists(), "nothing on disk");
+        let got = load_stored(&dirs, SecretStorage::Keyring, &ks).await;
+        assert_eq!(got.unwrap().unwrap().expose(), "pw one");
+        // Memory storage neither reads nor clears the keyring.
+        assert_eq!(
+            load_stored(&dirs, SecretStorage::Memory, &ks).await,
+            Ok(None)
+        );
+        forget(&dirs, SecretStorage::Memory, &ks).await.unwrap();
+        assert!(ks.entries.lock().unwrap().contains_key(ELEVATION));
+        // A keyring that fails is an error, never the file or nothing.
+        *ks.fail.lock().unwrap() = Some("the prompt was cancelled".into());
+        let e = load_stored(&dirs, SecretStorage::Keyring, &ks)
+            .await
+            .unwrap_err();
+        assert!(e.contains("cancelled"), "{e}");
+        let e = store(&dirs, SecretStorage::Keyring, &ks, &pw)
+            .await
+            .unwrap_err();
+        assert!(e.contains("cancelled"), "{e}");
+        assert!(!file(&dirs).exists());
+        *ks.fail.lock().unwrap() = None;
+        forget(&dirs, SecretStorage::Keyring, &ks).await.unwrap();
+        assert!(ks.entries.lock().unwrap().is_empty());
     }
 
     #[test]

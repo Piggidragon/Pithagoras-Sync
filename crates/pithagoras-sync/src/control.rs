@@ -83,6 +83,10 @@ pub struct Status {
     /// Whether the client holds the elevation password now (for `sudo status`).
     #[serde(default)]
     pub elevation_password: bool,
+    /// Where the connector token is kept: `file`, `keyring`, or the keyring as
+    /// this platform's default.
+    #[serde(default)]
+    pub token_storage: String,
     pub running_commands: usize,
     pub cgroups: bool,
     pub landlock: bool,

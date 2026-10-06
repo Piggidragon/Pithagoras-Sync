@@ -64,6 +64,9 @@ impl Env {
             .env("TMP", self.root.join("tmp"))
             // A secret in the client's own environment must not reach commands.
             .env("PORTAL_SECRET", "must-not-leak")
+            // The token stays in the test's own files, out of the machine's
+            // Credential Manager (the Windows default falls back to the file).
+            .env("PITHAGORAS_SYNC_NO_KEYRING", "1")
             .stdin(Stdio::null())
             .kill_on_drop(true);
         c

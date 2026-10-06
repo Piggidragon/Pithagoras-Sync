@@ -3,6 +3,7 @@
 //! them. Values are JSON where they parse as JSON, text otherwise.
 
 use serde_json::Value;
+use sync_policy::config::SecretStorage;
 use sync_policy::{DeviceConfig, Mode};
 
 pub enum Op {
@@ -31,9 +32,13 @@ fn lookup<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 fn check_key(key: &str) -> Result<(), String> {
     match key.split('.').next() {
         Some("portal") => Err("the pairing changes with `pair` and `unpair`".into()),
-        Some("profile" | "portal_policy" | "policy" | "exec") if !key.is_empty() => Ok(()),
+        Some("profile" | "portal_policy" | "token_storage" | "policy" | "exec")
+            if !key.is_empty() =>
+        {
+            Ok(())
+        }
         _ => Err(format!(
-            "{key}: settings start with policy., exec., portal_policy or profile"
+            "{key}: settings start with policy., exec., portal_policy, token_storage or profile"
         )),
     }
 }
@@ -53,6 +58,17 @@ pub fn get(cfg: &DeviceConfig, key: Option<&str>) -> Result<Value, String> {
 
 /// The config with one setting changed, checked as a whole.
 pub fn edit(cfg: &DeviceConfig, key: &str, op: Op, now_ms: i64) -> Result<DeviceConfig, String> {
+    edit_on(cfg, key, op, now_ms, cfg!(windows))
+}
+
+/// `edit` as on Windows (`windows`) or Linux.
+pub fn edit_on(
+    cfg: &DeviceConfig,
+    key: &str,
+    op: Op,
+    now_ms: i64,
+    windows: bool,
+) -> Result<DeviceConfig, String> {
     check_key(key)?;
     let mut v = as_value(cfg)?;
     let default = as_value(&DeviceConfig::default())?;
@@ -113,6 +129,15 @@ pub fn edit(cfg: &DeviceConfig, key: &str, op: Op, now_ms: i64) -> Result<Device
     } else {
         next.policy.full.until_ms = None;
     }
+    // The password in the keyring is for sudo, which Windows has not.
+    if windows
+        && next.policy.privilege.secret_storage == SecretStorage::Keyring
+        && cfg.policy.privilege.secret_storage != SecretStorage::Keyring
+    {
+        return Err(
+            "policy.privilege.secret_storage = keyring is Linux only: Windows has no sudo, so there is no password to keep".into(),
+        );
+    }
     next.policy.validate(next.profile)?;
     next.exec.validate()?;
     Ok(next)
@@ -163,5 +188,28 @@ mod tests {
             );
         }
         assert!(edit(&cfg, "policy.mode", Op::Add(parse_value("x")), 0).is_err());
+    }
+
+    #[test]
+    fn token_storage_is_a_setting_of_its_own() {
+        use sync_policy::config::TokenStorage;
+        let cfg = DeviceConfig::default();
+        assert_eq!(get(&cfg, Some("token_storage")).unwrap(), Value::Null);
+        let c = edit(&cfg, "token_storage", Op::Set(parse_value("keyring")), 0).unwrap();
+        assert_eq!(c.token_storage, Some(TokenStorage::Keyring));
+        let c = edit(&c, "token_storage", Op::Unset, 0).unwrap();
+        assert_eq!(c.token_storage, None);
+        assert!(edit(&c, "token_storage", Op::Set(parse_value("wallet")), 0).is_err());
+    }
+
+    #[test]
+    fn the_password_keyring_is_refused_on_windows() {
+        let cfg = DeviceConfig::default();
+        let key = "policy.privilege.secret_storage";
+        let e = edit_on(&cfg, key, Op::Set(parse_value("keyring")), 0, true).unwrap_err();
+        assert!(e.contains("Linux only"), "{e}");
+        assert!(edit_on(&cfg, key, Op::Set(parse_value("file")), 0, true).is_ok());
+        let c = edit_on(&cfg, key, Op::Set(parse_value("keyring")), 0, false).unwrap();
+        assert_eq!(c.policy.privilege.secret_storage, SecretStorage::Keyring);
     }
 }

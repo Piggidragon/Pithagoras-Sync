@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::control::{self, Reply, Request, Status};
+use sync_connector::token::TokenStore;
 use sync_policy::config::{Elevation, SecretStorage};
+use sync_policy::keyring::SecretStore;
 use sync_policy::secret::Secret;
 
 pub struct Daemon {
@@ -32,6 +34,11 @@ pub struct Daemon {
     /// an update).
     restart: tokio::sync::Notify,
     restarting: std::sync::atomic::AtomicBool,
+    /// The OS keyring, for a token or password kept there.
+    keyring: Arc<dyn SecretStore>,
+    /// Why the stored password could not be loaded from the keyring, for
+    /// `status`; cleared once it is set or loaded.
+    secret_error: std::sync::Mutex<Option<String>>,
 }
 
 /// With `approvals.desktop_notifications` on a Linux desktop: each approval is also
@@ -188,13 +195,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     );
     crate::secrets::scrub_log_with(device.secrets.clone());
     device.engine.seal(vec![crate::secrets::file(&dirs)]);
-    if cfg.policy.privilege.secret_storage == SecretStorage::File {
-        match crate::secrets::load(&crate::secrets::file(&dirs)) {
-            Ok(Some(s)) => device.secrets.set(s),
-            Ok(None) => {}
-            Err(e) => warn!("elevation password not loaded: {e}"),
-        }
-    }
+    let keyring = sync_policy::keyring::system();
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
         cfg.profile,
@@ -227,7 +228,10 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         approvals,
         restart: tokio::sync::Notify::new(),
         restarting: std::sync::atomic::AtomicBool::new(false),
+        keyring,
+        secret_error: std::sync::Mutex::new(None),
     });
+
     let (shutdown_tx, shutdown) = watch::channel(false);
     let control = tokio::spawn(serve_control(
         daemon.clone(),
@@ -241,6 +245,16 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         status_tx,
         shutdown.clone(),
     ));
+    // After the control channel is up: a keyring may ask the owner to unlock it,
+    // and `panic` must reach the client meanwhile.
+    let loader = daemon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = loader.load_stored_secret().await {
+            warn!(
+                "elevation password {e}; sudo commands run without it until `pithagoras-sync unlock` or `sudo set`"
+            );
+        }
+    });
     wait_for_signals(&daemon).await;
     info!("shutting down");
     shutdown_tx.send_replace(true);
@@ -342,11 +356,20 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
 }
 
 impl Daemon {
-    fn link_config(&self) -> Result<Option<LinkConfig>, String> {
-        let Some(portal) = self.store.config().portal else {
+    fn tokens(&self, cfg: &DeviceConfig) -> TokenStore {
+        TokenStore::new(
+            self.dirs.token_file(),
+            cfg.token_storage,
+            self.keyring.clone(),
+        )
+    }
+
+    async fn link_config(&self) -> Result<Option<LinkConfig>, String> {
+        let cfg = self.store.config();
+        let Some(portal) = cfg.portal.clone() else {
             return Ok(None);
         };
-        let token = pair::load_token(&self.dirs.token_file())?;
+        let token = self.tokens(&cfg).load().await?;
         Ok(Some(LinkConfig { portal, token }))
     }
 
@@ -384,6 +407,7 @@ impl Daemon {
             portal_policy: cfg.portal_policy.as_str().into(),
             elevation: self.elevation_status(&cfg),
             elevation_password: self.device.secrets.is_set(),
+            token_storage: self.tokens(&cfg).describe().into(),
             running_commands: self.device.execs.running(),
             cgroups: self.device.execs.uses_cgroups(),
             landlock: self.device.engine.landlock_available(),
@@ -417,8 +441,10 @@ impl Daemon {
                     return Reply::err(format!("cannot remove the pause marker: {e}"));
                 }
                 self.device.unlock();
-                self.load_stored_secret();
-                Reply::ok()
+                match self.load_stored_secret().await {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => Reply::err(format!("unlocked, but the elevation password was {e}")),
+                }
             }
             Request::Reload => match self.reload() {
                 Ok(()) => Reply::ok(),
@@ -447,7 +473,7 @@ impl Daemon {
                 self.restart.notify_one();
                 Reply::ok()
             }
-            Request::SecretSet { name, value } => match self.set_secret(&name, value) {
+            Request::SecretSet { name, value } => match self.set_secret(&name, value).await {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),
             },
@@ -456,16 +482,20 @@ impl Daemon {
                     return Reply::err(format!("there is no secret {name}"));
                 }
                 self.device.secrets.clear();
-                if let Err(e) = crate::secrets::remove(&crate::secrets::file(&self.dirs)) {
+                let storage = self.store.config().policy.privilege.secret_storage;
+                if let Err(e) =
+                    crate::secrets::forget(&self.dirs, storage, self.keyring.as_ref()).await
+                {
                     return Reply::err(e);
                 }
+                *self.secret_error.lock().unwrap() = None;
                 info!("elevation password cleared");
                 Reply::ok()
             }
         }
     }
 
-    fn set_secret(&self, name: &str, value: Secret) -> Result<(), String> {
+    async fn set_secret(&self, name: &str, value: Secret) -> Result<(), String> {
         if name != crate::secrets::ELEVATION {
             return Err(format!("there is no secret {name}"));
         }
@@ -478,23 +508,36 @@ impl Daemon {
         }
         crate::secrets::check(value.expose())?;
         let storage = self.store.config().policy.privilege.secret_storage;
-        if storage == SecretStorage::File {
-            crate::secrets::save(&crate::secrets::file(&self.dirs), &value)?;
-        }
+        crate::secrets::store(&self.dirs, storage, self.keyring.as_ref(), &value).await?;
         self.device.secrets.set(value);
+        *self.secret_error.lock().unwrap() = None;
         info!("elevation password set (kept in {})", storage.as_str());
         Ok(())
     }
 
-    fn load_stored_secret(&self) {
-        if self.store.config().policy.privilege.secret_storage != SecretStorage::File {
-            return;
+    /// Loads the password from the file or the keyring, where the owner keeps it
+    /// there. A keyring that fails is an error the owner hears of (`status`,
+    /// `unlock`), never a reason to look elsewhere.
+    async fn load_stored_secret(&self) -> Result<(), String> {
+        let storage = self.store.config().policy.privilege.secret_storage;
+        if storage == SecretStorage::Keyring && !cfg!(target_os = "linux") {
+            return Ok(());
         }
-        match crate::secrets::load(&crate::secrets::file(&self.dirs)) {
-            Ok(Some(s)) => self.device.secrets.set(s),
-            Ok(None) => {}
-            Err(e) => warn!("elevation password not loaded: {e}"),
-        }
+        let loaded = crate::secrets::load_stored(&self.dirs, storage, self.keyring.as_ref()).await;
+        let result = match loaded {
+            Ok(Some(s)) => {
+                self.device.secrets.set(s);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) if storage == SecretStorage::Keyring => Err(e),
+            Err(e) => {
+                warn!("elevation password not loaded: {e}");
+                Ok(())
+            }
+        };
+        *self.secret_error.lock().unwrap() = result.as_ref().err().cloned();
+        result
     }
 
     fn elevation_status(&self, cfg: &DeviceConfig) -> String {
@@ -504,9 +547,12 @@ impl Daemon {
             Elevation::Sudo if self.device.secrets.is_set() => {
                 format!("sudo, password set (kept in {})", p.secret_storage.as_str())
             }
-            Elevation::Sudo => {
-                "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
-            }
+            Elevation::Sudo => match &*self.secret_error.lock().unwrap() {
+                Some(e) => format!("sudo, no password: it was {e}"),
+                None => {
+                    "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
+                }
+            },
         }
     }
 }
@@ -520,7 +566,7 @@ async fn supervise(
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let cfg = match d.link_config() {
+        let cfg = match d.link_config().await {
             Ok(Some(c)) => c,
             other => {
                 let why = match other {
@@ -550,7 +596,7 @@ async fn supervise(
                     }
                 }
                 _ = relink.recv() => {
-                    let same = matches!(d.link_config(), Ok(Some(c)) if (c.portal.clone(), c.token.clone()) == current);
+                    let same = matches!(d.link_config().await, Ok(Some(c)) if (c.portal.clone(), c.token.clone()) == current);
                     if !same {
                         stop.send_replace(true);
                         let _ = (&mut task).await;
