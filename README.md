@@ -91,7 +91,7 @@ pithagoras-sync sudo deactivate    # sudo access off again; the password stays
 pithagoras-sync sudo clear     # forget the password
 ```
 
-`sudo activate` switches sudo access on later (it offers to store a password first if there is none). In a script, `sudo set --stdin --activate` reads the password from stdin and switches it on without asking. `pithagoras-sync sudo --help` lists everything.
+`sudo activate` switches sudo access on later (it offers to store a password first if there is none). On a headless machine (a server, `profile = headless`) `sudo set --stdin --activate` is the script route: it reads the password from stdin and switches sudo access on without asking. On a desktop profile every policy change checks your password in a terminal, so use `sudo set` there. `pithagoras-sync sudo --help` lists everything.
 
 The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
 

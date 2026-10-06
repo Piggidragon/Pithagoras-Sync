@@ -75,7 +75,7 @@ Results, each command approved through the mock portal:
 - The client's `/proc/<pid>/environ` belongs to root:root (the client is undumpable), so the user's other processes cannot read its memory.
 - With `strace` attached to the client: the exec shim refused to take the password (exit 126) and `sudo set` was refused ("being traced").
 - A wrong stored password: sudo answered "Sorry, try again" and "1 incorrect password attempt", exit 1.
-- After `panic`, `sudo status` said "no password set".
+- After `panic`, `sudo status` showed `Password:    not set` (`secret status` said "no password set" then).
 - The audit log, the user's journal, the full system journal and the mock portal's transcript of everything the device sent (`dump`) held the password neither as it is nor JSON-escaped.
 - `secret_storage = file`: `~/.config/pithagoras-sync/elevation.secret` was 0600 and the password worked after a restart of the client. `fs.read` of the file was denied (sealed). An unconfined Full-mode `cat` of it was readable, its output `[redacted]`: the known limit of file storage. `sudo clear` removed the file.
 

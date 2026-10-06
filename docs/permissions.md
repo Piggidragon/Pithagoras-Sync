@@ -128,8 +128,8 @@ Two things make `sudo <command>` work for the agent: the setting `policy.privile
 
 ```sh
 pithagoras-sync sudo set                # type the password (not echoed), then asks "Do you want to activate sudo access now? [y/N]"
-pithagoras-sync sudo set --stdin        # one line from stdin, for a script; asks nothing
-pithagoras-sync sudo set --stdin --activate   # ... and switches sudo access on
+pithagoras-sync sudo set --stdin        # one line from stdin, for a script on a headless machine; asks nothing
+pithagoras-sync sudo set --stdin --activate   # ... and switches sudo access on (the headless script route)
 pithagoras-sync sudo activate           # switch sudo access on
 pithagoras-sync sudo activate --no-password   # without a stored password: a sudoers rule that asks none
 pithagoras-sync sudo deactivate         # switch it off; the stored password stays
@@ -138,8 +138,10 @@ pithagoras-sync sudo clear --deactivate #   ... and switch sudo access off
 pithagoras-sync sudo status             # active or not, password set or not (and where), what to do next
 ```
 
+- Scripts (`--stdin`, `activate` without a terminal) are for headless machines: on `profile = "desktop"` every policy change checks the user's password in a terminal first, and `--stdin` leaves stdin as the password pipe, so it fails there; use `set` in a terminal.
 - Questions are asked only in a terminal. `set` asks about activating unless sudo access is active already; with `--stdin` (stdin is the password, so there is nobody to ask) or without a terminal it asks nothing, leaves sudo access as it is and prints the hint, unless `--activate` is given. `activate` without a stored password offers to type one now (y/N); in a script it refuses and says what to run, unless `--no-password` is given. A client that runs as root has nothing to elevate and needs no password, so `activate` does not ask there. `clear` asks whether to switch sudo access off too while it is active; without a terminal it keeps it active (sudo then runs only what sudoers allows without a password) and says so, unless `--deactivate` is given.
-- Switching sudo access on or off changes `policy.privilege.elevation` like `config set` does: the running client takes it at once and audits it with the old and new value, and the CLI refuses it from a command the client runs for the portal. `config set policy.privilege.elevation sudo` (or `off`) stays valid as the generic way and does the same; `sudo status` reads the same setting. `sudo set`, `sudo activate` and (on a desktop) the password check apply as for any policy change; `deactivate` and `clear` only take rights away and ask for no password.
+- Switching sudo access on or off changes `policy.privilege.elevation` like `config set` does: the running client takes it at once and audits it with the old and new value, and the CLI refuses it from a command the client runs for the portal. `config set policy.privilege.elevation sudo` (or `off`) stays valid as the generic way and does the same; `sudo status` reads the same setting. `sudo set`, `sudo activate` and (on a desktop) the password check apply as for any policy change; `deactivate` and `clear` only take rights away and ask for no password. Each of them reads the config again right before it saves and changes only the elevation, so what the owner changed meanwhile (the mode, a folder) while a question waited stays.
+- `deactivate` leaves the stored password in place. Where `portal_policy = "write"` the portal can switch `policy.privilege.elevation` on again (the setting is open to it), and the stored password is then used again; `sudo clear` forgets the password.
 - On Windows the group exists but says "sudo access is Linux only" and fails: Windows has no sudo, so there is nothing to rename or replace there.
 - `sudo set` refuses while a debugger traces the client. It does not try the password: a wrong one shows when the next `sudo` command fails with sudo's own message.
 - sudo gets it on stdin through the exec shim, which takes it from a private file descriptor (never argv or the environment) and closes stdin before the command starts, so the command cannot read it.
