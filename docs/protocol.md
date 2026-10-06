@@ -149,7 +149,7 @@ Calls on behalf of a chat carry a context:
 "ctx": {"chat": "<chat id>", "tainted": false, "tool": "edit"}
 ```
 
-- `chat`: which chat the call is for. Approvals ("for this chat") and the device's own taint are kept per chat.
+- `chat`: which chat the call is for, at most 256 bytes without control characters (else `INVALID_PARAMS`). Approvals ("for this chat") and the device's own taint are kept per chat, for at most 4096 chats: past that the chat unused longest is forgotten.
 - `tainted`: the portal guard's taint flag for that chat. The device only ever adds it to its own taint; `false` cannot clear anything.
 - `tool` (optional): the pi tool the call is for, `read`, `write`, `edit`, `bash`, `grep`, `find` or `ls`. The owner can switch each tool off (`policy.tools`, see permissions.md); a call for a tool that is off is `DENIED`. The label can only narrow: it has to fit the method (`fs.read` serves `read` and `edit`, `fs.write` serves `write` and `edit`, `fs.stat` serves every tool but `bash`, `fs.list` serves `ls`, `fs.grep` serves `grep`, `fs.find` serves `find`, `exec.start` serves `bash`), and another label is `DENIED`. Without it, a call passes when any tool its method serves is on.
 - Any other field in `ctx` is refused. There is no way to send "approved", a mode, folders or protections; those exist only on the device.
@@ -217,7 +217,7 @@ Params: `{"path": "...", "ctx": {...}}`. Result:
 {"entries": [{"name": "src", "kind": "dir"}], "truncated": false}
 ```
 
-At most 20 000 entries; `truncated` says more were left out. Protected entries are listed by name (a name is not content).
+At most 20 000 entries, and at most about 3 MiB of answer (section 10); `truncated` says more were left out. Protected entries are listed by name (a name is not content).
 
 ### `fs.read`
 
@@ -266,7 +266,7 @@ All but `path`, `pattern` and `ctx` are optional. `path` is a file or a folder; 
 {"lines": [{"path": "/abs/file", "line": 12, "text": "...", "context": false}], "truncated": false, "skipped": 0}
 ```
 
-`limit` defaults to 100 match lines and is capped at 10 000; lines are cut at 2000 characters. `skipped` counts files left out because they are protected, outside the granted folders, or unreadable.
+`limit` defaults to 100 match lines and is capped at 10 000; lines are cut at 2000 characters. The answer stops at about 3 MiB, context lines counted, and then says `truncated`, so it always fits one message. `skipped` counts files left out because they are protected, outside the granted folders, or unreadable.
 
 ### `fs.find`
 
@@ -276,7 +276,7 @@ Params: `{"path": "...", "pattern": "**/*.rs", "limit": 1000, "ctx": {...}}`. Re
 {"paths": ["/abs/a.rs"], "truncated": false, "skipped": 0}
 ```
 
-`limit` defaults to 1000, capped at 10 000.
+`limit` defaults to 1000, capped at 10 000; the answer stops at about 3 MiB with `truncated`.
 
 ### `exec.start`
 
@@ -469,7 +469,8 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | WebSocket message | 4 MiB |
 | Binary payload | 64 KiB |
 | Calls at once | 64 |
-| Uploads at once | 4 |
+| Uploads at once | 4 (each holds its slot until the write is done, its approval included; more are `BUSY`) |
+| `fs.read` holding a file at once | 4 (more wait) |
 | Read or write size | 64 MiB |
 | Upload stall | 60 s |
 | Running commands | 16 (config `exec.max_running`) |
@@ -477,6 +478,9 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | Command output | 16 MiB (config `exec.output_cap_bytes`) |
 | `fs.list` entries | 20 000 |
 | grep / find results | 100 / 1000 by default, 10 000 at most |
+| One `fs.list`, `fs.grep` or `fs.find` answer | about 3 MiB of JSON, context lines included; past it the answer stops with `truncated: true` |
+| Chat id (`ctx.chat`, `grant.end`) | 256 bytes, no control characters (else `INVALID_PARAMS`); the device keeps state for 4096 chats, forgetting the one unused longest |
+| Audit record | target and reason cut at 4 KiB, chat id at 256 bytes |
 | Approval timeout | 120 s (config `policy.approvals.timeout_secs`, 1 to 3600) |
 | Ping / dead | 20 s / 45 s |
 | Backoff | 1 s to 60 s |

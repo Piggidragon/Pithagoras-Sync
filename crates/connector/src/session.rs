@@ -21,7 +21,7 @@ use sync_proto::{
     BinaryFrame, FrameError, FrameKind, Id, Incoming, RpcError, code, error_without_id,
     notification, parse_incoming, response,
 };
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -41,8 +41,11 @@ pub const DEAD_AFTER: Duration = Duration::from_secs(45);
 const OUT_QUEUE: usize = 64;
 /// Calls handled at once; more are answered with `BUSY`.
 const MAX_CALLS: usize = 64;
-/// `fs.write` uploads in flight at once (each holds up to 64 MiB).
+/// `fs.write` calls holding their content at once (each up to 64 MiB), from the
+/// first frame until the write is done, its approval included.
 const MAX_UPLOADS: usize = 4;
+/// `fs.read` calls holding a file in memory at once (each up to 64 MiB); more wait.
+const MAX_READS: usize = 4;
 /// An upload with no frame for this long fails.
 const UPLOAD_STALL: Duration = Duration::from_secs(60);
 /// Longest preview of new content in an approval prompt.
@@ -68,7 +71,16 @@ struct Shared {
     device: Arc<Device>,
     out: mpsc::Sender<Message>,
     uploads: Mutex<HashMap<u32, Upload>>,
+    upload_slots: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
 }
+
+/// A write's content on its way in, and its slot among `MAX_UPLOADS`.
+type UploadIn = (
+    WriteParams,
+    mpsc::UnboundedReceiver<Vec<u8>>,
+    Option<OwnedSemaphorePermit>,
+);
 
 impl Shared {
     async fn send_text(&self, text: String) {
@@ -118,6 +130,8 @@ pub async fn run(
         device: device.clone(),
         out: out.clone(),
         uploads: Mutex::new(HashMap::new()),
+        upload_slots: Arc::new(Semaphore::new(MAX_UPLOADS)),
+        reads: Arc::new(Semaphore::new(MAX_READS)),
     });
     shared
         .send_text(notification(HELLO, device.hello(device_id)))
@@ -330,10 +344,7 @@ async fn authorize(
         .map_err(RpcError::from)
 }
 
-fn register_upload(
-    shared: &Shared,
-    params: Value,
-) -> Result<(WriteParams, mpsc::UnboundedReceiver<Vec<u8>>), RpcError> {
+fn register_upload(shared: &Shared, params: Value) -> Result<UploadIn, RpcError> {
     let p: WriteParams = parse(params)?;
     if p.size > MAX_WRITE {
         return Err(RpcError::new(
@@ -342,14 +353,20 @@ fn register_upload(
         ));
     }
     let (tx, rx) = mpsc::unbounded_channel();
+    let mut slot = None;
     if p.size > 0 {
         let mut ups = shared.uploads.lock().unwrap();
         if ups.contains_key(&p.stream) {
             return Err(RpcError::new(code::INVALID_PARAMS, "stream already in use"));
         }
-        if ups.len() >= MAX_UPLOADS {
-            return Err(RpcError::new(code::BUSY, "too many uploads at once"));
-        }
+        // Held until the write is done: content waiting for an approval counts.
+        slot = Some(
+            shared
+                .upload_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| RpcError::new(code::BUSY, "too many uploads at once"))?,
+        );
         ups.insert(
             p.stream,
             Upload {
@@ -358,7 +375,7 @@ fn register_upload(
             },
         );
     }
-    Ok((p, rx))
+    Ok((p, rx, slot))
 }
 
 fn on_binary(shared: &Shared, data: &[u8]) {
@@ -388,7 +405,7 @@ async fn dispatch(
     id: &Id,
     method: &str,
     params: Value,
-    upload: Option<(WriteParams, mpsc::UnboundedReceiver<Vec<u8>>)>,
+    upload: Option<UploadIn>,
 ) -> Result<Value, RpcError> {
     match method {
         DEVICE_INFO => {
@@ -412,6 +429,13 @@ async fn dispatch(
         FS_READ => {
             let p: ReadParams = parse(params)?;
             let permit = authorize(shared, id, &p.ctx, "read", Request::Read(&p.path)).await?;
+            // Until its frames are queued: bounds what reads hold in memory.
+            let _slot = shared
+                .reads
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| RpcError::new(code::INTERNAL, "closed"))?;
             let (data, sha256) = blocking(move || fsops::read(&permit)).await?;
             let mut chunks = 0u32;
             for c in data.chunks(MAX_CHUNK) {
@@ -438,7 +462,8 @@ async fn dispatch(
             })
         }
         FS_WRITE => {
-            let (p, rx) = upload.ok_or_else(|| RpcError::new(code::INTERNAL, "no upload"))?;
+            let (p, rx, _slot) =
+                upload.ok_or_else(|| RpcError::new(code::INTERNAL, "no upload"))?;
             write(shared, id, p, rx).await
         }
         FS_GREP => {

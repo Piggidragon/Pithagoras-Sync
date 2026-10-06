@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize};
 
 /// Above this size the log moves to `audit.jsonl.1` and a new one starts.
 const ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Longest target or reason a record keeps, in bytes. Both can come from the
+/// portal (a path or command of up to 4 MiB), and a few such records would
+/// otherwise push the owner's history out of the log.
+pub const MAX_FIELD: usize = 4096;
+
+/// `s` cut to at most `max` bytes (at a character border), saying how long it was.
+pub fn cut(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (cut, {} bytes in all)", &s[..end], s.len())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {

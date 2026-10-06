@@ -1074,3 +1074,48 @@ async fn landlock_carves_the_stored_secret_out_even_of_a_named_grant() {
         rules.write
     );
 }
+
+#[tokio::test]
+async fn the_portal_cannot_make_the_device_keep_chats_without_bound() {
+    // Every new chat id the portal sends with its taint flag is kept, but only up to
+    // MAX_CHATS: then the chat unused longest goes.
+    let f = Fixture::new();
+    let e = f.engine(full(&f), Profile::Headless, none());
+    for i in 0..engine::MAX_CHATS + 500 {
+        f.clock.fetch_add(1, Ordering::SeqCst);
+        e.mark_tainted(&format!("chat-{i}"));
+    }
+    assert_eq!(e.chats(), engine::MAX_CHATS);
+    assert!(e.is_tainted(&format!("chat-{}", engine::MAX_CHATS + 499)));
+    assert!(!e.is_tainted("chat-0"));
+}
+
+#[tokio::test]
+async fn huge_targets_cannot_flush_the_audit_log() {
+    // A denied call records its target, which the portal chooses: each record
+    // keeps at most a few KiB of it, so a few calls cannot rotate the log away.
+    let f = Fixture::new();
+    let e = f.engine(
+        f.folders(&[("home/proj", Access::Rw)]),
+        Profile::Headless,
+        none(),
+    );
+    let long = format!("{}/{}", f.p("outside"), "x".repeat(1 << 20));
+    assert!(read(&e, &long).await.is_err());
+    denied(
+        exec(
+            &e,
+            &format!("echo {}", "y".repeat(1 << 20)),
+            &f.p("outside"),
+        )
+        .await,
+    );
+    let log = fs::read_to_string(f.root.join("state/audit.jsonl")).unwrap();
+    assert!(log.len() < 20_000, "{} bytes", log.len());
+    let recs = f.audit();
+    assert!(
+        recs[0].target.contains("bytes in all"),
+        "{:?}",
+        recs[0].target
+    );
+}

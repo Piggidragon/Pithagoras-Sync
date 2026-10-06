@@ -277,17 +277,16 @@ pub fn list(permit: &Permit) -> Result<ListResult, RpcError> {
     };
     let mut entries = Vec::new();
     let mut truncated = false;
+    let mut budget = crate::search::Budget::new(crate::search::MAX_ANSWER);
     for e in rd {
         let e = e.map_err(io_error)?;
-        if entries.len() >= MAX_LIST {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if entries.len() >= MAX_LIST || !budget.take(&[&name]) {
             truncated = true;
             break;
         }
         let kind = e.file_type().map(kind_of).unwrap_or(FileKind::Other);
-        entries.push(ListEntry {
-            name: e.file_name().to_string_lossy().into_owned(),
-            kind,
-        });
+        entries.push(ListEntry { name, kind });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(ListResult { entries, truncated })

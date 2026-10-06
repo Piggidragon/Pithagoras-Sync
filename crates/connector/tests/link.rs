@@ -525,6 +525,74 @@ async fn uploads_must_match_their_announced_size() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn writes_waiting_for_approval_keep_their_upload_slot() {
+    // Each write holds its content until it is done, approval included, so at most
+    // four writes' content is held at once; a fifth is BUSY.
+    let fx = Fx::new();
+    let (dev, queue, _) = fx.full_device(Policy::default(), PortalPolicy::Read);
+    let (_mock, _dev, r, dl) = connect(dev).await;
+    let mut pending = Vec::new();
+    for stream in 1..=4u32 {
+        let rx = dl
+            .start_call(
+                "fs.write",
+                json!({"path": fx.p(&format!("home/proj/w{stream}.txt")), "stream": stream, "size": 3, "ctx": ctx()}),
+            )
+            .await;
+        dl.upload(stream, b"abc").await;
+        pending.push(rx);
+    }
+    for _ in 0..100 {
+        if queue.list().len() == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(queue.list().len(), 4, "all four wait for their approval");
+    let e = dl
+        .call(
+            "fs.write",
+            json!({"path": fx.p("home/proj/w5.txt"), "stream": 5, "size": 3, "ctx": ctx()}),
+        )
+        .await;
+    assert_eq!(err_code(e), code::BUSY);
+    // Answered, the slots come free again.
+    for a in queue.list() {
+        queue.answer(a.id, Choice::Deny, None, "device").unwrap();
+    }
+    for rx in pending {
+        let e = tokio::time::timeout(WAIT, rx).await.unwrap().unwrap();
+        assert_eq!(err_code(e), code::DENIED);
+    }
+    let rx = dl
+        .start_call(
+            "fs.write",
+            json!({"path": fx.p("home/proj/w6.txt"), "stream": 6, "size": 3, "ctx": ctx()}),
+        )
+        .await;
+    dl.upload(6, b"abc").await;
+    for _ in 0..100 {
+        if !queue.list().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    queue
+        .answer(queue.list()[0].id, Choice::Once, None, "device")
+        .unwrap();
+    tokio::time::timeout(WAIT, rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fx.root.join("home/proj/w6.txt")).unwrap(),
+        b"abc"
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_approval_is_denied_and_the_portal_sees_it_wait() {
     let fx = Fx::new();
     let mut policy = Policy::default();

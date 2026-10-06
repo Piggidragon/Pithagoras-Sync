@@ -23,6 +23,47 @@ pub const FIND_DEFAULT_LIMIT: u32 = 1000;
 pub const MAX_LIMIT: u32 = 10_000;
 /// Longest line text returned; longer lines are cut.
 const MAX_LINE: usize = 2000;
+/// Most bytes of JSON one answer of `fs.grep`, `fs.find` or `fs.list` holds, well
+/// below the protocol's 4 MiB message limit: past it the answer stops and says
+/// `truncated`. Context lines count too.
+pub const MAX_ANSWER: usize = 3 << 20;
+/// What one entry adds to an answer besides its strings (field names, numbers).
+const ENTRY_OVERHEAD: usize = 64;
+
+/// The length of `s` as a JSON string, escapes included.
+pub fn json_len(s: &str) -> usize {
+    2 + s
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
+/// Counts the bytes of an answer as entries are added.
+pub struct Budget {
+    used: usize,
+    max: usize,
+}
+
+impl Budget {
+    pub fn new(max: usize) -> Budget {
+        Budget { used: 0, max }
+    }
+
+    /// Takes room for an entry with these strings; false (and nothing taken) when
+    /// the answer is full.
+    pub fn take(&mut self, strings: &[&str]) -> bool {
+        let n = ENTRY_OVERHEAD + strings.iter().map(|s| json_len(s)).sum::<usize>();
+        if self.used + n > self.max {
+            return false;
+        }
+        self.used += n;
+        true
+    }
+}
 
 pub struct GrepOptions<'a> {
     pub pattern: &'a str,
@@ -87,6 +128,25 @@ struct Collect<'a> {
     out: &'a mut Vec<GrepLine>,
     matches: &'a mut u32,
     limit: u32,
+    budget: &'a mut Budget,
+    full: &'a mut bool,
+}
+
+impl Collect<'_> {
+    /// Adds a line if the answer has room for it; false stops the search.
+    fn push(&mut self, line: u64, text: String, context: bool) -> bool {
+        if !self.budget.take(&[&self.path, &text]) {
+            *self.full = true;
+            return false;
+        }
+        self.out.push(GrepLine {
+            path: self.path.clone(),
+            line,
+            text,
+            context,
+        });
+        true
+    }
 }
 
 fn clip_line(bytes: &[u8]) -> String {
@@ -110,24 +170,15 @@ impl Sink for Collect<'_> {
         if *self.matches >= self.limit {
             return Ok(false);
         }
+        if !self.push(m.line_number().unwrap_or(0), clip_line(m.bytes()), false) {
+            return Ok(false);
+        }
         *self.matches += 1;
-        self.out.push(GrepLine {
-            path: self.path.clone(),
-            line: m.line_number().unwrap_or(0),
-            text: clip_line(m.bytes()),
-            context: false,
-        });
         Ok(*self.matches < self.limit)
     }
 
     fn context(&mut self, _s: &Searcher, c: &SinkContext<'_>) -> Result<bool, Self::Error> {
-        self.out.push(GrepLine {
-            path: self.path.clone(),
-            line: c.line_number().unwrap_or(0),
-            text: clip_line(c.bytes()),
-            context: true,
-        });
-        Ok(true)
+        Ok(self.push(c.line_number().unwrap_or(0), clip_line(c.bytes()), true))
     }
 }
 
@@ -155,6 +206,8 @@ pub fn grep(
     let mut lines = Vec::new();
     let mut matches = 0u32;
     let mut skipped = 0u32;
+    let mut budget = Budget::new(MAX_ANSWER);
+    let mut full = false;
     let root = permit.path.clone();
     let is_dir = std::fs::symlink_metadata(&root).map_err(io_error)?.is_dir();
     let files: Box<dyn Iterator<Item = PathBuf>> = if is_dir {
@@ -167,7 +220,7 @@ pub fn grep(
         Box::new(std::iter::once(root.clone()))
     };
     for path in files {
-        if matches >= limit {
+        if matches >= limit || full {
             break;
         }
         if let Some(g) = &glob
@@ -196,6 +249,8 @@ pub fn grep(
             out: &mut lines,
             matches: &mut matches,
             limit,
+            budget: &mut budget,
+            full: &mut full,
         };
         if searcher
             .search_reader(&matcher, f.take(MAX_READ), &mut sink)
@@ -205,7 +260,7 @@ pub fn grep(
         }
     }
     Ok(GrepResult {
-        truncated: matches >= limit,
+        truncated: matches >= limit || full,
         lines,
         skipped,
     })
@@ -228,6 +283,7 @@ pub fn find(
     let mut paths = Vec::new();
     let mut skipped = 0u32;
     let mut truncated = false;
+    let mut budget = Budget::new(MAX_ANSWER);
     for e in walker(root).filter_map(|e| e.ok()) {
         if e.depth() == 0 {
             continue;
@@ -247,6 +303,10 @@ pub fn find(
         let mut s = to_wire(e.path());
         if e.file_type().is_some_and(|t| t.is_dir()) {
             s.push('/');
+        }
+        if !budget.take(&[&s]) {
+            truncated = true;
+            break;
         }
         paths.push(s);
     }

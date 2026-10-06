@@ -205,3 +205,42 @@ fn find_matches_names_and_paths_and_honours_gitignore() {
     let r = search::find(&permit(g.clone(), Some(&g)), "**/*.txt", None, &all).unwrap();
     assert_eq!(r.paths.len(), 1);
 }
+
+/// The protocol's limit for one message (`docs/protocol.md`, Limits): every
+/// answer fits below it.
+const _: () = assert!(search::MAX_ANSWER < 4 << 20);
+
+#[test]
+fn answers_stay_below_the_message_limit() {
+    // Long lines with context, and many long names: each answer would be well over
+    // 4 MiB, so each stops at the device's budget and says it was cut.
+    let f = fx();
+    let g = f.root.join("granted");
+    let line = format!("e{}\n", "x".repeat(1998));
+    fs::write(g.join("big.log"), line.repeat(3000)).unwrap();
+    let opts = GrepOptions {
+        pattern: "e",
+        glob: None,
+        ignore_case: false,
+        literal: true,
+        context: 20,
+        limit: Some(10_000),
+    };
+    let r = search::grep(&permit(g.join("big.log"), Some(&g)), &opts, &all).unwrap();
+    assert!(r.truncated);
+    assert!(serde_json::to_string(&r).unwrap().len() <= search::MAX_ANSWER);
+
+    let many = g.join(format!("d{}", "n".repeat(200)));
+    fs::create_dir(&many).unwrap();
+    for i in 0..16_000 {
+        fs::write(many.join(format!("{i:05}{}", "f".repeat(240))), "").unwrap();
+    }
+    let r = fsops::list(&permit(many.clone(), Some(&g))).unwrap();
+    assert!(r.truncated);
+    let len = serde_json::to_string(&r).unwrap().len();
+    assert!(len <= search::MAX_ANSWER, "{len}");
+    let r = search::find(&permit(g.clone(), Some(&g)), "*f", Some(10_000), &all).unwrap();
+    assert!(r.truncated);
+    let len = serde_json::to_string(&r).unwrap().len();
+    assert!(len <= search::MAX_ANSWER, "{len}");
+}

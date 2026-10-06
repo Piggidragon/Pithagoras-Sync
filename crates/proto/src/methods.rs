@@ -48,6 +48,7 @@ pub const CAP_POLICY: &str = "policy";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ctx {
+    #[serde(deserialize_with = "chat_id")]
     pub chat: String,
     #[serde(default)]
     pub tainted: bool,
@@ -211,7 +212,29 @@ pub struct ExecSignalParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantEndParams {
+    #[serde(deserialize_with = "chat_id")]
     pub chat: String,
+}
+
+/// Longest chat id, in bytes.
+pub const MAX_CHAT_ID: usize = 256;
+
+/// A chat id: at most `MAX_CHAT_ID` bytes and no control characters. The device
+/// keeps state per chat and shows the id to the owner, so the portal cannot make it
+/// hold or print anything larger.
+fn chat_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    if s.len() > MAX_CHAT_ID {
+        return Err(serde::de::Error::custom(format!(
+            "a chat id has at most {MAX_CHAT_ID} bytes"
+        )));
+    }
+    if s.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom(
+            "a chat id has no control characters",
+        ));
+    }
+    Ok(s)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +542,18 @@ mod tests {
         assert!(serde_json::from_value::<PathParams>(bad).is_err());
         let bad = json!({"path": "/a", "ctx": {"chat": "c"}, "mode": "full"});
         assert!(serde_json::from_value::<PathParams>(bad).is_err());
+    }
+
+    #[test]
+    fn chat_ids_are_short_and_printable() {
+        let with = |chat: String| json!({"path": "/a", "ctx": {"chat": chat}});
+        let ok = "c".repeat(MAX_CHAT_ID);
+        assert!(serde_json::from_value::<PathParams>(with(ok.clone())).is_ok());
+        assert!(serde_json::from_value::<PathParams>(with(ok + "c")).is_err());
+        assert!(serde_json::from_value::<PathParams>(with("c\x1b[2K".into())).is_err());
+        assert!(
+            serde_json::from_value::<GrantEndParams>(json!({"chat": "c".repeat(300)})).is_err()
+        );
     }
 
     #[test]

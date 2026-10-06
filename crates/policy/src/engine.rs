@@ -140,6 +140,34 @@ struct ChatState {
     tainted: bool,
     /// Standing approvals and when they end (Unix ms; `None` with the grant).
     approved: HashMap<Scope, Option<i64>>,
+    /// The last call of this chat (Unix ms).
+    used_ms: i64,
+}
+
+/// Most chats the device keeps taint and approvals for. Chat ids come from the
+/// portal; past this the chat unused longest is forgotten, so the portal cannot
+/// make the device hold memory without bound.
+pub const MAX_CHATS: usize = 4096;
+
+/// The state of `chat`, made when missing; drops the chat unused longest when
+/// that would hold more than `MAX_CHATS`.
+fn chat_state<'a>(
+    chats: &'a mut HashMap<String, ChatState>,
+    chat: &str,
+    now: i64,
+) -> &'a mut ChatState {
+    if !chats.contains_key(chat)
+        && chats.len() >= MAX_CHATS
+        && let Some(oldest) = chats
+            .iter()
+            .min_by_key(|(_, c)| c.used_ms)
+            .map(|(k, _)| k.clone())
+    {
+        chats.remove(&oldest);
+    }
+    let c = chats.entry(chat.to_string()).or_default();
+    c.used_ms = now;
+    c
 }
 
 struct Snapshot {
@@ -323,12 +351,13 @@ impl Engine {
     /// The device served untrusted content (screen, MCP) to this chat: from now on
     /// its mutating calls prompt.
     pub fn mark_tainted(&self, chat: &str) {
-        self.chats
-            .lock()
-            .unwrap()
-            .entry(chat.to_string())
-            .or_default()
-            .tainted = true;
+        let now = self.now();
+        chat_state(&mut self.chats.lock().unwrap(), chat, now).tainted = true;
+    }
+
+    /// How many chats the device keeps taint or approvals for.
+    pub fn chats(&self) -> usize {
+        self.chats.lock().unwrap().len()
     }
 
     pub fn is_tainted(&self, chat: &str) -> bool {
@@ -371,13 +400,16 @@ impl Engine {
             Some(s) => s.scrub(t),
             None => t.to_string(),
         };
+        // Cut after scrubbing, so a cut cannot leave half the secret behind.
         let rec = AuditRecord {
             time_ms: self.now(),
-            chat: chat.map(scrub),
+            chat: chat.map(|c| crate::audit::cut(&scrub(c), sync_proto::methods::MAX_CHAT_ID)),
             tool: tool.to_string(),
-            target: scrub(target),
+            target: crate::audit::cut(&scrub(target), crate::audit::MAX_FIELD),
             decision: decision.to_string(),
-            reason: reason.as_deref().map(scrub),
+            reason: reason
+                .as_deref()
+                .map(|r| crate::audit::cut(&scrub(r), crate::audit::MAX_FIELD)),
             exit_code,
         };
         self.audit.append(&rec);
@@ -493,11 +525,8 @@ impl Engine {
                     _ => None,
                 };
                 if let (Some(until), Some(scope)) = (until, offer) {
-                    self.chats
-                        .lock()
-                        .unwrap()
-                        .entry(call.chat.to_string())
-                        .or_default()
+                    let now = self.now();
+                    chat_state(&mut self.chats.lock().unwrap(), call.chat, now)
                         .approved
                         .insert(scope, until);
                 }
@@ -565,7 +594,10 @@ impl Engine {
         let mode = policy.effective_mode(snap.profile, now);
         let grants = resolved_grants(&policy.folders);
         let (tainted, approved) = {
-            let chats = self.chats.lock().unwrap();
+            let mut chats = self.chats.lock().unwrap();
+            if let Some(c) = chats.get_mut(call.chat) {
+                c.used_ms = now;
+            }
             let c = chats.get(call.chat);
             let approved: HashSet<Scope> = c
                 .map(|c| {
