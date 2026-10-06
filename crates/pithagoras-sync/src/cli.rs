@@ -1126,8 +1126,7 @@ async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
     }
     #[cfg(windows)]
     if console_is_ours_alone() {
-        // SAFETY: FreeConsole has no preconditions.
-        unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+        crate::actions::let_go_of_console();
     }
     let lang = crate::i18n::Lang::detect();
     #[cfg(windows)]
@@ -1176,10 +1175,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     eprintln!("pithagoras-sync: no log file: {e}");
                 }
                 #[cfg(windows)]
-                // SAFETY: FreeConsole has no preconditions.
-                unsafe {
-                    windows_sys::Win32::System::Console::FreeConsole()
-                };
+                crate::actions::let_go_of_console();
             }
             let ran = crate::daemon::run(dirs).await;
             if detach && let Err(e) = &ran {
