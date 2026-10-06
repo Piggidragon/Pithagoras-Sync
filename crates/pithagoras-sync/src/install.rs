@@ -398,6 +398,20 @@ mod tests {
     use crate::actions::{Fake, apply};
 
     #[test]
+    fn the_logon_task_is_switched_off_before_it_is_ended() {
+        let plan = windows_stop_plan();
+        let argv = |a: &Action| match a {
+            Action::Try { argv, .. } | Action::Run { argv } => argv.join(" "),
+            _ => String::new(),
+        };
+        // The minute trigger would start the client again between the two.
+        assert!(argv(&plan[0]).contains("/Change") && argv(&plan[0]).ends_with("/DISABLE"));
+        assert!(argv(&plan[1]).contains("/End"));
+        assert_eq!(plan.len(), 2);
+        assert!(argv(&user_stop_plan()[0]).ends_with(&format!("stop {UNIT_NAME}")));
+    }
+
+    #[test]
     fn pair_names_the_unit_that_exists_for_this_user() {
         let unit = system_unit(Some("pithagoras-sync"));
         assert_eq!(

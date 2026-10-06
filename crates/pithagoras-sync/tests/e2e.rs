@@ -730,6 +730,7 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "secret set elevation --stdin",
         "secret clear elevation",
         "update --manifest /nowhere/manifest.json",
+        "uninstall --purge --yes",
     ]
     .iter()
     .enumerate()
@@ -740,6 +741,12 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
             assert!(out.contains("cannot come from commands"), "{args}: {out}");
         }
     }
+    // Refused, so the audit log the owner relies on is still there.
+    assert!(
+        env.home
+            .join(".local/state/pithagoras-sync/audit.jsonl")
+            .exists()
+    );
     let cfg = std::fs::read_to_string(env.config()).unwrap();
     assert!(cfg.contains("mode = \"folders\""), "{cfg}");
     assert!(!cfg.contains("path = \"/\""), "{cfg}");

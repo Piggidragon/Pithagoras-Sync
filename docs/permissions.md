@@ -147,4 +147,4 @@ pithagoras-sync secret clear                   # forget it, in the client and on
 | `pithagoras-sync unlock` | Ends a pause; reloads the stored password when storage is `file`. |
 | `pithagoras-sync update [--check]` | Replaces the program the running client was started from (else the one you ran) with a newer signed release and restarts the client. Never changes a setting. |
 | `pithagoras-sync status` | Mode, folders, approvals, elevation, the connection. |
-| `pithagoras-sync uninstall --purge [--yes] [--print]` | Stops the client, undoes `install` and removes its pairing, config (folders and policy included), token, stored password, audit log, log and update records; the program stays. Refused from the commands the client runs. |
+| `pithagoras-sync uninstall --purge [--yes] [--print]` | Stops the client, undoes `install` and removes its pairing, config (folders and policy included), token, stored password, audit log, log and update records; the program stays. On Linux refused from the commands the client runs; on Windows commands run unconfined and can run it (see `windows.md`). |

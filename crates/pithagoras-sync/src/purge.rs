@@ -16,6 +16,10 @@ pub struct Found {
     pub entries: Vec<PathBuf>,
     /// The client's folders, innermost first: removed once nothing else is in them.
     pub folders: Vec<PathBuf>,
+    /// Which folder each of `folders` was when it was listed (device, inode):
+    /// `remove` deletes only in the very same folders.
+    #[cfg(unix)]
+    ids: Vec<(PathBuf, (u64, u64))>,
 }
 
 impl Found {
@@ -113,6 +117,20 @@ pub fn find(dirs: &Dirs) -> Result<Found, String> {
                 folder.display()
             ));
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Root purging a user's folders (`sudo -E`, a kept HOME) would delete
+            // where that user can turn the way.
+            // SAFETY: geteuid has no preconditions.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return Err(format!(
+                    "{} belongs to another user, not to whoever runs this: nothing was removed. Run it as that user",
+                    folder.display()
+                ));
+            }
+            found.ids.push((folder.clone(), (meta.dev(), meta.ino())));
+        }
         let mut names = Vec::new();
         for e in std::fs::read_dir(folder).map_err(|e| format!("{}: {e}", folder.display()))? {
             names.push(
@@ -159,11 +177,109 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The client's folders, held open from here on, so that what is deleted in
+/// them is deleted in the folders `find` listed, not in whatever a link put at
+/// their path since. A path `/proc/self/fd/<n>/<name>` leads into the held folder
+/// itself, whatever is at its old path now.
+// Only Linux holds the folders open; elsewhere they are looked at again.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Held(Vec<(PathBuf, Option<std::fs::File>)>);
+
+impl Held {
+    fn open(found: &Found) -> Result<Held, String> {
+        let mut held = Vec::new();
+        for folder in &found.folders {
+            let file = Self::hold(found, folder)?;
+            held.push((folder.clone(), file));
+        }
+        Ok(Held(held))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hold(found: &Found, folder: &Path) -> Result<Option<std::fs::File>, String> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if !Path::new("/proc/self/fd").is_dir() {
+            return Self::recheck(found, folder).map(|_| None);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(folder)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // O_NOFOLLOW on a link, or a file where the folder was.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                return Err(Self::replaced(folder));
+            }
+            Err(e) => return Err(format!("{}: {e}", folder.display())),
+        };
+        let m = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", folder.display()))?;
+        Self::same(found, folder, (m.dev(), m.ino()))?;
+        Ok(Some(file))
+    }
+
+    /// Where no folder can be held, it is looked at again right before.
+    #[cfg(not(target_os = "linux"))]
+    fn hold(found: &Found, folder: &Path) -> Result<Option<std::fs::File>, String> {
+        Self::recheck(found, folder).map(|_| None)
+    }
+
+    fn recheck(found: &Found, folder: &Path) -> Result<(), String> {
+        let m = match std::fs::symlink_metadata(folder) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{}: {e}", folder.display())),
+        };
+        if m.file_type().is_symlink() || !m.is_dir() {
+            return Err(Self::replaced(folder));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self::same(found, folder, (m.dev(), m.ino()))?;
+        }
+        #[cfg(not(unix))]
+        let _ = found;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn same(found: &Found, folder: &Path, id: (u64, u64)) -> Result<(), String> {
+        match found.ids.iter().find(|(f, _)| f == folder) {
+            Some((_, was)) if *was == id => Ok(()),
+            _ => Err(Self::replaced(folder)),
+        }
+    }
+
+    fn replaced(folder: &Path) -> String {
+        format!(
+            "{} is not the folder that was listed any more: stopped, run this again",
+            folder.display()
+        )
+    }
+
+    /// Where `entry` is deleted: inside the held folder when there is one.
+    fn path_of(&self, entry: &Path) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        if let (Some(parent), Some(name)) = (entry.parent(), entry.file_name())
+            && let Some((_, Some(file))) = self.0.iter().find(|(f, _)| f == parent)
+        {
+            use std::os::fd::AsRawFd;
+            return PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())).join(name);
+        }
+        entry.to_path_buf()
+    }
+}
+
 /// Removes what `find` found. Returns the folders kept because something that
 /// is not the client's is still in them.
 pub fn remove(found: &Found) -> Result<Vec<PathBuf>, String> {
+    let held = Held::open(found)?;
     for e in &found.entries {
-        remove_entry(e).map_err(|err| format!("{}: {err}", e.display()))?;
+        remove_entry(&held.path_of(e)).map_err(|err| format!("{}: {err}", e.display()))?;
     }
     let mut kept = Vec::new();
     for f in &found.folders {
@@ -176,6 +292,8 @@ pub fn remove(found: &Found) -> Result<Vec<PathBuf>, String> {
             kept.push(f.clone());
             continue;
         }
+        // Only an empty folder goes, and only the one that was listed.
+        Held::recheck(found, f)?;
         match std::fs::remove_dir(f) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("{}: {e}", f.display()));
@@ -324,6 +442,66 @@ mod tests {
         std::fs::remove_file(&dirs.config).unwrap();
         std::fs::write(&dirs.config, "x").unwrap();
         assert!(find(&dirs).unwrap_err().contains("is not a folder"));
+    }
+
+    /// What the purge reviewer did: a folder is turned into a link after the list
+    /// was made, and the removal must not go where the link leads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_turned_into_a_link_after_the_list_is_not_followed() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = client(t.path());
+        let found = find(&dirs).unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir_all(victim.join("tmp/deep")).unwrap();
+        for f in ["audit.jsonl", "token", "config.toml", "tmp/deep/precious"] {
+            std::fs::write(victim.join(f), "keep").unwrap();
+        }
+        std::fs::rename(&dirs.state, t.path().join("state-away")).unwrap();
+        std::os::unix::fs::symlink(&victim, &dirs.state).unwrap();
+        let e = remove(&found).unwrap_err();
+        assert!(e.contains("not the folder that was listed"), "{e}");
+        for f in ["audit.jsonl", "token", "config.toml", "tmp/deep/precious"] {
+            assert!(victim.join(f).exists(), "{f}");
+        }
+        // The same turn a moment later, with the folder already held: what is
+        // removed is removed in the folder that was held, not at the path.
+        let t = tempfile::tempdir().unwrap();
+        let dirs = client(t.path());
+        let found = find(&dirs).unwrap();
+        let held = Held::open(&found).unwrap();
+        let away = t.path().join("state-away");
+        std::fs::rename(&dirs.state, &away).unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir_all(victim.join("tmp")).unwrap();
+        std::fs::write(victim.join("audit.jsonl"), "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &dirs.state).unwrap();
+        remove_entry(&held.path_of(&dirs.state.join("audit.jsonl"))).unwrap();
+        remove_entry(&held.path_of(&dirs.state.join("tmp"))).unwrap();
+        assert!(victim.join("audit.jsonl").exists() && victim.join("tmp").exists());
+        assert!(!away.join("audit.jsonl").exists() && !away.join("tmp").exists());
+    }
+
+    /// Files made after the list (a command's temporary folder, a record) are the
+    /// client's too: a second `find` takes them.
+    #[test]
+    fn what_is_made_after_the_list_is_found_again() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = client(t.path());
+        let first = find(&dirs).unwrap();
+        std::fs::write(dirs.state.join("update-released-fedcba9876543210"), "x").unwrap();
+        let second = find(&dirs).unwrap();
+        assert!(
+            !first
+                .entries
+                .contains(&dirs.state.join("update-released-fedcba9876543210"))
+        );
+        assert!(
+            second
+                .entries
+                .contains(&dirs.state.join("update-released-fedcba9876543210"))
+        );
+        assert!(remove(&second).unwrap().is_empty());
     }
 
     #[test]

@@ -1299,15 +1299,19 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     // The system unit would start this user's client again after it stops, and
     // only root can stop it.
     let units_mine = !system && unit_user.as_deref() == Some(me.as_str());
+    // `is-active` says no for a unit that is between two starts (`activating`),
+    // which comes back within seconds: only a unit that is down counts as stopped.
     if units_mine
         && runner
             .try_run(&actions::argv(&[
                 "systemctl",
-                "is-active",
-                "--quiet",
+                "show",
+                "-p",
+                "ActiveState",
+                "--value",
                 install::UNIT_NAME,
             ]))
-            .is_ok()
+            .is_ok_and(|s| !matches!(s.trim(), "" | "inactive" | "failed"))
     {
         return Err(format!(
             "{} runs the client as {me}, and it would start it again: {}",
@@ -1463,7 +1467,30 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
         return Ok(ExitCode::from(1));
     }
     apply_plan(&stop)?;
-    stop_client(dirs).await?;
+    if let Err(e) = stop_client(dirs).await {
+        // The stop plan ran already: the owner is told how to undo it.
+        return Err(if stop.is_empty() {
+            e
+        } else if cfg!(windows) {
+            format!(
+                "{e}\nThe logon task was switched off: `schtasks /Change /TN {} /ENABLE` turns it on again",
+                install::TASK_NAME
+            )
+        } else {
+            format!(
+                "{e}\nThe unit was stopped: `{} {}` starts it again",
+                if system {
+                    "sudo systemctl start"
+                } else {
+                    "systemctl --user start"
+                },
+                install::UNIT_NAME
+            )
+        });
+    }
+    // What was made while the question waited and the client shut down is the
+    // client's too.
+    let found = crate::purge::find(dirs)?;
     apply_plan(&uninstall)?;
     for p in &olds {
         match std::fs::remove_file(p) {
