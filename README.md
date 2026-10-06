@@ -96,7 +96,15 @@ pithagoras-sync update --check
 pithagoras-sync update
 ```
 
-`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program and it was not released before one the client already took, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. It replaces the program the running client was started from (the installed copy its unit or logon task starts), whichever copy you run `update` from, and says so when that is not the one you ran; whether a release is newer is decided by the version of that running client; with no client running it replaces the one you ran and names the installed copy if that is another. Your config and policy stay as they are. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
+`update` takes a newer release only if its manifest carries a valid signature by the release key built into the program and it was not released before one the client already took, checks the download's size and sha256 and that it runs and reports the promised version, replaces the program in one step and restarts the client. It replaces the program the running client was started from (the installed copy its unit or logon task starts), whichever copy you run `update` from, and says so when that is not the one you ran; with no client running it replaces the one you ran and names the installed copy if that is another. Whether a release is newer is decided by the version of the program it replaces, as that file is on disk. Your config and policy stay as they are.
+
+A server set up with `setup --create-user` or `install --system` has its program in `/usr/local/bin`, owned by root, so its own user cannot replace it (`update` says so). Update it as root:
+
+```sh
+sudo pithagoras-sync update
+```
+
+As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere, and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). Each program keeps its own record of the newest release taken, so updating one never makes another refuse a release. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 

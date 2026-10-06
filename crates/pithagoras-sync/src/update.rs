@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::actions::{Runner, argv};
+use crate::install::UNIT_NAME;
+
 /// The release key (minisign public key, base64), set when a release is built.
 /// A build without it cannot update itself.
 pub const PUBLIC_KEY: Option<&str> = option_env!("PITHAGORAS_SYNC_UPDATE_KEY");
@@ -247,12 +250,27 @@ async fn fetch(source: &str, max: u64) -> Result<Vec<u8>, String> {
 }
 
 /// The program `update` replaces: the one the running client was started from
-/// when a client runs (`running`, from its status), else this one (`me`).
-pub fn target_exe(running: Option<&Path>, me: &Path) -> PathBuf {
-    match running {
-        Some(p) if p.is_absolute() => p.to_path_buf(),
-        _ => me.to_path_buf(),
+/// when a client runs (`running`, from its status), else this one (`me`). As
+/// root, `system` is the program the system unit starts (the dedicated user's of
+/// `setup`): it is replaced when it is the one run here or root runs no client of
+/// its own, so `sudo pithagoras-sync update` updates that unit's client, not a
+/// client root runs from elsewhere.
+pub fn target_exe(running: Option<&Path>, system: Option<&Path>, me: &Path) -> PathBuf {
+    let running = running.filter(|p| p.is_absolute());
+    if let Some(s) = system
+        && (running.is_none() || same_program(s, me))
+    {
+        return s.to_path_buf();
     }
+    running.unwrap_or(me).to_path_buf()
+}
+
+/// The version the program file at `exe` reports, as it is on disk now: what
+/// `update` would replace.
+pub fn version_of(exe: &Path) -> Option<String> {
+    let (ok, said) = run_version(exe).ok()?;
+    let v = said.trim().strip_prefix("pithagoras-sync ")?;
+    (ok && parse_version(v).is_some()).then(|| v.to_string())
 }
 
 /// The version a release is compared with: that of the program `update`
@@ -284,6 +302,75 @@ pub fn installed_copy(me: &Path) -> Option<PathBuf> {
     (p.is_file() && !same_program(&p, me)).then_some(p)
 }
 
+/// The system unit `setup` and `install --system` write.
+pub fn system_unit_file() -> PathBuf {
+    Path::new("/etc/systemd/system").join(UNIT_NAME)
+}
+
+/// The program a systemd unit starts: the first word of its `ExecStart=`.
+pub fn unit_program(unit: &str) -> Option<PathBuf> {
+    unit.lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))
+        .and_then(|cmd| cmd.split_whitespace().next())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// After `update` as root, for the system unit that starts `exe`: restarts it
+/// when it runs and `stale` says its process runs an older file than `exe` is
+/// now. A system unit's client cannot be asked to restart itself (its control
+/// socket answers its own user only), so systemd does it. What happened, for the
+/// owner; `None` when the unit does not run or runs `exe` as it is.
+pub fn restart_system_unit(
+    runner: &dyn Runner,
+    exe: &Path,
+    stale: impl Fn(u32) -> bool,
+) -> Option<String> {
+    let pid = runner
+        .run(&argv(&[
+            "systemctl",
+            "show",
+            "-p",
+            "MainPID",
+            "--value",
+            UNIT_NAME,
+        ]))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|p| *p != 0)?;
+    if !stale(pid) {
+        return None;
+    }
+    Some(
+        match runner.run(&argv(&["systemctl", "restart", UNIT_NAME])) {
+            Ok(_) => format!(
+                "Restarted {UNIT_NAME}, so its client runs {} as it is now.",
+                exe.display()
+            ),
+            Err(e) => format!(
+                "{UNIT_NAME} still runs the program it had and did not restart ({e}): systemctl restart {UNIT_NAME}"
+            ),
+        },
+    )
+}
+
+/// Whether process `pid` runs another file than the one at `exe` now: one that
+/// was replaced after it started (by this update, or by hand before it).
+#[cfg(target_os = "linux")]
+pub fn runs_other_file(pid: u32, exe: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // /proc/PID/exe leads to the file the process runs, even once it is deleted.
+    match (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata(exe),
+    ) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
 /// Downloads the binary, checks it against the manifest and that it runs and
 /// reports the new version, then puts it in place of `exe` in one rename. On
 /// Windows, where a running program cannot be replaced, the old one is moved
@@ -305,7 +392,9 @@ pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
     let dir = exe.parent().ok_or("this program has no folder")?;
     let tmp = dir.join(format!(".pithagoras-sync.update.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let written = write_new(&tmp, &data).and_then(|()| check_runs(&tmp, &plan.version));
+    let written = write_new(&tmp, &data)
+        .map_err(|e| write_error(e, &tmp, exe))
+        .and_then(|()| check_runs(&tmp, &plan.version));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -315,8 +404,7 @@ pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
     })
 }
 
-fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -324,13 +412,46 @@ fn write_new(path: &Path, data: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o755);
     }
-    let mut f = opts.open(path).map_err(err)?;
-    f.write_all(data).map_err(err)?;
-    f.sync_all().map_err(err)
+    let mut f = opts.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// A folder this user may not write to holds a program someone else installed:
+/// say who updates it rather than a bare errno.
+fn write_error(e: std::io::Error, path: &Path, exe: &Path) -> String {
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return format!("{}: {e}", path.display());
+    }
+    let dir = exe.parent().unwrap_or(exe).display();
+    if cfg!(windows) {
+        format!(
+            "{} cannot be replaced by this account ({dir} is not writable here): run `update` as the account that installed it, or in an elevated PowerShell",
+            exe.display()
+        )
+    } else {
+        format!(
+            "{} cannot be replaced by this user ({dir} is not writable here): it was installed by root, as `setup` and `install --system` do, so root updates it: sudo pithagoras-sync update",
+            exe.display()
+        )
+    }
 }
 
 /// The new program must start and name the version the manifest promised.
 fn check_runs(path: &Path, version: &str) -> Result<(), String> {
+    let (ok, said) =
+        run_version(path).map_err(|e| format!("the new program does not start: {e}"))?;
+    if !ok || said.trim() != format!("pithagoras-sync {version}") {
+        return Err(format!(
+            "the new program reports {:?}, not version {version}",
+            said.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `path --version`: whether it succeeded, and what it printed.
+fn run_version(path: &Path) -> std::io::Result<(bool, String)> {
     let mut tries = 0;
     let out = loop {
         match std::process::Command::new(path)
@@ -344,17 +465,13 @@ fn check_runs(path: &Path, version: &str) -> Result<(), String> {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            r => break r.map_err(|e| format!("the new program does not start: {e}"))?,
+            r => break r?,
         }
     };
-    let said = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || said.trim() != format!("pithagoras-sync {version}") {
-        return Err(format!(
-            "the new program reports {:?}, not version {version}",
-            said.trim()
-        ));
-    }
-    Ok(())
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
 }
 
 #[cfg(unix)]
@@ -407,10 +524,154 @@ mod tests {
         let home = std::env::temp_dir().join("u");
         let me = home.join("Downloads").join("pithagoras-sync");
         let installed = home.join("bin").join("pithagoras-sync");
-        assert_eq!(target_exe(Some(&installed), &me), installed);
-        assert_eq!(target_exe(None, &me), me);
+        assert_eq!(target_exe(Some(&installed), None, &me), installed);
+        assert_eq!(target_exe(None, None, &me), me);
         // An old client that does not say where it runs from.
-        assert_eq!(target_exe(Some(Path::new("")), &me), me);
+        assert_eq!(target_exe(Some(Path::new("")), None, &me), me);
+    }
+
+    #[test]
+    fn as_root_update_replaces_the_program_of_the_system_unit() {
+        let t = tempfile::tempdir().unwrap();
+        let system = t.path().join("usr-local-bin").join("pithagoras-sync");
+        let roots = t.path().join("root").join("pithagoras-sync");
+        let download = t.path().join("Downloads").join("pithagoras-sync");
+        for p in [&system, &roots, &download] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        // `sudo pithagoras-sync update` runs the unit's program: that one is
+        // replaced, even while root runs a client of its own from elsewhere.
+        assert_eq!(target_exe(Some(&roots), Some(&system), &system), system);
+        // Run from a download, with no client of root's own: the unit's program.
+        assert_eq!(target_exe(None, Some(&system), &download), system);
+        // Root's own client, updated with its own program or a download, stays
+        // the one replaced.
+        assert_eq!(target_exe(Some(&roots), Some(&system), &roots), roots);
+        assert_eq!(target_exe(Some(&roots), Some(&system), &download), roots);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_version_counted_is_that_of_the_file_on_disk() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("pithagoras-sync");
+        write_script(&exe, "echo 'pithagoras-sync 0.0.1'");
+        assert_eq!(version_of(&exe).as_deref(), Some("0.0.1"));
+        write_script(&exe, "echo 'something else 0.0.1'");
+        assert_eq!(version_of(&exe), None);
+        write_script(&exe, "echo 'pithagoras-sync 0.0.1'; exit 1");
+        assert_eq!(version_of(&exe), None);
+        assert_eq!(version_of(&t.path().join("missing")), None);
+    }
+
+    /// A program that runs `body` (the file replaced in one rename, as `update`
+    /// does, so a program still running keeps the old one).
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        let tmp = path.with_extension("new");
+        write_new(&tmp, format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[test]
+    fn the_program_of_a_unit_is_its_exec_start() {
+        assert_eq!(
+            unit_program(&crate::install::system_unit(Some("pithagoras-sync"))),
+            Some(PathBuf::from(crate::install::SYSTEM_BIN))
+        );
+        assert_eq!(
+            unit_program("[Service]\nExecStart=/opt/ps/pithagoras-sync run --x\n"),
+            Some(PathBuf::from("/opt/ps/pithagoras-sync"))
+        );
+        assert_eq!(
+            unit_program("[Service]\nExecStart=-pithagoras-sync run\n"),
+            None
+        );
+        assert_eq!(unit_program("[Service]\n"), None);
+    }
+
+    #[test]
+    fn the_system_unit_restarts_when_it_runs_an_older_file() {
+        let exe = Path::new("/usr/local/bin/pithagoras-sync");
+        let runner = |pid: &str| crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok(format!("{pid}\n")))],
+            ..Default::default()
+        };
+        let restarts = |r: &crate::actions::Fake| {
+            r.ran
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a.get(1).map(String::as_str) == Some("restart"))
+                .count()
+        };
+        // Running an older file: restarted.
+        let r = runner("4242");
+        let said = restart_system_unit(&r, exe, |pid| pid == 4242).unwrap();
+        assert!(
+            said.starts_with("Restarted pithagoras-sync.service"),
+            "{said}"
+        );
+        assert_eq!(restarts(&r), 1);
+        assert_eq!(
+            r.ran.lock().unwrap()[1],
+            crate::actions::argv(&["systemctl", "restart", UNIT_NAME])
+        );
+        // Running the file as it is, or not running: left alone.
+        let r = runner("4242");
+        assert_eq!(restart_system_unit(&r, exe, |_| false), None);
+        assert_eq!(restarts(&r), 0);
+        let r = runner("0");
+        assert_eq!(restart_system_unit(&r, exe, |_| true), None);
+        assert_eq!(restarts(&r), 0);
+        // The restart fails: the owner is told how to do it.
+        let r = crate::actions::Fake {
+            answers: vec![
+                ("systemctl show".into(), Ok("7\n".into())),
+                ("systemctl restart".into(), Err("denied".into())),
+            ],
+            ..Default::default()
+        };
+        let said = restart_system_unit(&r, exe, |_| true).unwrap();
+        assert!(
+            said.contains("systemctl restart pithagoras-sync.service"),
+            "{said}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_running_a_replaced_file_is_seen() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = t.path().join("prog");
+        std::fs::write(&exe, std::fs::read("/bin/sh").unwrap()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut tries = 0;
+        let mut child = loop {
+            // `; :` keeps the shell from exec'ing sleep in its place.
+            match std::process::Command::new(&exe)
+                .args(["-c", "sleep 30; :"])
+                .spawn()
+            {
+                Err(e) if text_busy(&e) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => break r.unwrap(),
+            }
+        };
+        let pid = child.id();
+        assert!(!runs_other_file(pid, &exe));
+        let new = t.path().join("prog.new");
+        std::fs::copy(&exe, &new).unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        assert!(runs_other_file(pid, &exe));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

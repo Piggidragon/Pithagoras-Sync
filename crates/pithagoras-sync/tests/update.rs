@@ -315,6 +315,74 @@ async fn this_build_updates_only_with_a_release_key_and_restarts_on_request() {
     );
 }
 
+/// A program in a folder this user cannot write to (root's /usr/local/bin, for
+/// the dedicated user `setup` makes): the error says who updates it.
+#[tokio::test]
+async fn a_program_this_user_cannot_replace_says_who_updates_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        // Root writes anywhere.
+        return;
+    }
+    let r = Release::new();
+    let manifest = r.publish("0.2.0", &program("0.2.0"), None);
+    let exe = r.installed();
+    let bin = exe.parent().unwrap();
+    std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
+    let e = update::install(&plan, &exe).await.unwrap_err();
+    std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(e.contains("sudo pithagoras-sync update"), "{e}");
+    assert!(e.contains(&exe.display().to_string()), "{e}");
+    assert!(!e.contains("os error"), "{e}");
+    assert_eq!(std::fs::read(&exe).unwrap(), program("0.1.0"));
+}
+
+/// The record of the newest release taken is kept per program: one taken for
+/// root's own client does not refuse an older-dated one for the dedicated user's
+/// program, while the same program still refuses it.
+#[tokio::test]
+async fn each_program_keeps_its_own_record_of_releases_taken() {
+    let r = Release::new();
+    let dirs = sync_policy::config::Dirs::under(&r.dir.join("cfg"));
+    let roots = r.installed();
+    let system = r.dir.join("system/pithagoras-sync");
+    std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+    std::fs::write(&system, program("0.1.0")).unwrap();
+    let earlier =
+        std::fs::read_to_string(r.publish_at("0.2.0", 1_000, &program("0.2.0"), None)).unwrap();
+    let earlier_sig = std::fs::read_to_string(r.dir.join("rel/manifest.json.minisig")).unwrap();
+    let manifest = r.publish_at("0.2.0", 2_000, &program("0.2.0"), None);
+    update::check(
+        &manifest,
+        &r.pk(),
+        "0.1.0",
+        Some(&dirs.update_seen_file(&roots)),
+    )
+    .await
+    .unwrap();
+    std::fs::write(&manifest, &earlier).unwrap();
+    std::fs::write(format!("{manifest}.minisig"), &earlier_sig).unwrap();
+    let offer = update::check(
+        &manifest,
+        &r.pk(),
+        "0.1.0",
+        Some(&dirs.update_seen_file(&system)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(offer.plan.unwrap().version, "0.2.0");
+    let e = update::check(
+        &manifest,
+        &r.pk(),
+        "0.1.0",
+        Some(&dirs.update_seen_file(&roots)),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("older than one this client already took"), "{e}");
+}
+
 /// A release made the way `.github/workflows/release.yml` makes it, with
 /// `sync-release manifest` and `sync-release sign`: the client takes it.
 #[tokio::test]

@@ -544,9 +544,14 @@ impl Dirs {
         self.state.join("audit.jsonl")
     }
 
-    /// The release time of the newest update manifest this client took.
-    pub fn update_seen_file(&self) -> PathBuf {
-        self.state.join("update-released")
+    /// The release time of the newest update manifest taken for `program`. One
+    /// record per program file: a user who updates two copies (root's own client
+    /// and the dedicated user's in /usr/local/bin, say) must not have a manifest
+    /// taken for one refuse an older-dated one for the other.
+    pub fn update_seen_file(&self, program: &Path) -> PathBuf {
+        let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+        self.state
+            .join(format!("update-released-{:016x}", path_hash(&program)))
     }
 
     /// Present while the client is paused by `panic`, until `unlock`.
@@ -559,12 +564,8 @@ impl Dirs {
     pub fn socket(&self) -> PathBuf {
         #[cfg(windows)]
         {
-            // FNV-1a: stable across runs, and distinct per config directory.
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in self.config.to_string_lossy().to_lowercase().bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x100000001b3);
-            }
+            // Stable across runs, and distinct per config directory.
+            let h = path_hash(&self.config);
             PathBuf::from(format!(r"\\.\pipe\pithagoras-sync-{h:016x}"))
         }
         #[cfg(not(windows))]
@@ -574,9 +575,44 @@ impl Dirs {
     }
 }
 
+/// FNV-1a of a path, case-blind on Windows, whose paths are.
+fn path_hash(path: &Path) -> u64 {
+    let s = path.to_string_lossy();
+    #[cfg(windows)]
+    let s = s.to_lowercase();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_program_has_its_own_update_record() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(t.path());
+        let a = t.path().join("a");
+        let b = t.path().join("b");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+        assert_ne!(dirs.update_seen_file(&a), dirs.update_seen_file(&b));
+        assert_eq!(dirs.update_seen_file(&a), dirs.update_seen_file(&a));
+        assert!(dirs.update_seen_file(&a).starts_with(&dirs.state));
+        // The same file by another name.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&a, t.path().join("link")).unwrap();
+            assert_eq!(
+                dirs.update_seen_file(&t.path().join("link")),
+                dirs.update_seen_file(&a)
+            );
+        }
+    }
 
     #[test]
     fn full_expires_after_eight_hours_by_default() {

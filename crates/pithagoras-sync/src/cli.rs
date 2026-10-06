@@ -232,6 +232,23 @@ pub fn is_root() -> bool {
     crate::daemon::is_root()
 }
 
+/// Restarts the system unit when its process runs an older file than `exe` is
+/// now (`replaced`: this update just replaced it). Whether it runs.
+fn restart_unit(exe: &Path, replaced: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    let stale = |pid| replaced || crate::update::runs_other_file(pid, exe);
+    #[cfg(not(target_os = "linux"))]
+    let stale = |_| replaced;
+    let runner = actions::System;
+    match crate::update::restart_system_unit(&runner, exe, stale) {
+        Some(said) => {
+            println!("{said}");
+            true
+        }
+        None => false,
+    }
+}
+
 /// What `pair` says when it runs as root or elevated. The client itself refuses to
 /// run that way unless the owner allowed it, so the warning says so instead of
 /// leaving the owner with a client that does not start.
@@ -907,27 +924,52 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let me = std::env::current_exe().map_err(|e| e.to_string())?;
             // The copy the running client was started from, which its unit or
             // logon task starts again, not necessarily the one run here (a
-            // download, while the installed copy is not on PATH). Its version,
-            // not this one's, says whether a release is newer.
+            // download, while the installed copy is not on PATH).
             let running = match control::send(&dirs.socket(), Request::Status).await {
                 Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version)),
                 _ => None,
             };
             let running = running.as_ref().map(|(p, v)| (p.as_path(), v.as_str()));
-            let exe = crate::update::target_exe(running.map(|(p, _)| p), &me);
-            let mine = env!("CARGO_PKG_VERSION");
-            let current = crate::update::current_version(running, mine);
-            let whose = if running.is_some_and(|(p, v)| p.is_absolute() && v == current) {
-                "the running client is"
+            // As root, the program of the system unit (`setup`'s dedicated user),
+            // whose client root cannot reach over its control socket.
+            let system = if cfg!(target_os = "linux") && is_root() {
+                std::fs::read_to_string(crate::update::system_unit_file())
+                    .ok()
+                    .and_then(|u| crate::update::unit_program(&u))
             } else {
-                "this is"
+                None
+            };
+            let exe = crate::update::target_exe(running.map(|(p, _)| p), system.as_deref(), &me);
+            let runs_exe = |p: &Path| p.is_absolute() && crate::update::same_program(p, &exe);
+            let client = running.filter(|(p, _)| runs_exe(p));
+            let unit_runs_exe = system.as_deref().is_some_and(runs_exe);
+            // Whether a release is newer is decided by the program it replaces,
+            // as it is on disk.
+            let mine = env!("CARGO_PKG_VERSION");
+            let (current, whose) = match crate::update::version_of(&exe) {
+                Some(v) => (v, format!("{} is", exe.display())),
+                None => {
+                    let v = crate::update::current_version(client, mine);
+                    let whose = if client.is_some_and(|(_, cv)| cv == v) {
+                        "the running client is"
+                    } else {
+                        "this is"
+                    };
+                    (v.to_string(), whose.to_string())
+                }
             };
             let offer =
-                crate::update::check(source, key, current, Some(&dirs.update_seen_file())).await?;
+                crate::update::check(source, key, &current, Some(&dirs.update_seen_file(&exe)))
+                    .await?;
             // The date shows a release listing that stopped moving.
             let released = crate::update::utc(offer.released);
             let Some(plan) = offer.plan else {
                 println!("Up to date ({whose} {current}; the newest release was made {released}).");
+                // The file is current, but the unit may still run the one it
+                // replaced (an update whose restart failed, or a copy by hand).
+                if unit_runs_exe && !check {
+                    restart_unit(&exe, false);
+                }
                 return Ok(ExitCode::SUCCESS);
             };
             if check {
@@ -940,26 +982,34 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             crate::update::install(&plan, &exe).await?;
             println!("Updated {} to {}.", exe.display(), plan.version);
             if !crate::update::same_program(&exe, &me) {
-                println!(
-                    "That is the program the running client was started from; the one you ran, {}, is unchanged.",
-                    me.display()
-                );
+                println!("The one you ran, {}, is unchanged.", me.display());
             }
-            match control::send(&dirs.socket(), Request::Restart).await {
-                Ok(Some(r)) if r.ok => println!(
+            let restarted = client.is_some()
+                && matches!(
+                    control::send(&dirs.socket(), Request::Restart).await,
+                    Ok(Some(r)) if r.ok
+                );
+            if restarted {
+                println!(
                     "The running client restarts with it (its unit or logon task starts it again)."
-                ),
-                _ => {
+                );
+            } else if unit_runs_exe {
+                if !restart_unit(&exe, true) {
                     println!(
-                        "No client of this user is running. A client run by a system unit restarts with: systemctl restart pithagoras-sync"
+                        "{} is not running; it starts the new version when it starts.",
+                        crate::install::UNIT_NAME
                     );
-                    if let Some(other) = crate::update::installed_copy(&me) {
-                        println!(
-                            "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
-                            other.display(),
-                            other.display()
-                        );
-                    }
+                }
+            } else {
+                println!(
+                    "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
+                );
+                if let Some(other) = crate::update::installed_copy(&me) {
+                    println!(
+                        "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
+                        other.display(),
+                        other.display()
+                    );
                 }
             }
         }
