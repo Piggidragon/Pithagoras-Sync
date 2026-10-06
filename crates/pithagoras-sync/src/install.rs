@@ -534,7 +534,8 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
         // `install` again (to repair or update by hand) ends the task first.
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
+            // Not running (every first install): no news, no note.
+            hint: String::new(),
         },
         Action::Copy {
             from: exe.to_path_buf(),
@@ -570,7 +571,8 @@ pub fn windows_stop_plan() -> Vec<Action> {
         },
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
+            // Not running (every first install): no news, no note.
+            hint: String::new(),
         },
     ]
 }
@@ -580,7 +582,8 @@ pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
     let mut plan = vec![
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
+            // Not running (every first install): no news, no note.
+            hint: String::new(),
         },
         Action::Run {
             argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
@@ -852,6 +855,36 @@ mod tests {
                 .any(|l| l.ends_with("applications/pithagoras-sync.desktop"))
         );
         assert!(listed.iter().any(|l| l.contains("xdg-mime default")));
+    }
+
+    /// Ending a logon task that does not run (on every first install) is no
+    /// news: it adds no note. A start that failed does.
+    #[test]
+    fn a_task_that_was_not_running_adds_no_note() {
+        let tries = |plan: Vec<Action>| -> Vec<Action> {
+            plan.into_iter()
+                .filter(|a| matches!(a, Action::Try { .. }))
+                .collect()
+        };
+        let fake = Fake {
+            answers: vec![
+                ("schtasks /End".into(), Err("`schtasks /End` failed".into())),
+                ("schtasks /Run".into(), Err("`schtasks /Run` failed".into())),
+            ],
+            ..Fake::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let install = tries(windows_plan(r"C:\x", Path::new("p.exe"), "S-1"));
+        assert_eq!(
+            apply(&install, root.path(), &fake).unwrap(),
+            ["`schtasks /Run` failed: it starts at the next logon"]
+        );
+        for plan in [windows_stop_plan(), windows_uninstall_plan(r"C:\x")] {
+            assert_eq!(
+                apply(&tries(plan), root.path(), &fake).unwrap(),
+                Vec::<String>::new()
+            );
+        }
     }
 
     #[test]

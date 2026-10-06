@@ -185,7 +185,8 @@ pub enum Action {
     Run {
         argv: Vec<String>,
     },
-    /// May fail; `hint` tells the owner what to do then.
+    /// May fail; `hint` tells the owner what to do then. Empty: a failure is
+    /// no news (a task ended that did not run), and adds no note.
     Try {
         argv: Vec<String>,
         hint: String,
@@ -292,7 +293,9 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
                 runner.run(argv)?;
             }
             Action::Try { argv, hint } => {
-                if let Err(e) = runner.try_run(argv) {
+                if let Err(e) = runner.try_run(argv)
+                    && !hint.is_empty()
+                {
                     hints.push(format!("{e}: {hint}"));
                 }
             }
