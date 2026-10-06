@@ -2,7 +2,7 @@
 
 This page is for people who want to connect their computer to their Pithagoras portal and never open a terminal. It says what you see, what each window does, and how to remove the program again. A server, or anyone who prefers the command line, follows [the README](../README.md) instead; nothing below changes that way.
 
-Pithagoras Sync works on Windows 10 and 11 and on Linux desktops (GNOME, KDE and others). On Linux it shows its windows with `zenity` or `kdialog`, which most desktops have; if neither is installed, install one of them (`sudo apt install zenity`) or use the command line.
+Pithagoras Sync works on Windows 10 and 11 and on Linux desktops (GNOME, KDE and others). On Linux it shows its windows with `zenity` or `kdialog`, which most desktops have; if neither is installed, install one of them (`sudo apt install zenity`) or use the command line. Only a copy the system installed counts (one root alone can change, as in `/usr/bin`): a `zenity` in your home folder is not used, since the windows ask for your passwords.
 
 The windows speak English or German, as your desktop does: on Linux the language settings of your session (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`), on Windows the display language. Any other language gets English. The quotes below are the English texts; the German windows say the same in German. The command line stays English.
 

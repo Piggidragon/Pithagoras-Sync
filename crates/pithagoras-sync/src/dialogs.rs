@@ -73,18 +73,13 @@ pub enum Helper {
 
 /// Pango markup's three special characters (zenity's list and entry texts).
 fn pango(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    sync_policy::approve::markup_escaped(s)
 }
 
 /// kdialog shows rich text when the text looks like it: `<qt>` makes it so
 /// always, and the escaped text inside can then hold no tag of its own.
 fn qt(s: &str) -> String {
-    let body = s
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let body = sync_policy::approve::markup_escaped(s)
         .replace('"', "&quot;")
         .replace('\n', "<br>");
     format!("<qt>{body}</qt>")
@@ -214,12 +209,54 @@ pub fn has_display() -> bool {
         .any(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty()))
 }
 
-/// The first `name` in an absolute `PATH` folder.
-fn on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+/// The first `name` in an absolute `PATH` folder that `trusted` takes.
+fn on_path(name: &str, path: &std::ffi::OsStr, trusted: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(name))
-        .find(|p| is_executable(p))
+        .find(|p| is_executable(p) && trusted(p))
+}
+
+/// Set (debug builds only) to the one folder whose programs count as the
+/// system's: the tests' stand-in dialog programs. A release build ignores it.
+pub const TEST_DIALOG_DIR: &str = "PITHAGORAS_SYNC_TEST_DIALOG_DIR";
+
+/// Whether a program found on `PATH` may be shown the owner's passwords: the
+/// file and every folder above it (links resolved) belong to root and nobody
+/// else can write them. A program the user (or a command of the agent) could
+/// change or put earlier on `PATH`, as in `~/bin`, could be a stand-in that
+/// draws the same window and keeps what is typed into it.
+pub fn system_program(p: &Path) -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os(TEST_DIALOG_DIR)
+        && p.parent() == Some(Path::new(&dir))
+    {
+        return true;
+    }
+    root_only(p)
+}
+
+#[cfg(unix)]
+fn root_only(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = std::fs::canonicalize(p) else {
+        return false;
+    };
+    real.ancestors().all(|a| {
+        std::fs::metadata(a).is_ok_and(|m| {
+            // A sticky folder (`/tmp`) that others may write in still keeps
+            // them from replacing what root owns there.
+            let others_write = m.mode() & 0o022 != 0;
+            let sticky = m.is_dir() && m.mode() & 0o1000 != 0;
+            m.uid() == 0 && (!others_write || sticky)
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn root_only(_p: &Path) -> bool {
+    // Windows shows its own message boxes and runs no dialog program.
+    false
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -232,11 +269,16 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// kdialog on KDE (when there), else zenity, else kdialog.
-pub fn find_helper(path: &std::ffi::OsStr, desktop: &str) -> Option<Helper> {
+/// kdialog on KDE (when there), else zenity, else kdialog; only one that
+/// `trusted` takes (`system_program`).
+pub fn find_helper(
+    path: &std::ffi::OsStr,
+    desktop: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+) -> Option<Helper> {
     let kde = desktop.split(':').any(|d| d.eq_ignore_ascii_case("kde"));
-    let kdialog = || on_path("kdialog", path).map(Helper::Kdialog);
-    let zenity = || on_path("zenity", path).map(Helper::Zenity);
+    let kdialog = || on_path("kdialog", path, trusted).map(Helper::Kdialog);
+    let zenity = || on_path("zenity", path, trusted).map(Helper::Zenity);
     if kde {
         kdialog().or_else(zenity)
     } else {
@@ -306,7 +348,7 @@ pub fn locale_fix(
 
 /// The locales installed for the dialog programs: `locale -a`, or none known.
 fn installed_locales(path: &std::ffi::OsStr) -> Vec<String> {
-    let Some(prog) = on_path("locale", path) else {
+    let Some(prog) = on_path("locale", path, &system_program) else {
         return Vec::new();
     };
     std::process::Command::new(prog)
@@ -345,7 +387,7 @@ impl Native {
         }
         let path = std::env::var_os("PATH")?;
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-        let helper = find_helper(&path, &desktop)?;
+        let helper = find_helper(&path, &desktop, &system_program)?;
         let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
         Some(Native::new(helper, locale))
     }
@@ -726,19 +768,50 @@ mod tests {
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let path = std::ffi::OsString::from(t.path());
+        let any = |_: &Path| true;
         assert_eq!(
-            find_helper(&path, "KDE"),
+            find_helper(&path, "KDE", &any),
             Some(Helper::Kdialog(t.path().join("kdialog")))
         );
         assert_eq!(
-            find_helper(&path, "ubuntu:GNOME"),
+            find_helper(&path, "ubuntu:GNOME", &any),
+            Some(Helper::Zenity(t.path().join("zenity")))
+        );
+        // One that is not trusted is passed over.
+        let no_kdialog = |p: &Path| !p.ends_with("kdialog");
+        assert_eq!(
+            find_helper(&path, "KDE", &no_kdialog),
             Some(Helper::Zenity(t.path().join("zenity")))
         );
         std::fs::remove_file(t.path().join("zenity")).unwrap();
         assert_eq!(
-            find_helper(&path, "GNOME"),
+            find_helper(&path, "GNOME", &any),
             Some(Helper::Kdialog(t.path().join("kdialog")))
         );
+    }
+
+    /// A dialog program in a folder the user can write (`~/bin`, or here a
+    /// temporary folder) is not shown a password, wherever it is on `PATH`;
+    /// one root alone can change is.
+    #[cfg(unix)]
+    #[test]
+    fn a_dialog_program_the_user_could_change_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let fake = t.path().join("zenity");
+        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!root_only(&fake));
+        let path =
+            std::env::join_paths([t.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        assert_ne!(
+            find_helper(&path, "GNOME", &root_only),
+            Some(Helper::Zenity(fake.clone()))
+        );
+        // A user-owned folder above a root-owned file counts against it too.
+        let inner = t.path().join("sub");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(!root_only(&inner));
     }
 
     #[test]

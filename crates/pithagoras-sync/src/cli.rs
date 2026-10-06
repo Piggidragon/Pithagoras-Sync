@@ -886,10 +886,11 @@ pub(crate) async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Re
             None => match storage {
                 SecretStorage::Memory => false,
                 SecretStorage::File => crate::secrets::file(dirs).exists(),
+                // Without unlocking it: a status is no reason for a prompt.
                 SecretStorage::Keyring => sync_policy::keyring::system()
-                    .get(crate::secrets::ELEVATION)
+                    .has(crate::secrets::ELEVATION)
                     .await
-                    .is_ok_and(|s| s.is_some()),
+                    .unwrap_or(false),
             },
         },
     )
@@ -1076,10 +1077,7 @@ pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
     let [_, arg] = args else { return None };
     let arg = arg.to_str()?;
     let scheme = format!("{}:", install::SCHEME);
-    // `get`: the scheme's length may end inside a character of the argument.
-    arg.get(..scheme.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(&scheme))
-        .then(|| arg.to_string())
+    sync_connector::url::strip_prefix_ci(arg, &scheme).map(|_| arg.to_string())
 }
 
 /// Whether a start without a command is a double click or the menu's: no
@@ -1258,8 +1256,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let tokens = token_store(&dirs, &cfg);
             cfg.portal = None;
             cfg.save(&dirs.config_file())?;
-            tokens.delete().await?;
+            // The running client lets go of the portal before the token goes:
+            // a keyring that fails here must not leave it connected.
             reload_running(&dirs).await;
+            tokens.delete().await.map_err(|e| {
+                format!("unpaired (the config names no portal now, and a running client was told), but {e}; run `unpair` again to remove the token")
+            })?;
             println!("Unpaired. Remove the device in the portal as well.");
         }
         Cmd::Status { json } => match control::send(&dirs.socket(), Request::Status).await? {
@@ -1436,7 +1438,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 // the setting, then away from the old place.
                 let from = token_store(&dirs, &cfg);
                 let to = token_store(&dirs, &next);
-                if let Some(n) = from.switch(&to, || next.save(&dirs.config_file())).await? {
+                for n in from.switch(&to, || next.save(&dirs.config_file())).await? {
                     eprintln!("note: {n}");
                 }
             } else {
@@ -2000,12 +2002,19 @@ pub(crate) async fn purge(
         .and_then(|r| r.status);
     let config = DeviceConfig::load(&dirs.config_file()).ok();
     let portal = config.as_ref().and_then(|c| c.portal.clone());
-    // What the keyring keeps for the client, where the config puts it there.
+    // What the keyring keeps for the client: where the config puts it there,
+    // and an entry left from an earlier setting (found without a prompt).
+    let keyring = sync_policy::keyring::system();
+    let left_in_keyring = |name: &'static str| {
+        let keyring = keyring.clone();
+        async move { keyring.has(name).await == Ok(true) }
+    };
     let tokens = config.as_ref().map(|c| token_store(dirs, c));
-    let keyring_token = tokens.as_ref().is_some_and(|t| t.uses_keyring());
+    let token_setting = tokens.as_ref().is_some_and(|t| t.uses_keyring());
+    let keyring_token = token_setting || left_in_keyring(sync_connector::token::KEYRING_NAME).await;
     let keyring_password = config.as_ref().is_some_and(|c| {
         c.policy.privilege.secret_storage == sync_policy::config::SecretStorage::Keyring
-    });
+    }) || (linux && left_in_keyring(crate::secrets::ELEVATION).await);
 
     let mut notes = Vec::new();
     if let Some(p) = &portal {
@@ -2119,11 +2128,15 @@ pub(crate) async fn purge(
     apply_plan(&uninstall).map_err(after_stop)?;
     deleted.set(true);
     // The keyring first: the config that says what is there goes with the files.
-    if let Some(t) = tokens.as_ref().filter(|_| keyring_token) {
+    if let Some(t) = tokens.as_ref().filter(|_| token_setting) {
         t.delete().await.map_err(after_stop)?;
+    } else if keyring_token {
+        keyring
+            .delete(sync_connector::token::KEYRING_NAME)
+            .await
+            .map_err(|e| after_stop(format!("cannot remove the token from the keyring: {e}")))?;
     }
     if keyring_password {
-        let keyring = sync_policy::keyring::system();
         crate::secrets::forget(
             dirs,
             sync_policy::config::SecretStorage::Keyring,

@@ -266,6 +266,7 @@ async fn this_build_updates_only_with_a_release_key_and_restarts_on_request() {
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("USER", "tester")
+            .env("PITHAGORAS_SYNC_NO_KEYRING", "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         c

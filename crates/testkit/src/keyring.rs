@@ -28,6 +28,8 @@ pub struct State {
     /// The prompts waiting for that.
     pub waiting: Vec<SignalEmitter<'static>>,
     pub prompts: u32,
+    /// Set: deleting an item fails with this (a delete prompt dismissed).
+    pub refuse_delete: Option<String>,
     pub next: u32,
     /// The secrets as the service received them, for the checks below.
     pub labels: Vec<String>,
@@ -149,6 +151,9 @@ impl Item {
         let mut s = self.0.lock().unwrap();
         if s.locked {
             return Err(zbus::fdo::Error::Failed("locked".into()));
+        }
+        if let Some(e) = &s.refuse_delete {
+            return Err(zbus::fdo::Error::Failed(e.clone()));
         }
         s.items.retain(|(p, ..)| *p != self.1);
         Ok(ObjectPath::try_from("/").unwrap().into())

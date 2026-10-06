@@ -43,6 +43,10 @@ pub struct Daemon {
     /// clear`). A load from the keyring may wait minutes on its unlock prompt;
     /// it keeps what it read only when nothing of these came in meanwhile.
     secret_gen: std::sync::Mutex<u64>,
+    /// `sudo set` and `sudo clear` write the stored password one after the
+    /// other: a clear that comes in while a set waits on the keyring's prompt
+    /// runs after it, and so takes out what the set stored.
+    secret_writes: tokio::sync::Mutex<()>,
 }
 
 /// With `approvals.desktop_notifications` on a Linux desktop: each approval is also
@@ -235,7 +239,16 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         keyring,
         secret_error: std::sync::Mutex::new(None),
         secret_gen: std::sync::Mutex::new(0),
+        secret_writes: tokio::sync::Mutex::new(()),
     });
+
+    // The file (or nothing, for memory) before the link starts: reading it waits
+    // on nobody.
+    if daemon.store.config().policy.privilege.secret_storage != SecretStorage::Keyring
+        && let Err(e) = daemon.load_stored_secret().await
+    {
+        warn!("elevation password {e}");
+    }
 
     let (shutdown_tx, shutdown) = watch::channel(false);
     let control = tokio::spawn(serve_control(
@@ -250,16 +263,11 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         status_tx,
         shutdown.clone(),
     ));
-    // After the control channel is up: a keyring may ask the owner to unlock it,
-    // and `panic` must reach the client meanwhile.
-    let loader = daemon.clone();
-    tokio::spawn(async move {
-        if let Err(e) = loader.load_stored_secret().await {
-            warn!(
-                "elevation password {e}; sudo commands run without it until `pithagoras-sync unlock` or `sudo set`"
-            );
-        }
-    });
+    // The keyring after the control channel is up: it may ask the owner to
+    // unlock it, and `panic` must reach the client meanwhile.
+    if daemon.store.config().policy.privilege.secret_storage == SecretStorage::Keyring {
+        tokio::spawn(load_from_keyring(daemon.clone(), shutdown.clone()));
+    }
     wait_for_signals(&daemon).await;
     info!("shutting down");
     shutdown_tx.send_replace(true);
@@ -487,6 +495,13 @@ impl Daemon {
                     return Reply::err(format!("there is no secret {name}"));
                 }
                 self.drop_secret();
+                let _one = match self.secret_writes.try_lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        info!("sudo clear waits for the sudo set before it");
+                        self.secret_writes.lock().await
+                    }
+                };
                 let storage = self.store.config().policy.privilege.secret_storage;
                 let forgot =
                     crate::secrets::forget(&self.dirs, storage, self.keyring.as_ref()).await;
@@ -514,9 +529,21 @@ impl Daemon {
             return Err("the client is being traced; it does not take the password now".into());
         }
         crate::secrets::check(value.expose())?;
+        let _one = self.secret_writes.lock().await;
+        let started = *self.secret_gen.lock().unwrap();
         let storage = self.store.config().policy.privilege.secret_storage;
         crate::secrets::store(&self.dirs, storage, self.keyring.as_ref(), &value).await?;
         let mut generation = self.secret_gen.lock().unwrap();
+        // A `panic` or `sudo clear` while the keyring asked to be unlocked wins:
+        // the client does not hold the password it was given before them (a
+        // waiting clear takes the stored one out next).
+        if *generation != started {
+            info!("elevation password not taken: panic or sudo clear came in while it was stored");
+            return Err(format!(
+                "a panic or sudo clear came in while the password was stored ({}), so the client does not hold it; `pithagoras-sync unlock` loads a stored one again",
+                storage.as_str()
+            ));
+        }
         *generation += 1;
         self.device.secrets.set(value);
         *self.secret_error.lock().unwrap() = None;
@@ -585,6 +612,42 @@ impl Daemon {
                     "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
                 }
             },
+        }
+    }
+}
+
+/// Loads the password from the keyring at start. A keyring service that is not
+/// there yet (the client started at login before it) is tried again, as for the
+/// token, until the password is loaded, the keyring says no, or the owner set,
+/// cleared or dropped it (`sudo set`, `sudo clear`, `panic`) meanwhile.
+async fn load_from_keyring(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
+    let first = *d.secret_gen.lock().unwrap();
+    let mut retry = KEYRING_RETRY;
+    loop {
+        let e = tokio::select! {
+            r = d.load_stored_secret() => match r {
+                Ok(()) => return,
+                Err(e) => e,
+            },
+            _ = until(&mut shutdown) => return,
+        };
+        if !sync_policy::keyring::may_come_later(&e) {
+            warn!(
+                "elevation password {e}; sudo commands run without it until `pithagoras-sync unlock` or `sudo set`"
+            );
+            return;
+        }
+        warn!(
+            "elevation password {e}; trying again in {}s",
+            retry.as_secs()
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(retry) => {}
+            _ = until(&mut shutdown) => return,
+        }
+        retry = (retry * 2).min(KEYRING_RETRY_MAX);
+        if *d.secret_gen.lock().unwrap() != first || d.device.is_paused() {
+            return;
         }
     }
 }

@@ -130,15 +130,16 @@ pub async fn store(
 }
 
 /// Forgets the stored password: the file always (an old one may be left from
-/// another storage), the keyring entry where the keyring keeps it. Memory
-/// storage leaves the keyring alone, so it never asks to unlock one.
+/// another storage), the keyring entry where the keyring keeps it or one is
+/// left from when it did. Another storage asks the keyring only whether there
+/// is an entry, which needs no unlock: without one it never asks for a prompt.
 pub async fn forget(
     dirs: &Dirs,
     storage: SecretStorage,
     keyring: &dyn SecretStore,
 ) -> Result<(), String> {
     remove(&file(dirs))?;
-    if storage == SecretStorage::Keyring {
+    if storage == SecretStorage::Keyring || keyring.has(ELEVATION).await == Ok(true) {
         keyring
             .delete(ELEVATION)
             .await
@@ -426,13 +427,23 @@ mod tests {
         assert!(!file(&dirs).exists(), "nothing on disk");
         let got = load_stored(&dirs, SecretStorage::Keyring, &ks).await;
         assert_eq!(got.unwrap().unwrap().expose(), "pw one");
-        // Memory storage neither reads nor clears the keyring.
+        // Memory storage does not read the keyring, but `sudo clear` takes out
+        // what keyring storage left there before the owner switched away.
         assert_eq!(
             load_stored(&dirs, SecretStorage::Memory, &ks).await,
             Ok(None)
         );
         forget(&dirs, SecretStorage::Memory, &ks).await.unwrap();
-        assert!(ks.entries.lock().unwrap().contains_key(ELEVATION));
+        assert!(ks.entries.lock().unwrap().is_empty());
+        forget(&dirs, SecretStorage::File, &ks).await.unwrap();
+        store(&dirs, SecretStorage::Keyring, &ks, &pw)
+            .await
+            .unwrap();
+        forget(&dirs, SecretStorage::File, &ks).await.unwrap();
+        assert!(ks.entries.lock().unwrap().is_empty());
+        store(&dirs, SecretStorage::Keyring, &ks, &pw)
+            .await
+            .unwrap();
         // A keyring that fails is an error, never the file or nothing.
         *ks.fail.lock().unwrap() = Some("the prompt was cancelled".into());
         let e = load_stored(&dirs, SecretStorage::Keyring, &ks)
@@ -447,6 +458,9 @@ mod tests {
         *ks.fail.lock().unwrap() = None;
         forget(&dirs, SecretStorage::Keyring, &ks).await.unwrap();
         assert!(ks.entries.lock().unwrap().is_empty());
+        // No keyring at all: another storage forgets without an error.
+        *ks.fail.lock().unwrap() = Some("no keyring service".into());
+        forget(&dirs, SecretStorage::Memory, &ks).await.unwrap();
     }
 
     /// A stand-in sudo: it logs its arguments and environment, passes `-n`

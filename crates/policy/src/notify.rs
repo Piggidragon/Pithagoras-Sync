@@ -68,9 +68,7 @@ impl NotifyApprover {
         let esc = |s: &str| {
             let s = visible(s);
             if self.markup {
-                s.replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
+                crate::approve::markup_escaped(&s)
             } else {
                 s
             }
@@ -117,10 +115,7 @@ pub async fn show(summary: &str, body: &str) -> Result<(), String> {
     let caps = proxy.get_capabilities().await.map_err(|e| e.to_string())?;
     let mut body = clip(&visible(body), 2 * MAX_TARGET);
     if caps.iter().any(|c| c == "body-markup") {
-        body = body
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+        body = crate::approve::markup_escaped(&body);
     }
     proxy
         .notify(

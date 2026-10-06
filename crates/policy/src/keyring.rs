@@ -31,6 +31,12 @@ pub trait SecretStore: Send + Sync {
     fn set<'a>(&'a self, name: &'a str, value: &'a Secret) -> BoxFuture<'a, Result<(), String>>;
     /// Removes it; none there is no error.
     fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    /// Whether there is an entry, without unlocking the keyring or asking the
+    /// owner anything: for a status, or to find an entry left from another
+    /// storage. Where a read asks nobody anyway, it is a read.
+    fn has<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move { self.get(name).await.map(|s| s.is_some()) })
+    }
 }
 
 /// What a call says when the keyring service is not on the session bus.
@@ -435,6 +441,14 @@ pub mod secret_service {
             Ok(())
         }
 
+        /// Searching needs no unlock: a locked keyring names its items too.
+        async fn has_secret(&self, name: &str) -> Result<bool, String> {
+            let conn = self.connect().await?;
+            let service = timed(ServiceProxy::new(&conn)).await?;
+            let (unlocked, locked) = timed(service.search_items(attributes(name))).await?;
+            Ok(!unlocked.is_empty() || !locked.is_empty())
+        }
+
         async fn delete_secret(&self, name: &str) -> Result<(), String> {
             let conn = self.connect().await?;
             let service = timed(ServiceProxy::new(&conn)).await?;
@@ -472,6 +486,10 @@ pub mod secret_service {
 
         fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(self.delete_secret(name))
+        }
+
+        fn has<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<bool, String>> {
+            Box::pin(self.has_secret(name))
         }
     }
 }

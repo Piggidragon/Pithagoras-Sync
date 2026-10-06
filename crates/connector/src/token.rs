@@ -180,26 +180,35 @@ impl TokenStore {
     /// Moves the token from this store to `to` (`config set token_storage`): it
     /// is written to the new place first, then `commit` saves the setting, and
     /// only then does the old place lose it. A failure before `commit` leaves
-    /// the token and the setting as they were.
+    /// the token and the setting as they were. Once the setting is saved the
+    /// switch has happened: an old place that cannot be cleared is a note for
+    /// the owner, not an error, so the caller still tells the running client.
     pub async fn switch(
         &self,
         to: &TokenStore,
         commit: impl FnOnce() -> Result<(), String>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Vec<String>, String> {
         let Some(token) = self.current().await? else {
             commit()?;
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let (in_keyring, note) = to.write(&token).await?;
         commit()?;
+        let mut notes: Vec<String> = note.into_iter().collect();
         if in_keyring {
-            self.remove_file()?;
-        } else if self.uses_keyring() {
-            self.keyring.delete(KEYRING_NAME).await.map_err(|e| {
-                format!("the token is in the file now, but its keyring entry stays: {e}")
-            })?;
+            if let Err(e) = self.remove_file() {
+                notes.push(format!(
+                    "the token is in the keyring now, but its old file stays: {e}"
+                ));
+            }
+        } else if self.uses_keyring()
+            && let Err(e) = self.keyring.delete(KEYRING_NAME).await
+        {
+            notes.push(format!(
+                "the token is in the file now, but its keyring entry stays (run `config set token_storage file` again to remove it): {e}"
+            ));
         }
-        Ok(note)
+        Ok(notes)
     }
 }
 
@@ -350,6 +359,36 @@ mod tests {
         .await
         .unwrap();
         assert!(committed);
+    }
+
+    /// The setting saved, the switch has happened: an old keyring entry that
+    /// cannot be removed is a note, not an error that would keep the running
+    /// client from hearing of the change.
+    #[tokio::test]
+    async fn an_old_place_that_cannot_be_cleared_is_a_note() {
+        let t = tempfile::tempdir().unwrap();
+        let ks = Arc::new(FakeStore::default());
+        let file = store(t.path(), Some(TokenStorage::File), &ks, false);
+        let keyring = store(t.path(), Some(TokenStorage::Keyring), &ks, false);
+        keyring.save(T1).await.unwrap();
+        let mut committed = false;
+        let notes = keyring
+            .switch(&file, || {
+                committed = true;
+                // The keyring fails from here: its delete prompt is dismissed.
+                *ks.fail.lock().unwrap() = Some("prompt dismissed".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(committed);
+        assert!(
+            notes.len() == 1
+                && notes[0].contains("keyring entry stays")
+                && notes[0].contains("prompt dismissed"),
+            "{notes:?}"
+        );
+        assert_eq!(file.load().await.unwrap(), T1);
     }
 
     #[tokio::test]

@@ -525,6 +525,41 @@ async fn uninstall(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     }
 }
 
+/// How the client is set up for this user on Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxInstall {
+    /// The user unit `install` writes.
+    User,
+    /// No user unit, but the system unit (`install --system`, `setup`) runs
+    /// the client as this user: installing a user unit next to it would start
+    /// a second client for the same config.
+    System,
+    None,
+}
+
+fn linux_install(
+    home: Option<&std::path::Path>,
+    system_unit: &std::path::Path,
+    me: &str,
+) -> LinuxInstall {
+    if home.is_some_and(|h| {
+        h.join(".config/systemd/user")
+            .join(crate::install::UNIT_NAME)
+            .is_file()
+    }) {
+        return LinuxInstall::User;
+    }
+    let runs_as_me = std::fs::read_to_string(system_unit)
+        .ok()
+        .and_then(|u| crate::install::unit_user(&u))
+        .is_some_and(|u| u == me);
+    if runs_as_me {
+        LinuxInstall::System
+    } else {
+        LinuxInstall::None
+    }
+}
+
 /// The system as the commands change it.
 pub struct RealHost {
     pub dirs: Dirs,
@@ -549,11 +584,14 @@ impl Host for RealHost {
                 ]))
                 .is_ok();
         }
-        sync_ops::info::home().is_some_and(|h| {
-            h.join(".config/systemd/user")
-                .join(crate::install::UNIT_NAME)
-                .is_file()
-        })
+        match linux_install(
+            sync_ops::info::home().as_deref(),
+            &crate::update::system_unit_file(),
+            &sync_ops::info::user().0,
+        ) {
+            LinuxInstall::User | LinuxInstall::System => true,
+            LinuxInstall::None => false,
+        }
     }
 
     fn paired(&self) -> Option<String> {
@@ -746,6 +784,18 @@ impl Host for RealHost {
     }
 
     async fn uninstall(&self, purge: bool) -> Result<String, String> {
+        if cfg!(target_os = "linux")
+            && linux_install(
+                sync_ops::info::home().as_deref(),
+                &crate::update::system_unit_file(),
+                &sync_ops::info::user().0,
+            ) == LinuxInstall::System
+        {
+            return Err(format!(
+                "the client runs from the system unit {} (installed with `install --system` or `setup`), which only root can remove: sudo pithagoras-sync uninstall --system",
+                crate::update::system_unit_file().display()
+            ));
+        }
         let program = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -1803,5 +1853,31 @@ mod tests {
             PairUri::parse("pithagoras-sync://pair?portal=http://127.0.0.1:3000/a%2520b&code=x1")
                 .unwrap();
         assert_eq!(PairUri::parse(&link_of(&u)).unwrap(), u);
+    }
+
+    /// A client installed for the whole system (`install --system --user me`,
+    /// `setup`) counts as installed for its user: the window does not put a
+    /// second, user-unit client next to it. One running as another user does
+    /// not count.
+    #[test]
+    fn a_system_unit_for_this_user_counts_as_installed() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let unit = t.path().join("system.service");
+        assert_eq!(linux_install(Some(&home), &unit, "me"), LinuxInstall::None);
+        std::fs::write(&unit, crate::install::system_unit(Some("someone"))).unwrap();
+        assert_eq!(linux_install(Some(&home), &unit, "me"), LinuxInstall::None);
+        std::fs::write(&unit, crate::install::system_unit(Some("me"))).unwrap();
+        assert_eq!(
+            linux_install(Some(&home), &unit, "me"),
+            LinuxInstall::System
+        );
+        assert_eq!(linux_install(None, &unit, "me"), LinuxInstall::System);
+        let user_unit = home
+            .join(".config/systemd/user")
+            .join(crate::install::UNIT_NAME);
+        std::fs::create_dir_all(user_unit.parent().unwrap()).unwrap();
+        std::fs::write(&user_unit, crate::install::user_unit()).unwrap();
+        assert_eq!(linux_install(Some(&home), &unit, "me"), LinuxInstall::User);
     }
 }

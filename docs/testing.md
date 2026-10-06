@@ -36,7 +36,7 @@ next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) a
 
 The tests never show a window or touch a keyring: the flow (`gui.rs`) runs against fake dialogs and a fake host, the dialog programs' arguments are checked as built, `tests/e2e.rs` runs the real binary with stand-in `zenity`/`kdialog` scripts on `PATH`, and the Secret Service code runs against a fake service of the testkit (`sync_testkit::keyring`) on a private `dbus-daemon`. To try them by hand on a machine without a display:
 
-- **A fake dialog program.** Put a script named `zenity` (or `kdialog`) first on `PATH` that prints its arguments and answers, and run with any `DISPLAY` set:
+- **A fake dialog program.** The client takes a dialog program only from a folder root alone can change (permissions.md, "The graphical flow"). A debug build also takes the ones in the folder `PITHAGORAS_SYNC_TEST_DIALOG_DIR` names; a release build ignores that variable. Put a script named `zenity` (or `kdialog`) there and first on `PATH` that prints its arguments and answers, and run the debug build with any `DISPLAY` set:
 
   ```sh
   mkdir -p /tmp/fakegui && cat > /tmp/fakegui/zenity <<'SH'
@@ -45,10 +45,12 @@ The tests never show a window or touch a keyring: the flow (`gui.rs`) runs again
   exit 0                     # 0: Yes/OK; 1: No/Cancel. An --entry or --list answer goes to stdout.
   SH
   chmod +x /tmp/fakegui/zenity
-  DISPLAY=:99 PATH=/tmp/fakegui:$PATH pithagoras-sync 'pithagoras-sync://pair?portal=http://127.0.0.1:18080&code=ABC123'
+  DISPLAY=:99 PATH=/tmp/fakegui:$PATH PITHAGORAS_SYNC_TEST_DIALOG_DIR=/tmp/fakegui \
+    target/debug/pithagoras-sync 'pithagoras-sync://pair?portal=http://127.0.0.1:18080&code=ABC123'
   ```
 
-  With the mock portal (`sync-mock-portal 18080`, then `code ABC123`) this pairs after the stand-in's "Yes". `tests/e2e.rs` (`fake_dialogs`) has a stand-in that answers from a file, line by line.
+  With the mock portal (`sync-mock-portal 18080`, then `code ABC123`) this pairs after the stand-in's "Yes". `tests/e2e.rs` (`fake_dialogs`) has a stand-in that answers from a file, line by line; its harness sets the variable to the test's own `fakebin`, so the e2e tests of the windows need the debug build (`cargo test`, not `cargo test --release`).
+- **Real zenity in a user namespace.** `unshare --user --map-user=1000` shows root's files as owned by `nobody`, so there the client takes no dialog program, not even `/usr/bin/zenity`, and `gui` says it cannot show its windows. Try the real one as a normal user outside such a namespace.
 - **Real zenity under Xvfb.** With `xvfb`, `zenity` and `xdotool` installed: `xvfb-run -a pithagoras-sync gui &`, then `xdotool search --name 'Pithagoras Sync'` finds the window and `xdotool key Return` answers its default button (Yes, OK, the first row of the menu). `import -window root shot.png` (ImageMagick) shows what is on the screen. Without a window manager the keys go to the window under the pointer (`xdotool mousemove 200 200` first); in the menu's list, typing filters it, and clicks need a pause between `mousemove` and `click`. The container has no German locale installed, so `LANG=de_DE.UTF-8` shows the German texts with English buttons (the client then gives the dialog program `LC_ALL=C.UTF-8`, see permissions.md).
 - **A real keyring, headless.** With `dbus`, `gnome-keyring` and `libsecret-tools`:
 
@@ -61,7 +63,7 @@ The tests never show a window or touch a keyring: the flow (`gui.rs`) runs again
   Locked again (`gdbus call --session --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets --method org.freedesktop.Secret.Service.Lock "['/org/freedesktop/secrets/collection/login']"`), GNOME Keyring wants its unlock prompt, which needs a display: without one the prompt counts as cancelled and the client says so.
 - **The link handler.** `install` from a session with `DISPLAY` set (a stand-in `systemctl` on `PATH` keeps the real systemd out; `XDG_DATA_HOME` and `HOME` pointed into a temporary folder keep the real `~/.local` out), then `xdg-mime query default x-scheme-handler/pithagoras-sync` says `pithagoras-sync.desktop`, and under Xvfb `gio open 'pithagoras-sync://pair?...'` starts `pithagoras-sync gui <link>`. `xdg-open` without a desktop environment (its "generic" mode) did not open the link on the build machine; on GNOME and KDE it hands it to `gio` or `kde-open`.
 
-`PITHAGORAS_SYNC_NO_KEYRING=1` makes the client use no keyring at all, so a test run on Windows never writes to the machine's Credential Manager.
+`PITHAGORAS_SYNC_NO_KEYRING=1` makes the client use no keyring at all. The test harnesses (`tests/e2e.rs`, `tests/update.rs`, `tests/e2e_windows.rs`) set it for every run of the client, so a test never reaches the real session bus or the machine's Credential Manager; only the tests that start the testkit's fake Secret Service on a private bus leave it out and point `DBUS_SESSION_BUS_ADDRESS` at that bus. A new e2e test that wants a keyring does the same.
 
 ## Linux evidence for 0.0.2 (the build machine, headless)
 

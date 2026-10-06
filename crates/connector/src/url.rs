@@ -146,7 +146,9 @@ fn plain_path(p: &str) -> bool {
     true
 }
 
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+/// `s` without `prefix`, matched ignoring ASCII case; `None` when it does not
+/// start with it.
+pub fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     // `get`: the prefix's length may end inside a character of `s`.
     match (s.get(..prefix.len()), s.get(prefix.len()..)) {
         (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),

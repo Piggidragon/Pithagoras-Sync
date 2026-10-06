@@ -101,6 +101,25 @@ async fn a_dismissed_prompt_is_an_error_not_an_empty_keyring() {
     assert_eq!(s.items[0].2, b"tok-1");
 }
 
+/// `has` tells whether an entry is there without a prompt, even locked.
+#[tokio::test]
+async fn whether_there_is_an_entry_asks_nobody() {
+    let Some(bus) = private_bus() else { return };
+    let state = Shared::default();
+    let _server = serve(&bus, state.clone()).await;
+    let ks = client(&bus).await;
+    assert_eq!(ks.has("elevation").await, Ok(false));
+    ks.set("elevation", &secret("pw")).await.unwrap();
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+    }
+    assert_eq!(ks.has("elevation").await, Ok(true));
+    assert_eq!(ks.has("token").await, Ok(false));
+    assert_eq!(state.lock().unwrap().prompts, 0);
+}
+
 #[tokio::test]
 async fn no_service_on_the_bus_is_an_error() {
     let Some(bus) = private_bus() else { return };
