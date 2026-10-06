@@ -36,7 +36,7 @@ Either way, a window then shows the portal it would pair with and the name your 
 
 > Pair this computer with the Pithagoras portal https://portal.example as "my-laptop"?
 
-Below it says what the agent may do right after pairing: this computer's mode, which pairing keeps. Normally that is "every call asks you first"; if you switched this computer to `folders` or `full` earlier, the window says so, and for `full` that the agent then acts with your rights right away.
+Below it says what the agent may do right after pairing: this computer's mode, which pairing keeps. Normally that is "every call asks you first"; if you switched this computer to `folders` or `full` earlier, the window says so, and for `full` that the agent then acts with your rights right away. For a portal on this computer over plain `http` it adds who else could answer on its port, as `pair` does ([windows.md](windows.md#plain-http-to-a-local-portal)).
 
 Check that this is your portal. **Yes** pairs; **No** changes nothing. A link that is not a valid pairing link, that names a portal on another machine over plain `http`, or whose portal address has spaces or other characters a real address does not need (it could make the question read differently) is refused before anything happens.
 

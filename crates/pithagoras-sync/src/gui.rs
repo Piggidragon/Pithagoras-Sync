@@ -249,10 +249,14 @@ async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome
     let name = shown(&h.device_name());
     let pinned = uri.spki.is_some();
     let mode = h.pair_mode();
-    let q = match h.paired() {
+    let mut q = match h.paired() {
         Some(old) => t.replace_question(&shown(&old), &portal, &name, pinned, mode),
         None => t.pair_question(&portal, &name, pinned, mode),
     };
+    // Only a portal on this computer gets this far over plain http (`parse`).
+    if !uri.portal.tls {
+        q = format!("{q}\n\n{}", t.plain_http_note());
+    }
     if !d.question(&q) {
         return Outcome::Cancelled;
     }
@@ -1276,11 +1280,23 @@ mod tests {
         assert_eq!(errors.len(), 3, "{seen:?}");
         assert!(errors[1].contains("over plain http"), "{seen:?}");
         assert!(errors[2].contains("unknown key"), "{seen:?}");
-        // A portal on this computer may use plain http.
-        let h = installed();
-        let local = "pithagoras-sync://pair?portal=http://127.0.0.1:3000&code=AB";
-        let (o, _) = run(&h, &["yes"], Some(local)).await;
-        assert_eq!(o, Outcome::Done);
+        // A portal on this computer may use plain http; the question says
+        // who else could answer there, as `pair` does.
+        for t in [Lang::En, Lang::De] {
+            let h = installed();
+            let local = "pithagoras-sync://pair?portal=http://127.0.0.1:3000&code=AB";
+            let (o, seen) = run_in(t, &h, &["yes"], Some(local)).await;
+            assert_eq!(o, Outcome::Done);
+            assert!(
+                seen[0].ends_with(&format!("\n\n{}", t.plain_http_note())),
+                "{seen:?}"
+            );
+            let h = paired();
+            let (_, seen) = run_in(t, &h, &["no"], Some(local)).await;
+            assert!(seen[0].ends_with(t.plain_http_note()), "{seen:?}");
+            let (_, seen) = run_in(t, &h, &["no"], Some(LINK)).await;
+            assert!(!seen[0].contains(t.plain_http_note()), "{seen:?}");
+        }
     }
 
     #[tokio::test]

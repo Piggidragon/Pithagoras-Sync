@@ -153,6 +153,22 @@ impl Lang {
         )
     }
 
+    /// Below the pairing question for a portal on this computer over plain
+    /// http, as `pair` says it: who else could answer there.
+    pub fn plain_http_note(self) -> &'static str {
+        if cfg!(target_os = "linux") {
+            self.pick(
+                "The portal is reached over plain http on this computer: the client talks there only to a program of your user or root. A portal that runs as another user needs https.",
+                "Das Portal wird auf diesem Computer über unverschlüsseltes http erreicht: Der Client spricht dort nur mit einem Programm deines Benutzers oder von root. Ein Portal, das als anderer Benutzer läuft, braucht https.",
+            )
+        } else {
+            self.pick(
+                "The portal is reached over plain http on this computer: any account here that listens on its port while the portal is down gets the token. On a computer shared with other accounts, use https.",
+                "Das Portal wird auf diesem Computer über unverschlüsseltes http erreicht: Jedes Konto hier, das auf seinem Port lauscht, während das Portal nicht läuft, bekommt den Token. Auf einem Computer, den du mit anderen Konten teilst, verwende https.",
+            )
+        }
+    }
+
     fn pin_note(self, pinned: bool) -> &'static str {
         if !pinned {
             return "";
