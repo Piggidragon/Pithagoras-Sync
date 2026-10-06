@@ -7,18 +7,25 @@ use std::path::{Component, Path, PathBuf};
 pub trait Runner {
     /// Runs a program; its standard output on success.
     fn run(&self, argv: &[String]) -> Result<String, String>;
+
+    /// Runs a program that may fail (`Action::Try`), whose own error text is
+    /// not shown: the hint explains the failure in the client's words, where
+    /// the program's would come first and in the system's language.
+    fn try_run(&self, argv: &[String]) -> Result<String, String> {
+        self.run(argv)
+    }
 }
 
 /// Runs real programs.
 pub struct System;
 
-impl Runner for System {
-    fn run(&self, argv: &[String]) -> Result<String, String> {
+impl System {
+    fn run_with(&self, argv: &[String], stderr: std::process::Stdio) -> Result<String, String> {
         let (prog, args) = argv.split_first().ok_or("empty command")?;
         let out = std::process::Command::new(prog)
             .args(args)
             .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(stderr)
             .output()
             .map_err(|e| format!("{prog}: {e}"))?;
         if out.status.success() {
@@ -26,6 +33,16 @@ impl Runner for System {
         } else {
             Err(format!("`{}` failed ({})", argv.join(" "), out.status))
         }
+    }
+}
+
+impl Runner for System {
+    fn run(&self, argv: &[String]) -> Result<String, String> {
+        self.run_with(argv, std::process::Stdio::inherit())
+    }
+
+    fn try_run(&self, argv: &[String]) -> Result<String, String> {
+        self.run_with(argv, std::process::Stdio::null())
     }
 }
 
@@ -139,7 +156,7 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
                 runner.run(argv)?;
             }
             Action::Try { argv, hint } => {
-                if let Err(e) = runner.run(argv) {
+                if let Err(e) = runner.try_run(argv) {
                     hints.push(format!("{e}: {hint}"));
                 }
             }

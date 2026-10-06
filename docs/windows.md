@@ -86,7 +86,7 @@ A service runs in session 0 without a desktop and as another account; the client
 
 The task names the user by SID, not by name: in an ssh session the domain reads `WORKGROUP`, which `schtasks` cannot map to the account. It has a logon trigger for this user and a second trigger that fires every minute, `InteractiveToken` (runs only while the user is logged on, no stored password), `LeastPrivilege`, no time limit, and no second instance (`IgnoreNew`). The minute trigger is what starts the client again after it exits: Task Scheduler's own restart on failure only covers a start that failed, not a program that exited with an error code (tested: after a kill, the client stayed down). With the minute trigger, the client runs again within a minute of a kill (10 seconds on the VM); while it runs, the trigger does nothing.
 
-The task runs `pithagoras-sync.exe run --detach`; `--detach` drops the console (`FreeConsole`). On the test VM the task's client ran in the user's session at Medium integrity, without a console window. A console window may still flash briefly at logon, since the program is a console program so that the CLI prints in a terminal. No flash was seen, but nobody watched a real logon: the test VM had no way to log off and on again (**unverified**). If it flashes, the fix is a small GUI-subsystem launcher, not a change to the CLI.
+The task runs `pithagoras-sync.exe run --detach`; `--detach` drops the console (`FreeConsole`). On the test VM the task's client ran in the user's session at Medium integrity, without a console window. Because the program is a console program (so that the CLI prints in a terminal), each start by the task opens a console window for a moment before `--detach` drops it: at a real logon on the test VM a Windows Terminal window showed for about 0.3 s, a classic console window for under 60 ms.
 
 `pithagoras-sync install --print` shows the steps without doing them. `uninstall` ends and deletes the task and removes the task definition; the program, its `.old` copy, the config and the audit log stay. Admin rights are not needed. `install --system` and `setup --create-user` are Linux only.
 
@@ -100,3 +100,4 @@ The task runs `pithagoras-sync.exe run --detach`; `--detach` drops the console (
 - A password check before policy changes.
 - A permission check on the token file.
 - `setup --create-user` and system-wide install.
+- At logon a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6).

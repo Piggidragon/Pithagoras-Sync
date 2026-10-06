@@ -360,6 +360,43 @@ async fn folder_list_shows_control_characters_as_escapes() {
     assert!(out.contains(&format!("{other} (rw, exec)")), "{out:?}");
 }
 
+/// A step that may fail (`Action::Try`) shows the client's own note, not the
+/// program's error text first (schtasks' "FEHLER: ..." on a German Windows).
+/// Here a stand-in `systemctl` on PATH: nothing reaches the real systemd.
+#[tokio::test]
+async fn a_step_that_may_fail_shows_only_the_clients_note() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let bin = env.root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$2\" in disable) echo 'FEHLER: raw text of the program' >&2; exit 1;; esac\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .cmd(&["uninstall"])
+        .env("PATH", path)
+        .output()
+        .await
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("FEHLER"), "{err}");
+    assert!(
+        err.contains("note: `systemctl --user disable --now"),
+        "{err}"
+    );
+    assert!(err.contains("the unit was not enabled"), "{err}");
+}
+
 /// A config this user cannot read (another user's folder) is an error, never
 /// the defaults: `mode` and `config get` do not print made-up values, and no
 /// command writes defaults over it.
