@@ -7,6 +7,7 @@ pub mod approve;
 pub mod audit;
 pub mod config;
 pub mod engine;
+pub mod keyring;
 #[cfg(unix)]
 pub mod notify;
 pub mod paths;

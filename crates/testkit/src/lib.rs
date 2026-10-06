@@ -7,6 +7,9 @@
 
 /// The release signer, under the name the tests know it by: tests sign their
 /// releases with throwaway keys the same way a real release is signed.
+#[cfg(unix)]
+pub mod keyring;
+
 pub mod minisign {
     pub use sync_release::minisign::SigningKey as TestKey;
 }
