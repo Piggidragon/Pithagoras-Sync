@@ -195,6 +195,7 @@ mod tests {
         assert!(unit.contains("User=pithagoras-sync"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn next_steps_say_when_setfacl_is_missing() {
         let with = next_steps("ps", true);

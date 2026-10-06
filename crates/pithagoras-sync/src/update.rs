@@ -1341,6 +1341,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o755);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_program_of_a_unit_is_what_systemd_starts() {
         let show = |out: &str| crate::actions::Fake {
