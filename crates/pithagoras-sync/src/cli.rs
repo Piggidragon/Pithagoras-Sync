@@ -610,6 +610,24 @@ pub async fn pair_device(
     })
 }
 
+/// The uninstall after a purge's stop, without the steps the stop took
+/// already (on Windows: ending the task).
+fn not_again(stop: &[Action], uninstall: Vec<Action>) -> Vec<Action> {
+    uninstall
+        .into_iter()
+        .filter(|a| !stop.contains(a))
+        .collect()
+}
+
+/// How long `mode full` lasts, for its message.
+fn full_for(expiry_hours: u32) -> String {
+    match expiry_hours {
+        0 => ", with no expiry".into(),
+        1 => ", for 1 hour".into(),
+        h => format!(", for {h} hours"),
+    }
+}
+
 /// What `pair` says about a plain-http portal.
 pub fn http_note(url: &str) -> Option<String> {
     url.starts_with("http://").then(|| {
@@ -1327,11 +1345,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 println!(
                     "Full mode: the portal's agent can do whatever {} can do here{}.",
                     info::user().0,
-                    if cfg.policy.full.expiry_hours == 0 {
-                        ", with no expiry".to_string()
-                    } else {
-                        format!(", for {} hours", cfg.policy.full.expiry_hours)
-                    }
+                    full_for(cfg.policy.full.expiry_hours)
                 );
             }
             println!(
@@ -1998,6 +2012,7 @@ pub(crate) async fn purge(
     } else {
         (install::user_stop_plan(), uninstall_plan(false)?)
     };
+    let uninstall = not_again(&stop, uninstall);
     let found = crate::purge::find(dirs)?;
     let me_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut programs = vec![me_exe.clone()];
@@ -2108,7 +2123,13 @@ pub(crate) async fn purge(
         show_plan(&stop);
         show_plan(&uninstall);
     }
-    for e in &found.entries {
+    // The uninstall's own removals are listed with it already.
+    let removed_by_uninstall = |e: &Path| {
+        uninstall
+            .iter()
+            .any(|a| matches!(a, Action::Remove { path } if path == e))
+    };
+    for e in found.entries.iter().filter(|e| !removed_by_uninstall(e)) {
         say!(
             "  - remove {}{}",
             e.display(),
@@ -2486,6 +2507,36 @@ mod tests {
             assert_eq!(n, stop_note(stopped, !installed, true, false));
             assert!(fake.ran.lock().unwrap().is_empty());
         }
+    }
+
+    /// `uninstall --purge` on Windows ends the task once, in its stop.
+    #[test]
+    fn the_purge_ends_the_task_once() {
+        use crate::actions::Action;
+        use crate::install::{windows_stop_plan, windows_uninstall_plan};
+        let stop = windows_stop_plan();
+        let all: Vec<Action> = stop
+            .iter()
+            .cloned()
+            .chain(super::not_again(
+                &stop,
+                windows_uninstall_plan(r"C:\x", true),
+            ))
+            .collect();
+        let ends = all
+            .iter()
+            .filter(|a| a.describe().contains("schtasks /End"))
+            .count();
+        assert_eq!(ends, 1, "{all:?}");
+        assert!(all.iter().any(|a| a.describe().contains("/Delete")));
+    }
+
+    #[test]
+    fn full_mode_says_how_long_in_words() {
+        use super::full_for;
+        assert_eq!(full_for(0), ", with no expiry");
+        assert_eq!(full_for(1), ", for 1 hour");
+        assert_eq!(full_for(8), ", for 8 hours");
     }
 
     #[test]
