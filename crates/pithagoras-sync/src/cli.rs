@@ -297,8 +297,14 @@ async fn reload_running(dirs: &Dirs) {
 /// profile is detected once, by whichever command writes the file first, so a
 /// `folder add` before `pair` on a desktop does not make it headless.
 fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
-    if dirs.config_file().exists() {
-        return DeviceConfig::load(&dirs.config_file());
+    // Only a config that is not there means defaults: one this user cannot read
+    // (another user's folder) is an error, so nothing writes defaults over it.
+    match std::fs::metadata(dirs.config_file()) {
+        Ok(_) => return DeviceConfig::load(&dirs.config_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("cannot read {}: {e}", dirs.config_file().display()));
+        }
     }
     let mut cfg = DeviceConfig {
         profile: detect_profile(),

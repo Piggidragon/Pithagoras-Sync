@@ -360,6 +360,50 @@ async fn folder_list_shows_control_characters_as_escapes() {
     assert!(out.contains(&format!("{other} (rw, exec)")), "{out:?}");
 }
 
+/// A config this user cannot read (another user's folder) is an error, never
+/// the defaults: `mode` and `config get` do not print made-up values, and no
+/// command writes defaults over it.
+#[tokio::test]
+async fn a_config_that_cannot_be_read_is_an_error_not_the_defaults() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        // Root reads it anyway.
+        return;
+    }
+    let env = Env::new();
+    env.ok(&["config", "set", "policy.approvals.timeout_secs", "77"])
+        .await;
+    let before = std::fs::read(env.config()).unwrap();
+    let dir = env.config().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut said = Vec::new();
+    for args in [
+        &["mode"][..],
+        &["config", "get", "policy.approvals.timeout_secs"],
+        &["mode", "full"],
+        &["folder", "list"],
+    ] {
+        let out = env.cmd(args).output().await.unwrap();
+        said.push((
+            args,
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (args, ok, out, err) in said {
+        assert!(!ok, "{args:?}: {out}");
+        assert!(err.contains("cannot read"), "{args:?}: {err}");
+        assert!(err.contains("Permission denied"), "{args:?}: {err}");
+    }
+    assert_eq!(std::fs::read(env.config()).unwrap(), before);
+    let out = env
+        .ok(&["config", "get", "policy.approvals.timeout_secs"])
+        .await;
+    assert_eq!(out.trim(), "77");
+}
+
 /// A deny rule that is slow on a long one-line command takes up to a second per
 /// command to check. Those checks run beside the client's two worker threads, so
 /// `status` and `panic` answer while the most commands the device starts at once

@@ -428,7 +428,7 @@ impl DeviceConfig {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(DeviceConfig::default()),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
         let cfg: DeviceConfig =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
