@@ -74,9 +74,9 @@ impl TokenStore {
             Place::File => "file",
             Place::Keyring { explicit: true } => "keyring",
             Place::Keyring { explicit: false } if self.file.exists() => {
-                "file (the keyring did not take it)"
+                "file, as the keyring did not take it"
             }
-            Place::Keyring { explicit: false } => "keyring (the default here)",
+            Place::Keyring { explicit: false } => "keyring, the default here",
         }
     }
 
@@ -531,10 +531,10 @@ mod tests {
         *ks.fail.lock().unwrap() = Some("no service".into());
         let s = store(t.path(), None, &ks, true);
         assert!(s.save(T1).await.unwrap().is_some());
-        assert_eq!(s.describe(), "file (the keyring did not take it)");
+        assert_eq!(s.describe(), "file, as the keyring did not take it");
         assert!(!s.keyring_holds(true).await);
         s.delete().await.unwrap();
         assert!(!t.path().join("token").exists());
-        assert_eq!(s.describe(), "keyring (the default here)");
+        assert_eq!(s.describe(), "keyring, the default here");
     }
 }
