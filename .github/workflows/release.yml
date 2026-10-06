@@ -1,8 +1,12 @@
-# A release: on a version tag (v0.0.1), check the workspace, build the static musl
-# Linux binaries (x86_64, aarch64) and the Windows x86_64 program with the release
-# key's public half compiled in, then publish them as a GitHub Release with
-# SHA256SUMS and manifest.json signed by the release key. `pithagoras-sync update`
-# reads that manifest from the newest release (the stable channel).
+# A release: on a version tag (v0.0.2) or a pre-release tag (pre-v0.0.2, pre2-v0.0.2),
+# check the workspace, build the static musl Linux binaries (x86_64, aarch64) and
+# the Windows x86_64 program with the release key's public half compiled in, then
+# publish them as a GitHub Release with SHA256SUMS and manifest.json signed by the
+# release key. A version tag is a real release and the latest one, which
+# `pithagoras-sync update` reads (the stable channel). A pre-release tag is a
+# pre-release for testing: it is never "latest", so the stable channel never offers
+# it. Its binaries report the plain version (0.0.2), so everywhere below the
+# version is what follows the last `v` of the tag.
 #
 # One-time setup by the repository owner (docs/releasing.md):
 #   - repository variable PITHAGORAS_SYNC_UPDATE_KEY: the public key
@@ -19,7 +23,10 @@ name: Release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "pre-v[0-9]+.[0-9]+.[0-9]+"
+      - "pre[0-9]+-v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
@@ -39,6 +46,14 @@ jobs:
     steps:
       # Every other job needs this one, so a tag off main stops here, before
       # anything is built and long before the key.
+      # The filter above lets only these three shapes start the run; this is the
+      # same rule again, so a change of the filter cannot let another tag build.
+      - name: The tag is a version or a pre-release of one
+        run: |
+          if ! [[ "$GITHUB_REF_NAME" =~ ^(pre[0-9]*-)?v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag $GITHUB_REF_NAME is neither v<x.y.z> (a release) nor pre-v<x.y.z> / pre<N>-v<x.y.z> (a pre-release)" >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
@@ -53,10 +68,11 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
           rustup default "$RUST_TOOLCHAIN"
-      - name: The tag is the version in Cargo.toml
+      # The version is what follows the last `v` of the tag (a version has no `v`).
+      - name: The tag names the version in Cargo.toml
         run: |
           version=$(cargo pkgid -p pithagoras-sync | sed 's/.*[#@]//')
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          if [ "$version" != "${GITHUB_REF_NAME##*v}" ]; then
             echo "the tag is $GITHUB_REF_NAME, Cargo.toml says $version" >&2
             exit 1
           fi
@@ -110,7 +126,7 @@ jobs:
         run: |
           file -b "dist/$BIN" | tee /dev/stderr | grep -Eq 'static(-pie)? linked|statically linked'
           said=$("dist/$BIN" --version)
-          if [ "$said" != "pithagoras-sync ${GITHUB_REF_NAME#v}" ]; then
+          if [ "$said" != "pithagoras-sync ${GITHUB_REF_NAME##*v}" ]; then
             echo "the binary says $said" >&2
             exit 1
           fi
@@ -148,7 +164,7 @@ jobs:
             exit 1
           fi
           said=$("dist/$BIN" --version | tr -d '\r')
-          if [ "$said" != "pithagoras-sync ${GITHUB_REF_NAME#v}" ]; then
+          if [ "$said" != "pithagoras-sync ${GITHUB_REF_NAME##*v}" ]; then
             echo "the program says $said" >&2
             exit 1
           fi
@@ -207,7 +223,7 @@ jobs:
         run: |
           chmod +x tool/sync-release
           cd dist
-          ../tool/sync-release manifest --version "${GITHUB_REF_NAME#v}" \
+          ../tool/sync-release manifest --version "${GITHUB_REF_NAME##*v}" \
             --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
             --out manifest.json \
             pithagoras-sync-x86_64-linux=x86_64-linux \
@@ -233,17 +249,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 0.0.x are previews: a pre-release is not "latest", so the stable update
-          # channel never offers it (docs/releasing.md).
-          pre=
-          notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs this release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
-          case "${GITHUB_REF_NAME#v}" in
-            0.0.*)
-              pre=--prerelease
-              notes="Preview, not the first stable release (that is 0.1.0). It is a pre-release, so \`pithagoras-sync update\` does not offer it by itself: \`pithagoras-sync update --manifest https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/manifest.json\`. $notes"
+          # A pre-release tag (pre-v0.0.2, pre2-v0.0.2) makes a pre-release, which is
+          # not "latest", so the stable update channel never offers it. A version tag
+          # makes a real release and is marked latest explicitly (docs/releasing.md).
+          # The `check` job has refused every other shape.
+          version=${GITHUB_REF_NAME##*v}
+          notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs the latest release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
+          case "$GITHUB_REF_NAME" in
+            pre*)
+              flags=(--prerelease)
+              title="Pithagoras Sync $version (pre-release $GITHUB_REF_NAME)"
+              notes="Pre-release for testing. It is not the latest release, so \`pithagoras-sync update\` does not offer it by itself: \`pithagoras-sync update --manifest https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/manifest.json\`. $notes"
+              ;;
+            *)
+              flags=(--latest)
+              title="Pithagoras Sync $version"
               ;;
           esac
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
-            --title "Pithagoras Sync ${GITHUB_REF_NAME#v}" \
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
+            --title "$title" \
             --notes "$notes" \
             dist/*

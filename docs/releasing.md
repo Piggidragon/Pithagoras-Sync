@@ -1,6 +1,15 @@
 # Releasing
 
-A release is a version tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. `pithagoras-sync update` reads the manifest of the newest release (`releases/latest/download/manifest.json` of this repository: the stable channel; pre-releases are not "latest", so they never reach it). The 0.0.x versions are previews and the workflow publishes them as pre-releases (the first stable release is 0.1.0): a client takes one only with `pithagoras-sync update --manifest https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json`, and the assets are downloaded from the release's own page, not from `releases/latest`.
+A release is a tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. There are two kinds of tag:
+
+| Tag | Example | Release |
+|---|---|---|
+| `v<x.y.z>` | `v0.0.2` | A real release, marked latest (`gh release create --latest`). `pithagoras-sync update` reads the manifest of the latest release (`releases/latest/download/manifest.json` of this repository: the stable channel), so it offers this one. |
+| `pre-v<x.y.z>`, `pre<N>-v<x.y.z>` | `pre-v0.0.2`, `pre2-v0.0.2` | A pre-release for the owner's testing, never "latest", so the stable channel never offers it. Its notes say how to take it: `pithagoras-sync update --manifest https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json` (the assets come from the release's own page, not from `releases/latest`). |
+
+`N` is one or more digits (`pre0-v0.0.2` passes too), for a second and third try of the same version. Any other tag shape is refused: the trigger filter lists only these three, and the first step of the `check` job fails on any other tag, so nothing is built. The binaries of a pre-release report the plain version (`0.0.2`): the version is what follows the last `v` of the tag, and the workflow compares that with `Cargo.toml` and with `--version`. The manifest of a pre-release carries that version, with the pre-release's tag in the download URLs.
+
+A client takes a manifest only if its version is newer than its own, and a pre-release and the real release of the same version have the same version number. So a client that took `pre-v0.0.2` will not take `v0.0.2` by `update`: install the real release again, from the release page as the README describes.
 
 ## What a release holds
 
@@ -26,9 +35,9 @@ cargo run --release -p sync-release -- keygen release.key
 It writes the secret key to `release.key` (readable by you only; it never overwrites a file) and prints the public key, one line of base64 starting with `RW`. Then, in the repository's Settings:
 
 1. **Repository variable** `PITHAGORAS_SYNC_UPDATE_KEY` (Secrets and variables, Actions, Variables): the public key line. A variable, not a secret: it is public, and every binary carries it.
-2. **Environment** `release` (Environments): required reviewer the owner, "Prevent self-review" off (the owner is the only reviewer and pushes the tags), deployment branches and tags limited to the tag pattern `v*`.
+2. **Environment** `release` (Environments): required reviewer the owner, "Prevent self-review" off (the owner is the only reviewer and pushes the tags), deployment branches and tags limited to the tag patterns `v*`, `pre-v*` and `pre*-v*` (the workflow runs for all three; a deployment tag filter takes no regular expression, so these globs are looser than the shapes the workflow accepts, and its `check` job refuses the rest). This is a repository setting, not workflow content: the owner changes it in Settings.
 3. **Environment secret** `PITHAGORAS_SYNC_SIGNING_KEY` of `release`: the whole content of `release.key`. Not a repository secret: one of those would be readable by every job of every workflow.
-4. **Tag ruleset** (Rules, Rulesets) on `v*`: only the owner may create such tags (bypass list), nobody may update or delete them, and non-fast-forward is blocked.
+4. **Tag ruleset** (Rules, Rulesets) on `v*`, `pre-v*` and `pre*-v*` (the same patterns as the environment; also a repository setting the owner changes): only the owner may create such tags (bypass list), nobody may update or delete them, and non-fast-forward is blocked.
 
 Keep `release.key` offline (a password manager or an encrypted backup) and delete the working copy. Never commit it, and never use it in tests: tests make throwaway keys.
 
@@ -42,26 +51,26 @@ The secret reaches one step of the workflow only: the one that runs `sync-releas
 
 ### Who can sign
 
-- **Only a commit on `main`.** The first step of the run fails unless the tagged commit is `main` or an ancestor of it ("tag vX is not on main: merge to main first, then tag"). Every other job needs that one, so a tag on another branch builds nothing and never reaches the key. This matters because a run takes the workflow and the signing tool from the tagged commit.
+- **Only a commit on `main`.** The `check` job fails unless the tagged commit is `main` or an ancestor of it ("tag v0.0.2 is not on main: merge to main first, then tag"). Every other job needs that one, so a tag on another branch builds nothing and never reaches the key. This matters because a run takes the workflow and the signing tool from the tagged commit.
 - **Only with the owner's approval.** `publish` is the only job in the environment `release`. It waits until the owner approves it in the Actions tab, and the run shows the commit about to be signed. No other job can read the secret.
-- **Only tags the owner made.** The tag ruleset keeps everyone else, another account's stolen write token included, from creating a `v*` tag, and nobody can move or delete one, so a published version always names the same commit.
+- **Only tags the owner made.** The tag ruleset keeps everyone else, another account's stolen write token included, from creating a `v*`, `pre-v*` or `pre*-v*` tag, and nobody can move or delete one, so a published version always names the same commit.
 - **The owner's GitHub account holds all of it.** Whoever controls it can merge to `main`, tag and approve. Keep two-factor authentication on, with a hardware key or an authenticator rather than SMS, and keep personal access tokens few and short-lived. Signing offline, by the key holder, would be stronger still.
 
 ## Making a release
 
 1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and merge that to `main`.
-2. Tag the merged commit on `main` with `v<version>` and push the tag:
+2. Tag the merged commit on `main` and push the tag. `v<version>` is the real release, `pre-v<version>` (or `pre2-v<version>` for another try) a pre-release to test first:
 
    ```sh
    git switch main && git pull
-   git tag v0.0.1
-   git push origin v0.0.1
+   git tag pre-v0.0.2 && git push origin pre-v0.0.2   # a pre-release
+   git tag v0.0.2 && git push origin v0.0.2           # the real release
    ```
 
 3. In the Actions tab, open the run "Release". When check, builds and tool are done, `publish` waits for review: check that the commit is the one you tagged, then approve the deployment to `release`.
-4. When the run is green, check the release: the three binaries, `manifest.json`, `manifest.json.minisig` and `SHA256SUMS`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and `pithagoras-sync update --check` from an installed client, which should offer the new version.
+4. When the run is green, check the release: the three binaries, `manifest.json`, `manifest.json.minisig` and `SHA256SUMS`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and for a real release `pithagoras-sync update --check` from an installed client, which should offer the new version (a pre-release is not offered: take it with `update --manifest <url>`).
 
-The workflow checks that the tag is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
+The workflow checks that the version of the tag (what follows its last `v`) is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
 
 ## The helper: `sync-release`
 
@@ -85,5 +94,7 @@ The public key and the signatures are in minisign's format (a legacy, not prehas
 The workflow was checked with `actionlint` 1.7.7 (without shellcheck), and its steps were run by hand on Linux: the x86_64 musl build (with clang as the C compiler, the workflow uses `musl-gcc`) and the Windows build (with `cargo xwin` instead of the Windows runner), both with a throwaway key compiled in; the static-binary, version and no-`VCRUNTIME140` checks; `manifest`, `sign --key-env`, `verify` (a wrong key refused), `sums` and `sha256sum -c`; and the release client's `update --check` against that manifest (up to date at 0.1.0, 0.1.1 offered, a manifest signed by another key refused). Against GitHub, `update --check` reached the stable channel's URL (HTTP 404: no release yet) and followed GitHub's release download redirects.
 
 The split of the publish job (the tool built in its own job, the key only in the sign step, actions pinned by commit) was checked by parsing the YAML and by running the publish job's steps by hand against the tool built as in its job, after a round trip without the executable bit as artifacts make it (`manifest`, `sign --key-env`, `verify`, `sums`, `sha256sum -c`); actionlint was not run on it again. The same holds for the `main` check and the `release` environment: the YAML was parsed and read, not linted, and neither has run on GitHub yet.
+
+The tag rules (the three shapes, the version after the last `v`, pre-release or latest) were run by hand on the `check` and `publish` steps with a fake `gh`, for good and bad tags; `gh release create --latest` was not run.
 
 Not run: the workflow itself on GitHub (nothing is published until a tag is pushed), the aarch64 build, and `gh release create`.
