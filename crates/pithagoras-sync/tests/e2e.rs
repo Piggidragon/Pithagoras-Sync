@@ -753,6 +753,28 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
             assert!(out.contains("cannot come from commands"), "{args}: {out}");
         }
     }
+    // The graphical flow with a link, from a command: refused before it asks
+    // anything, even with a display and a dialog program that would say yes.
+    let path = fake_dialogs(&env, &["0|", "0|", "0|"]);
+    let evil = "pithagoras-sync://pair?portal=http://127.0.0.1:9&code=EVIL1";
+    let (out, _) = exec(
+        &dl,
+        40,
+        &format!("DISPLAY=:99 PATH={path} {}", me(&format!("'{evil}'"))),
+        &env.p("home/proj"),
+    )
+    .await;
+    assert!(out.contains("exit=1"), "{out}");
+    let shown = dialogs_shown(&env);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(shown[0].contains(&"--error".to_string()), "{shown:?}");
+    assert!(
+        shown[0]
+            .last()
+            .unwrap()
+            .contains("cannot come from commands"),
+        "{shown:?}"
+    );
     // Refused, so the audit log the owner relies on is still there.
     assert!(
         env.home
@@ -942,6 +964,229 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     assert!(!entry.exists() && !icon.exists());
     // The program stays, as `--purge` says.
     assert!(program.exists());
+}
+
+/// A stand-in `zenity` (and `kdialog`) in `fakebin`: it writes each dialog's
+/// arguments, one per line and a `----` line after them, to `dialogs.log`, its
+/// environment to `dialogs.env`, and answers with the next line of
+/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). Returns
+/// the PATH to run with.
+fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = env.root.join("dialogs.log");
+    let envlog = env.root.join("dialogs.env");
+    let ans = env.root.join("dialogs.answers");
+    std::fs::write(
+        &ans,
+        answers.iter().map(|a| format!("{a}\n")).collect::<String>(),
+    )
+    .unwrap();
+    for prog in ["zenity", "kdialog"] {
+        let p = bin.join(prog);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
+                log = log.display(),
+                envlog = envlog.display(),
+                ans = ans.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// The dialogs shown so far: each one's arguments.
+fn dialogs_shown(env: &Env) -> Vec<Vec<String>> {
+    let log = std::fs::read_to_string(env.root.join("dialogs.log")).unwrap_or_default();
+    log.split("----\n")
+        .filter(|d| !d.is_empty())
+        .map(|d| d.lines().map(str::to_string).collect())
+        .collect()
+}
+
+/// Makes the client look installed for this user (the unit file `install`
+/// writes), so the graphical flow goes straight to pairing.
+fn looks_installed(env: &Env) {
+    let unit = env
+        .home
+        .join(".config/systemd/user/pithagoras-sync.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(unit, "installed").unwrap();
+}
+
+/// A pairing link opened from the browser (the program started with the link
+/// alone): one question showing the portal it parsed, never the raw link or its
+/// code, then the pairing as `pair` does it, and the running client connects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_link_pairs_after_the_owner_says_yes() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let path = fake_dialogs(&env, &["0|", "0|"]);
+    let daemon = env.start();
+    let link = mock.pair_uri("CODE9999");
+    let out = env
+        .cmd(&[&link])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    mock.next_device(WAIT).await.expect("the client connects");
+    let shown = dialogs_shown(&env);
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    assert!(shown[0].contains(&"--question".to_string()), "{shown:?}");
+    let question = shown[0].join("\n");
+    let portal = link
+        .split("portal=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap()
+        .replace("%3A", ":")
+        .replace("%2F", "/");
+    assert!(
+        question.contains(&format!("portal {portal} as \"")),
+        "{question}"
+    );
+    assert!(!question.contains("CODE9999") && !question.contains("pithagoras-sync://"));
+    assert!(shown[1].contains(&"--info".to_string()));
+    assert!(
+        shown[1].join("\n").contains("running, connected to"),
+        "{shown:?}"
+    );
+    // The dialog program got a cleaned environment.
+    let denv = std::fs::read_to_string(env.root.join("dialogs.env")).unwrap();
+    assert!(
+        !denv.contains("PORTAL_SECRET") && !denv.contains("must-not-leak"),
+        "{denv}"
+    );
+    assert!(denv.contains("DISPLAY=:99"), "{denv}");
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains(&format!("url = \"{portal}\"")), "{cfg}");
+    stop(daemon).await;
+}
+
+/// No to the question: nothing is paired, the code is not used.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_link_the_owner_refuses_changes_nothing() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let path = fake_dialogs(&env, &["1|"]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(dialogs_shown(&env).len(), 1);
+    assert!(!env.config().exists());
+    assert!(!env.home.join(".config/pithagoras-sync/token").exists());
+    // The code is still unused: `pair` takes it.
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+}
+
+/// Without a display, or without a dialog program, `gui` shows nothing: it
+/// says so on stderr and in the log file. Neither a start without a command
+/// nor any other command starts the dialogs there.
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_run_without_a_display_or_a_bus() {
+    let env = Env::new();
+    let path = fake_dialogs(&env, &["0|", "0|", "0|"]);
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1111".into()],
+    })
+    .await;
+    let run = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("PATH", &path);
+        c
+    };
+    // The program alone (no terminal, no display): the help, nothing else.
+    let out = run(&[]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Usage:"), "{err}");
+    let out = run(&["gui"]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot show its windows"), "{err}");
+    let log =
+        std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/client.log")).unwrap();
+    assert!(
+        log.contains("gui: Pithagoras Sync cannot show its windows"),
+        "{log}"
+    );
+    let out = run(&[&mock.pair_uri("CODE1111")]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    // With a display but no dialog program on PATH: the same.
+    let out = env
+        .cmd(&["gui"])
+        .env("DISPLAY", ":99")
+        .env("PATH", "/nonexistent")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    for args in [
+        &["install", "--print"][..],
+        &["uninstall", "--print"],
+        &["uninstall", "--purge", "--print"],
+        &["status"],
+        &["status", "--json"],
+        &["config", "get"],
+        &["mode"],
+        &["folder", "list"],
+        &["sudo", "status"],
+        &["setup", "--create-user", "--print"],
+        &["update", "--check"],
+        &["approvals"],
+        &["toggle"],
+        &[
+            "pair",
+            "pithagoras-sync://pair?portal=https://x.example&code=A B",
+        ],
+    ] {
+        let out = tokio::time::timeout(WAIT, run(args).output())
+            .await
+            .unwrap_or_else(|_| panic!("{args:?} hangs"))
+            .unwrap();
+        // Each ends on its own (some with an error: nothing is paired or running).
+        assert!(out.status.code().is_some(), "{args:?}");
+    }
+    env.ok(&["pair", &mock.pair_uri("CODE1111")]).await;
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    env.ok(&["status"]).await;
+    stop(daemon).await;
+    assert!(dialogs_shown(&env).is_empty(), "{:?}", dialogs_shown(&env));
 }
 
 #[tokio::test(flavor = "multi_thread")]

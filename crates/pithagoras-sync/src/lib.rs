@@ -6,6 +6,7 @@ pub mod config_cmd;
 pub mod control;
 pub mod daemon;
 pub mod dialogs;
+pub mod gui;
 pub mod install;
 pub mod logfile;
 pub mod owner;

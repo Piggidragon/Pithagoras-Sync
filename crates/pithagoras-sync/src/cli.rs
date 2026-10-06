@@ -26,8 +26,10 @@ pub struct Cli {
     /// More log output.
     #[arg(short, long, global = true)]
     pub verbose: bool,
+    /// Without one: the help in a terminal, the graphical flow from a file
+    /// manager or the menu.
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -42,6 +44,19 @@ pub enum Cmd {
         /// window and write the log to `client.log` in the state folder.
         #[arg(long, hide = true)]
         detach: bool,
+    },
+    /// Install, pair and uninstall in windows instead of a terminal.
+    ///
+    /// The menu entry and a double click on the program start it, and so does a
+    /// pairing link (pithagoras-sync://pair?...) opened in the browser: it asks
+    /// before it installs, pairs (showing the portal it would pair with) or
+    /// uninstalls. Needs zenity or kdialog on Linux.
+    Gui {
+        /// A pairing link to pair with (after asking).
+        link: Option<String>,
+        /// The same, as an option.
+        #[arg(long = "link", value_name = "LINK", conflicts_with = "link")]
+        link_option: Option<String>,
     },
     /// Pair with a portal, using the URI it shows under Settings, Devices.
     Pair {
@@ -368,7 +383,7 @@ async fn reload_running(dirs: &Dirs) {
 /// The config file, or a new config for this machine when there is none yet. The
 /// profile is detected once, by whichever command writes the file first, so a
 /// `folder add` before `pair` on a desktop does not make it headless.
-fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
+pub(crate) fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
     // Only a config that is not there means defaults: one this user cannot read
     // (another user's folder) is an error, so nothing writes defaults over it.
     match std::fs::metadata(dirs.config_file()) {
@@ -1001,9 +1016,123 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
     Ok(())
 }
 
+/// The pairing link when the program was started with one alone, as the
+/// browser hands it over (`pithagoras-sync <link>`).
+pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
+    let [_, arg] = args else { return None };
+    let arg = arg.to_str()?;
+    let scheme = format!("{}:", install::SCHEME);
+    (arg.len() >= scheme.len() && arg[..scheme.len()].eq_ignore_ascii_case(&scheme))
+        .then(|| arg.to_string())
+}
+
+/// Whether a start without a command is a double click or the menu's: no
+/// terminal, a display to show windows on, and no systemd unit around it. On
+/// Windows: a console window that Windows opened for this program alone.
+fn gui_without_command() -> bool {
+    #[cfg(windows)]
+    return console_is_ours_alone();
+    #[cfg(not(windows))]
+    {
+        use std::io::IsTerminal;
+        let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        !terminal && std::env::var_os("INVOCATION_ID").is_none() && crate::dialogs::has_display()
+    }
+}
+
+/// Whether the console belongs to this process only: Explorer made it for a
+/// double click, so nobody reads it.
+#[cfg(windows)]
+fn console_is_ours_alone() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut ids = [0u32; 4];
+    // SAFETY: the buffer holds `ids.len()` process ids.
+    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+}
+
+/// The graphical flow (`gui`, a pairing link, a double click).
+async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
+    #[cfg(windows)]
+    if console_is_ours_alone() {
+        // SAFETY: FreeConsole has no preconditions.
+        unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+    }
+    #[cfg(windows)]
+    let d: Box<dyn crate::dialogs::Dialogs> = Box::new(crate::dialogs::WinDialogs);
+    #[cfg(not(windows))]
+    let d: Box<dyn crate::dialogs::Dialogs> = match crate::dialogs::Native::find() {
+        Some(n) => Box::new(n),
+        None => {
+            crate::gui::say_without_dialogs(
+                dirs,
+                "Pithagoras Sync cannot show its windows here: there is no display, or neither zenity nor kdialog is installed. Install one of them, or use the command line (pithagoras-sync --help).",
+            )
+            .await;
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let host = crate::gui::RealHost { dirs: dirs.clone() };
+    Ok(
+        match crate::gui::flow(d.as_ref(), &host, link.as_deref()).await {
+            crate::gui::Outcome::Done => ExitCode::SUCCESS,
+            _ => ExitCode::from(1),
+        },
+    )
+}
+
+/// What `status` says, as one text: the running client's, or the config's
+/// when none runs.
+pub async fn status_report(dirs: &Dirs) -> String {
+    use std::fmt::Write;
+    use sync_policy::approve::visible;
+    if let Ok(Some(r)) = control::send(&dirs.socket(), Request::Status).await
+        && let Some(s) = r.status
+    {
+        return status_text(&s);
+    }
+    let mut out = String::from("pithagoras-sync is not running.\n");
+    match DeviceConfig::load(&dirs.config_file()) {
+        Ok(cfg) => {
+            match &cfg.portal {
+                Some(p) => {
+                    let _ = writeln!(
+                        out,
+                        "Paired with {} as {} (token kept in the {}).",
+                        visible(&p.url),
+                        visible(&p.name),
+                        token_store(dirs, &cfg).describe()
+                    );
+                }
+                None => out.push_str("Not paired.\n"),
+            }
+            let _ = writeln!(
+                out,
+                "Mode: {}",
+                mode_text(
+                    cfg.policy.effective_mode(cfg.profile, now_ms()),
+                    cfg.policy.full.until_ms
+                )
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(out, "{}", visible(&e));
+        }
+    }
+    out
+}
+
 pub async fn run(cli: Cli) -> Result<ExitCode, String> {
     let dirs = Dirs::from_env()?;
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        if gui_without_command() {
+            return gui(&dirs, None).await;
+        }
+        // In a terminal, as before; and nothing else without a display.
+        eprint!("{}", <Cli as clap::CommandFactory>::command().render_help());
+        return Ok(ExitCode::from(2));
+    };
+    match cmd {
+        Cmd::Gui { link, link_option } => return gui(&dirs, link.or(link_option)).await,
         Cmd::Run { detach } => {
             if detach {
                 // Without a console the log would go nowhere; the file is capped.
@@ -1685,7 +1814,12 @@ fn delete_hint(path: &Path) -> String {
 /// `uninstall --purge`: stops the client, undoes `install`, and removes what the
 /// client wrote for this user. The program stays: it may be the owner's only
 /// copy, and on Windows the running one cannot be deleted anyway.
-async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<ExitCode, String> {
+pub(crate) async fn purge(
+    dirs: &Dirs,
+    system: bool,
+    print: bool,
+    yes: bool,
+) -> Result<ExitCode, String> {
     let linux = cfg!(target_os = "linux");
     if cfg!(windows) && system {
         return Err(
