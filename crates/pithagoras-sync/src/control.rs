@@ -85,6 +85,10 @@ pub struct Status {
     pub landlock: bool,
     pub config_file: String,
     pub audit_file: String,
+    /// The program the running client was started from: what its unit or logon
+    /// task starts again, and so what `update` replaces.
+    #[serde(default)]
+    pub exe: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

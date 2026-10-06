@@ -143,5 +143,5 @@ pithagoras-sync secret clear                   # forget it, in the client and on
 |---|---|
 | `pithagoras-sync panic` | Closes the link, kills every command, denies every call (pending approvals included) and forgets the elevation password held in memory, until `unlock`. |
 | `pithagoras-sync unlock` | Ends a pause; reloads the stored password when storage is `file`. |
-| `pithagoras-sync update [--check]` | Replaces the program with a newer signed release and restarts the client. Never changes a setting. |
+| `pithagoras-sync update [--check]` | Replaces the program the running client was started from (else the one you ran) with a newer signed release and restarts the client. Never changes a setting. |
 | `pithagoras-sync status` | Mode, folders, approvals, elevation, the connection. |

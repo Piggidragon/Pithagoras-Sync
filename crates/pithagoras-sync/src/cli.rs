@@ -908,16 +908,39 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 );
                 return Ok(ExitCode::SUCCESS);
             }
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let me = std::env::current_exe().map_err(|e| e.to_string())?;
+            // The copy the running client was started from, which its unit or
+            // logon task starts again, not necessarily the one run here (a
+            // download, while the installed copy is not on PATH).
+            let running = match control::send(&dirs.socket(), Request::Status).await {
+                Ok(Some(r)) => r.status.map(|s| PathBuf::from(s.exe)),
+                _ => None,
+            };
+            let exe = crate::update::target_exe(running.as_deref(), &me);
             crate::update::install(&plan, &exe).await?;
             println!("Updated {} to {}.", exe.display(), plan.version);
+            if !crate::update::same_program(&exe, &me) {
+                println!(
+                    "That is the program the running client was started from; the one you ran, {}, is unchanged.",
+                    me.display()
+                );
+            }
             match control::send(&dirs.socket(), Request::Restart).await {
                 Ok(Some(r)) if r.ok => println!(
                     "The running client restarts with it (its unit or logon task starts it again)."
                 ),
-                _ => println!(
-                    "No client of this user is running. A client run by a system unit restarts with: systemctl restart pithagoras-sync"
-                ),
+                _ => {
+                    println!(
+                        "No client of this user is running. A client run by a system unit restarts with: systemctl restart pithagoras-sync"
+                    );
+                    if let Some(other) = crate::update::installed_copy(&me) {
+                        println!(
+                            "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
+                            other.display(),
+                            other.display()
+                        );
+                    }
+                }
             }
         }
         Cmd::Install {
@@ -1089,6 +1112,7 @@ mod tests {
             landlock: true,
             config_file: "/c".into(),
             audit_file: "/a".into(),
+            exe: "/usr/local/bin/pithagoras-sync".into(),
         };
         let text = status_text(&s);
         assert!(

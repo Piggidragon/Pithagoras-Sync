@@ -20,6 +20,8 @@ use sync_policy::secret::Secret;
 
 pub struct Daemon {
     dirs: Dirs,
+    /// The program this client was started from.
+    exe: std::path::PathBuf,
     device: Arc<Device>,
     store: Arc<ConfigStore>,
     queue: Arc<ApprovalQueue>,
@@ -155,7 +157,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
     let execs = Arc::new(Execs::new(ExecConfig {
-        shim_program: exe,
+        shim_program: exe.clone(),
         shim_args: Vec::new(),
         shell: cfg.exec.shell.clone(),
         base_env: std::env::vars().collect(),
@@ -216,6 +218,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     drop(cfg);
     let daemon = Arc::new(Daemon {
         dirs: dirs.clone(),
+        exe,
         device: device.clone(),
         store,
         queue,
@@ -385,6 +388,7 @@ impl Daemon {
             landlock: self.device.engine.landlock_available(),
             config_file: self.dirs.config_file().to_string_lossy().into_owned(),
             audit_file: self.dirs.audit_file().to_string_lossy().into_owned(),
+            exe: self.exe.to_string_lossy().into_owned(),
         }
     }
 

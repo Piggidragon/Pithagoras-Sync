@@ -290,6 +290,17 @@ async fn this_build_updates_only_with_a_release_key_and_restarts_on_request() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let mut s = s.expect("the client listens");
+    // `update` replaces the program the running client was started from.
+    s.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).await.unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(
+        Path::new(reply["status"]["exe"].as_str().unwrap_or_default()),
+        std::fs::canonicalize(BIN).unwrap(),
+        "{reply}"
+    );
+    let mut s = tokio::net::UnixStream::connect(&socket).await.unwrap();
     s.write_all(b"{\"cmd\":\"restart\"}\n").await.unwrap();
     let mut reply = String::new();
     s.read_to_string(&mut reply).await.unwrap();

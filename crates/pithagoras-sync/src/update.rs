@@ -246,6 +246,34 @@ async fn fetch(source: &str, max: u64) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
 }
 
+/// The program `update` replaces: the one the running client was started from
+/// when a client runs (`running`, from its status), else this one (`me`).
+pub fn target_exe(running: Option<&Path>, me: &Path) -> PathBuf {
+    match running {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        _ => me.to_path_buf(),
+    }
+}
+
+/// Whether two paths name the same program file.
+pub fn same_program(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The copy `install` puts in place for the current user (the one its unit or
+/// logon task starts), when it exists and is not `me`.
+pub fn installed_copy(me: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let p = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+        .join(r"Programs\pithagoras-sync\pithagoras-sync.exe");
+    #[cfg(not(windows))]
+    let p = PathBuf::from(std::env::var_os("HOME")?).join(".local/bin/pithagoras-sync");
+    (p.is_file() && !same_program(&p, me)).then_some(p)
+}
+
 /// Downloads the binary, checks it against the manifest and that it runs and
 /// reports the new version, then puts it in place of `exe` in one rename. On
 /// Windows, where a running program cannot be replaced, the old one is moved
@@ -362,6 +390,28 @@ pub fn old_path(exe: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_replaces_the_program_the_running_client_was_started_from() {
+        let me = Path::new("/home/u/Downloads/pithagoras-sync");
+        let installed = Path::new("/home/u/.local/bin/pithagoras-sync");
+        assert_eq!(target_exe(Some(installed), me), installed);
+        assert_eq!(target_exe(None, me), me);
+        // An old client that does not say where it runs from.
+        assert_eq!(target_exe(Some(Path::new("")), me), me);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_the_program_is_the_same_program() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a");
+        std::fs::write(&a, "x").unwrap();
+        std::os::unix::fs::symlink(&a, t.path().join("b")).unwrap();
+        assert!(same_program(&a, &t.path().join("b")));
+        std::fs::write(t.path().join("c"), "x").unwrap();
+        assert!(!same_program(&a, &t.path().join("c")));
+    }
 
     #[test]
     fn updates_come_from_the_stable_release_channel() {
