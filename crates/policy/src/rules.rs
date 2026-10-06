@@ -455,6 +455,23 @@ impl CmdMatch {
         }
     }
 
+    /// Whether a match on a part from a later word is also a match on the part
+    /// from its first word: a regex without `^` or `\A` (it is searched, and a
+    /// later piece is the end of the first one), and a glob that starts with one
+    /// `*` (it takes any start).
+    /// Such a rule needs one try per part, not one per word.
+    fn found_from_the_head(&self) -> bool {
+        match self {
+            CmdMatch::Exact(_) | CmdMatch::Prefix(_) => false,
+            // `**/` is a recursive prefix, which matches less than `*`.
+            CmdMatch::Glob(g) => {
+                let g = g.glob().glob();
+                g.starts_with('*') && !g.starts_with("**")
+            }
+            CmdMatch::Regex(r) => !r.as_str().contains('^') && !r.as_str().contains("\\A"),
+        }
+    }
+
     fn matches(&self, cmd: &str) -> bool {
         match self {
             CmdMatch::Exact(s) => cmd == s,
@@ -477,20 +494,86 @@ pub fn simple_command(cmd: &str) -> bool {
     ])
 }
 
+/// Most bytes one command's check against the deny or the always-ask rules may
+/// scan for rules that must be tried at every word (a glob that does not start
+/// with `*`, a regex with `^` or `\A`): such a rule costs the command's length
+/// once per word. Past it the command counts as matching (fail closed).
+const MAX_RULE_WORK: usize = 256 << 20;
+
 /// The pieces of a command a deny or always-ask rule is checked against: the whole
 /// command, and each part between separators from every word on, so that
-/// `sudo -u x rm ...` or `env A=1 rm ...` still meet a rule about `rm`.
-fn pieces(cmd: &str) -> Vec<String> {
-    let mut out = vec![normalise(cmd)];
-    for part in cmd.split([';', '&', '|', '`', '(', ')', '\n', '\r', '{', '}']) {
-        let words: Vec<&str> = part.split_whitespace().collect();
-        for i in 0..words.len() {
-            out.push(words[i..].join(" ").trim_start_matches('$').to_string());
+/// `sudo -u x rm ...` or `env A=1 rm ...` still meet a rule about `rm`. Each part
+/// is kept once, normalised, and a piece is a slice of it: a command of many
+/// words takes memory in proportion to its length, not to its length times its
+/// words.
+struct Pieces {
+    whole: String,
+    /// Each part, normalised, with the byte offsets where its words start.
+    parts: Vec<(String, Vec<usize>)>,
+}
+
+impl Pieces {
+    fn new(cmd: &str) -> Pieces {
+        let parts = cmd
+            .split([';', '&', '|', '`', '(', ')', '\n', '\r', '{', '}'])
+            .filter_map(|part| {
+                let mut s = String::new();
+                let mut starts = Vec::new();
+                for w in part.split_whitespace() {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    starts.push(s.len());
+                    s.push_str(w);
+                }
+                (!starts.is_empty()).then_some((s, starts))
+            })
+            .collect();
+        Pieces {
+            whole: normalise(cmd),
+            parts,
         }
     }
-    out.sort();
-    out.dedup();
-    out
+
+    /// Every piece: the whole command, then each part from every word on.
+    fn all(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.whole.as_str()).chain(
+            self.parts.iter().flat_map(|(s, starts)| {
+                starts.iter().map(move |&i| s[i..].trim_start_matches('$'))
+            }),
+        )
+    }
+
+    /// The whole command and each part from its first word: enough for a rule
+    /// that matches a part from its first word whenever it matches it from a
+    /// later one.
+    fn heads(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.whole.as_str())
+            .chain(self.parts.iter().map(|(s, _)| s.trim_start_matches('$')))
+    }
+
+    /// The bytes that trying a rule on every piece scans.
+    fn work(&self) -> usize {
+        self.parts.iter().fold(self.whole.len(), |n, (s, starts)| {
+            starts.iter().fold(n, |n, &i| n.saturating_add(s.len() - i))
+        })
+    }
+
+    /// Whether `m` matches a piece; `None` when finding out would scan more than
+    /// what is left of `budget`.
+    fn matched(&self, m: &CmdMatch, budget: &mut usize) -> Option<bool> {
+        match m {
+            // A comparison or a prefix check costs at most the rule's length per
+            // piece (an exact match compares lengths first).
+            CmdMatch::Exact(_) | CmdMatch::Prefix(_) => Some(self.all().any(|p| m.matches(p))),
+            _ if m.found_from_the_head() => Some(self.heads().any(|p| m.matches(p))),
+            _ => {
+                let work = self.work();
+                *budget = budget.checked_sub(work)?;
+                Some(self.all().any(|p| m.matches(p)))
+            }
+        }
+    }
 }
 
 /// The rules of a policy, compiled.
@@ -584,13 +667,20 @@ impl Compiled {
 
     /// Why `cmd` is refused by the command lists, if it is.
     pub fn command_refusal(&self, cmd: &str) -> Option<String> {
-        let ps = pieces(cmd);
-        if let Some((r, _)) = self
-            .deny_cmd
-            .iter()
-            .find(|(_, m)| ps.iter().any(|p| m.matches(p)))
-        {
-            return Some(format!("the command matches the deny rule {r}"));
+        if !self.deny_cmd.is_empty() {
+            let ps = Pieces::new(cmd);
+            let mut budget = MAX_RULE_WORK;
+            for (r, m) in &self.deny_cmd {
+                match ps.matched(m, &mut budget) {
+                    Some(true) => return Some(format!("the command matches the deny rule {r}")),
+                    Some(false) => {}
+                    None => {
+                        return Some(format!(
+                            "the command is too long to check against the deny rule {r} (split it into shorter commands)"
+                        ));
+                    }
+                }
+            }
         }
         if !self.allow.is_empty() {
             let whole = normalise(cmd);
@@ -614,13 +704,26 @@ impl Compiled {
         }
     }
 
-    /// The always-ask rule `cmd` matches, if any.
-    pub fn always_ask(&self, cmd: &str) -> Option<&CommandRule> {
-        let ps = pieces(cmd);
-        self.always_ask
-            .iter()
-            .find(|(_, m)| ps.iter().any(|p| m.matches(p)))
-            .map(|(r, _)| r)
+    /// Why `cmd` asks by the always-ask list: the rule it matches, or one it is
+    /// too long to be checked against.
+    pub fn always_ask(&self, cmd: &str) -> Option<String> {
+        if self.always_ask.is_empty() {
+            return None;
+        }
+        let ps = Pieces::new(cmd);
+        let mut budget = MAX_RULE_WORK;
+        for (r, m) in &self.always_ask {
+            match ps.matched(m, &mut budget) {
+                Some(true) => return Some(format!("the command matches the always-ask rule {r}")),
+                Some(false) => {}
+                None => {
+                    return Some(format!(
+                        "the command is too long to check against the always-ask rule {r}"
+                    ));
+                }
+            }
+        }
+        None
     }
 
     pub fn within_hours(&self, now_ms: i64) -> bool {
@@ -686,6 +789,117 @@ mod tests {
         }
         assert!(c.command_refusal("ls -la").is_none());
         assert!(c.command_refusal("echo rm").is_none());
+    }
+
+    /// The pieces as they were built before: every suffix a string of its own.
+    fn suffix_strings(cmd: &str) -> Vec<String> {
+        let mut out = vec![normalise(cmd)];
+        for part in cmd.split([';', '&', '|', '`', '(', ')', '\n', '\r', '{', '}']) {
+            let words: Vec<&str> = part.split_whitespace().collect();
+            for i in 0..words.len() {
+                out.push(words[i..].join(" ").trim_start_matches('$').to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rules_tried_once_per_part_match_what_every_piece_matches() {
+        let rules = [
+            rule("exact", "rm x"),
+            rule("prefix", "rm "),
+            rule("regex", r"\bshutdown\b"),
+            rule("regex", r"HOME/\.ssh"),
+            rule("regex", r"^rm\s"),
+            rule("regex", r"\Arm\s"),
+            rule("regex", r"[^a]rm"),
+            rule("glob", "*shutdown*"),
+            rule("glob", "*.ssh/*"),
+            rule("glob", "rm *"),
+            rule("glob", "**/rm"),
+        ];
+        let cmds = [
+            "rm x",
+            "ls; rm x",
+            "true && sudo  rm   x",
+            "echo $(rm x)",
+            "env A=1 rm x",
+            "cat $HOME/.ssh/id",
+            "$rm -rf",
+            "systemctl poweroff || shutdown now",
+            "echo rm",
+            "a/rm",
+            "x a/rm",
+            "ls -la",
+            "",
+            "   ",
+        ];
+        for r in &rules {
+            let m = CmdMatch::new(r).unwrap();
+            for cmd in cmds {
+                let before = suffix_strings(cmd).iter().any(|p| m.matches(p));
+                let mut budget = MAX_RULE_WORK;
+                assert_eq!(
+                    Pieces::new(cmd).matched(&m, &mut budget),
+                    Some(before),
+                    "{r} on {cmd:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_command_is_checked_without_quadratic_memory() {
+        // 200 000 words in one line (400 KB): each word suffix as a string of its
+        // own would take 40 GB.
+        let mut cmd = String::from("echo");
+        for _ in 0..200_000 {
+            cmd.push_str(" a");
+        }
+        let started = std::time::Instant::now();
+        let c = compiled(Commands {
+            deny: vec![
+                rule("exact", "rm x"),
+                rule("prefix", "rm "),
+                rule("regex", r"\bshutdown\b"),
+                rule("glob", "*shutdown*"),
+            ],
+            always_ask: vec![rule("prefix", "git push"), rule("regex", "curl")],
+            ..Default::default()
+        });
+        assert_eq!(c.command_refusal(&cmd), None);
+        assert_eq!(c.always_ask(&cmd), None);
+        let tail = format!("{cmd} && rm -rf x");
+        assert!(c.command_refusal(&tail).unwrap().contains("rm "));
+        let tail = format!("{cmd}; git push");
+        assert!(c.always_ask(&tail).unwrap().contains("git push"));
+        // A rule that must be tried at every word would scan 20 GB: the command
+        // counts as matching instead of being checked for minutes.
+        let anchored = compiled(Commands {
+            deny: vec![rule("regex", "^rm ")],
+            always_ask: vec![rule("glob", "git push*")],
+            ..Default::default()
+        });
+        assert!(
+            anchored
+                .command_refusal(&cmd)
+                .unwrap()
+                .contains("too long to check")
+        );
+        assert!(
+            anchored
+                .always_ask(&cmd)
+                .unwrap()
+                .contains("too long to check")
+        );
+        // A short command still meets those rules word by word.
+        assert!(anchored.command_refusal("ls; rm -rf x").is_some());
+        assert!(anchored.command_refusal("ls -la").is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

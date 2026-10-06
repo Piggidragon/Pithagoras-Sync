@@ -786,8 +786,8 @@ impl Engine {
                 if !never_ask {
                     reasons.extend(asks);
                 }
-                if let Some(r) = rules.always_ask(command) {
-                    reasons.push(format!("the command matches the always-ask rule {r}"));
+                if let Some(why) = rules.always_ask(command) {
+                    reasons.push(why);
                 }
                 if taint_prompts {
                     reasons.push("this chat has seen untrusted content".to_string());
