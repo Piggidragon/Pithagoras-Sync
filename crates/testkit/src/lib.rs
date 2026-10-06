@@ -92,6 +92,16 @@ impl MockPortal {
 
     /// On a fixed loopback port (0: any free one).
     pub async fn start_on(opts: MockOptions, port: u16) -> MockPortal {
+        MockPortal::start_with(opts, port, false).await
+    }
+
+    /// With TLS (`opts.tls`) whose self-signed certificate says it is a CA, as
+    /// `openssl req -x509` makes it by default.
+    pub async fn start_with_ca_certificate(opts: MockOptions) -> MockPortal {
+        MockPortal::start_with(opts, 0, true).await
+    }
+
+    async fn start_with(opts: MockOptions, port: u16, ca: bool) -> MockPortal {
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -106,11 +116,16 @@ impl MockPortal {
             transcript: Mutex::new(Vec::new()),
         });
         let (acceptor, spki, cert_der) = if opts.tls {
-            let ck = rcgen::generate_simple_self_signed(vec![
-                "localhost".to_string(),
-                "127.0.0.1".to_string(),
-            ])
-            .unwrap();
+            let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let ck = if ca {
+                let mut params = rcgen::CertificateParams::new(names).unwrap();
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                let signing_key = rcgen::KeyPair::generate().unwrap();
+                let cert = params.self_signed(&signing_key).unwrap();
+                rcgen::CertifiedKey { cert, signing_key }
+            } else {
+                rcgen::generate_simple_self_signed(names).unwrap()
+            };
             let spki = URL_SAFE_NO_PAD.encode(ring::digest::digest(
                 &ring::digest::SHA256,
                 &ck.signing_key.subject_public_key_info(),

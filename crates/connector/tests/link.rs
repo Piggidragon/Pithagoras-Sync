@@ -290,6 +290,30 @@ async fn a_certificate_that_does_not_match_the_pin_is_refused() {
     assert!(mock.pairs().is_empty());
 }
 
+/// A self-signed certificate that says it is a CA (what `openssl req -x509`
+/// makes by default) and no pin: the refusal says it is self-signed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_signed_ca_certificate_without_a_pin_is_named_as_such() {
+    let mock = MockPortal::start_with_ca_certificate(MockOptions {
+        tls: true,
+        codes: vec!["AB12CD34".into()],
+    })
+    .await;
+    let uri = mock.pair_uri("AB12CD34");
+    let e = pair::pair(&uri[..uri.find("&spki=").unwrap()], "laptop")
+        .await
+        .err()
+        .unwrap();
+    if e.contains("no system root certificates") {
+        // Nothing to check the certificate against on this machine.
+        return;
+    }
+    assert!(e.contains("(it is self-signed)"), "{e}");
+    assert!(e.contains("open the portal over https once"), "{e}");
+    // With its pin it pairs.
+    assert!(pair::pair(&uri, "laptop").await.is_ok());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_token_cannot_connect() {
     let fx = Fx::new();
