@@ -277,10 +277,10 @@ impl Lang {
     pub fn owner_password_failed(self, e: &str) -> String {
         match self {
             Lang::En => format!(
-                "Your password could not be checked: {e}. Nothing changed. In a terminal, `pithagoras-sync pair` with the link checks it as well."
+                "Your password could not be checked: {e}. Nothing changed. If your login asks for more than a password (a fingerprint, a security key), pair in a terminal: `pithagoras-sync pair` with the link, where su asks you itself."
             ),
             Lang::De => format!(
-                "Dein Passwort konnte nicht geprüft werden: {e}. Es wurde nichts geändert. Im Terminal prüft es `pithagoras-sync pair` mit dem Link ebenfalls."
+                "Dein Passwort konnte nicht geprüft werden: {e}. Es wurde nichts geändert. Wenn deine Anmeldung mehr als ein Passwort verlangt (einen Fingerabdruck, einen Sicherheitsschlüssel), kopple im Terminal: `pithagoras-sync pair` mit dem Link, dort fragt su dich selbst."
             ),
         }
     }
@@ -777,6 +777,21 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k| m.get(k).cloned()
+    }
+
+    /// A password that could not be checked: the terminal is offered for a
+    /// login that asks for more than a password, never as a check of its own
+    /// (with a PAM stack that trusts the account it checks nothing either).
+    #[test]
+    fn an_unchecked_password_promises_no_check_in_the_terminal() {
+        for t in [Lang::En, Lang::De] {
+            let s = t.owner_password_failed("su let this account through");
+            assert!(
+                s.contains(t.pick("a fingerprint", "einen Fingerabdruck")),
+                "{s}"
+            );
+            assert!(!s.contains(t.pick("checks it as well", "ebenfalls")), "{s}");
+        }
     }
 
     /// The last box of the Windows menu offers no next choice.
