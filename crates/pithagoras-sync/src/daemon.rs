@@ -210,7 +210,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     );
     crate::secrets::scrub_log_with(device.secrets.clone());
     device.engine.seal(vec![crate::secrets::file(&dirs)]);
-    let keyring = sync_policy::keyring::system();
+    let keyring = sync_policy::keyring::system(&dirs);
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
         cfg.profile,
@@ -756,7 +756,7 @@ async fn supervise(
             }
         };
         retry = KEYRING_RETRY;
-        let current = (cfg.portal.clone(), cfg.token.clone());
+        let pairing = cfg.portal.clone();
         // Until the new link says otherwise, not the old link's state.
         {
             let mut linked = d.linked.lock().unwrap();
@@ -765,47 +765,32 @@ async fn supervise(
         }
         let (stop, stop_rx) = watch::channel(false);
         let mut task = tokio::spawn(link::run(d.device.clone(), cfg, status.clone(), stop_rx));
-        // A reload since the link started whose token was not read again.
-        let mut unread = false;
+        // A reload comes with every policy change; only a new pairing (or
+        // none) brings a new token, and every pairing changes the portal block
+        // (`paired_ms`), so the token is read again only then. A read of the
+        // keyring may ask to unlock it.
+        let repaired = || d.store.config().portal.as_ref() != Some(&pairing);
         loop {
             tokio::select! {
                 end = &mut task => {
                     if let Ok(link::LinkEnd::Rejected(why)) = end {
                         warn!("{why}");
                     }
-                    // A pairing that kept the device id may have brought a
-                    // new token: it is read now.
-                    if unread {
-                        break;
+                    // Down until the owner pairs again or unpairs (or the
+                    // client stops): the token the portal refused is not
+                    // tried again.
+                    loop {
+                        tokio::select! {
+                            _ = relink.recv() => if repaired() {
+                                break;
+                            },
+                            _ = until(&mut shutdown) => return,
+                        }
                     }
-                    // Down until the owner pairs again (or the client stops).
-                    tokio::select! {
-                        _ = relink.recv() => break,
-                        _ = until(&mut shutdown) => return,
-                    }
+                    break;
                 }
                 _ = relink.recv() => {
-                    let cfg = d.store.config();
-                    let tokens = d.tokens(&cfg);
-                    let same = if cfg.portal.as_ref() != Some(&current.0) {
-                        false
-                    } else if tokens.reads_keyring() {
-                        // Every read may ask to unlock the keyring, and a
-                        // reload comes with each policy change. A new pairing
-                        // changes the config (its device id); one that did not
-                        // is read when this link ends.
-                        unread = true;
-                        true
-                    } else {
-                        match tokens.load().await {
-                            Ok(t) => t == current.1,
-                            Err(e) => {
-                                warn!("the token could not be read again ({e}); the link stays as it is");
-                                true
-                            }
-                        }
-                    };
-                    if !same {
+                    if repaired() {
                         stop.send_replace(true);
                         let _ = (&mut task).await;
                         break;
@@ -828,14 +813,22 @@ fn link_for(
     linked: Option<&PortalConfig>,
     paired: Option<&PortalConfig>,
 ) -> LinkStatus {
-    if link.state == LinkState::Connected && linked != paired {
-        return LinkStatus {
+    if link.state != LinkState::Connected || linked == paired {
+        return link;
+    }
+    match paired {
+        Some(_) => LinkStatus {
             state: LinkState::Connecting,
             detail: Some("switching to the new pairing".into()),
             since_ms: link.since_ms,
-        };
+        },
+        // `unpair`: nothing connects again.
+        None => LinkStatus {
+            state: LinkState::Stopped,
+            detail: Some("not paired: the link to the old portal is closing".into()),
+            since_ms: link.since_ms,
+        },
     }
-    link
 }
 
 async fn until(rx: &mut watch::Receiver<bool>) {
@@ -1050,6 +1043,7 @@ mod tests {
             spki_sha256: None,
             device_id: id.into(),
             name: "box".into(),
+            paired_ms: Some(1),
         };
         let a = portal("https://a.example", "d1");
         let b = portal("https://b.example", "d2");
@@ -1058,11 +1052,20 @@ mod tests {
             link_for(up.clone(), Some(&a), Some(&a)).state,
             LinkState::Connected
         );
-        for paired in [Some(&b), None] {
-            let s = link_for(up.clone(), Some(&a), paired);
+        // Paired again, with the same device id too.
+        let again = PortalConfig {
+            paired_ms: Some(2),
+            ..a.clone()
+        };
+        for paired in [&b, &again] {
+            let s = link_for(up.clone(), Some(&a), Some(paired));
             assert_eq!(s.state, LinkState::Connecting);
             assert_eq!(s.detail.as_deref(), Some("switching to the new pairing"));
         }
+        // Unpaired: nothing to switch to.
+        let s = link_for(up.clone(), Some(&a), None);
+        assert_eq!(s.state, LinkState::Stopped);
+        assert!(s.detail.unwrap().starts_with("not paired"));
         let down = LinkStatus::new(LinkState::Waiting, Some("closed".into()));
         assert_eq!(link_for(down, Some(&a), Some(&b)).state, LinkState::Waiting);
     }

@@ -576,11 +576,17 @@ impl Lang {
         }
     }
 
+    /// `detail` is empty when sudo said nothing, or said the password.
     pub fn sudo_refused(self, detail: &str) -> String {
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({detail})")
+        };
         match self {
-            Lang::En => format!("sudo did not accept this password ({detail}). Nothing changed."),
+            Lang::En => format!("sudo did not accept this password{detail}. Nothing changed."),
             Lang::De => format!(
-                "sudo hat dieses Passwort nicht angenommen ({detail}). Es wurde nichts geändert."
+                "sudo hat dieses Passwort nicht angenommen{detail}. Es wurde nichts geändert."
             ),
         }
     }
@@ -692,6 +698,15 @@ impl Lang {
         self.pick(
             "Pithagoras Sync cannot show its windows here: there is no display, or neither zenity nor kdialog is installed. Install one of them, or use the command line (pithagoras-sync --help).",
             "Pithagoras Sync kann hier keine Fenster anzeigen: Es gibt keine Anzeige, oder weder zenity noch kdialog ist installiert. Installiere eines davon oder nutze die Kommandozeile (pithagoras-sync --help).",
+        )
+    }
+
+    /// Linux: something traces the window, which could read what is typed in.
+    #[cfg(target_os = "linux")]
+    pub fn traced(self) -> &'static str {
+        self.pick(
+            "Pithagoras Sync is being traced (a debugger or another program watches it), so it asks for no password now. Close what traces it and open Pithagoras Sync again.",
+            "Pithagoras Sync wird gerade verfolgt (ein Debugger oder ein anderes Programm beobachtet es), deshalb fragt es jetzt nach keinem Passwort. Beende, was es verfolgt, und öffne Pithagoras Sync erneut.",
         )
     }
 

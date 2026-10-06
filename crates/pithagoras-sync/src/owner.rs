@@ -73,19 +73,7 @@ fn check_with(
     let program = cmd.get_program().to_string_lossy().into_owned();
     let a = pty::answer(cmd, pw, wait)?;
     // Its last line, as plain text; never anything that holds the password.
-    let said = String::from_utf8_lossy(&a.said)
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>();
-    let said = if !pw.expose().is_empty() && said.contains(pw.expose()) {
-        String::new()
-    } else {
-        said
-    };
+    let said = crate::secrets::last_line(&a.said, Some(pw));
     match (a.asked, a.success) {
         (true, true) => Ok(true),
         (false, true) => Err(format!(

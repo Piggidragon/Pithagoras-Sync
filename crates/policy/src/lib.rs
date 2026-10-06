@@ -18,6 +18,8 @@ pub mod queue;
 pub mod rules;
 pub mod secret;
 pub mod settings;
+#[cfg(windows)]
+pub mod win;
 
 pub use approve::{Answer, ApprovalRequest, Approver, BoxFuture, NoApprover};
 pub use audit::{AuditLog, AuditRecord};

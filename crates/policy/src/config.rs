@@ -369,6 +369,12 @@ pub struct PortalConfig {
     pub spki_sha256: Option<String>,
     pub device_id: String,
     pub name: String,
+    /// When this pairing was made (ms since the epoch). A new pairing differs
+    /// from the old one by it even when the portal keeps the device id, so the
+    /// running client knows to read the new token. Absent in a config from
+    /// before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

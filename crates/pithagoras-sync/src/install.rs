@@ -14,6 +14,16 @@ use crate::actions::{Action, argv};
 
 pub const UNIT_NAME: &str = "pithagoras-sync.service";
 pub const TASK_NAME: &str = "Pithagoras Sync";
+
+/// Whether the logon task `install` makes is there (Windows): for the window's
+/// menu and `uninstall --purge` alike.
+pub fn task_installed(runner: &dyn crate::actions::Runner) -> bool {
+    runner
+        .try_run(&crate::actions::argv(&[
+            "schtasks", "/Query", "/TN", TASK_NAME,
+        ]))
+        .is_ok()
+}
 pub const SYSTEM_BIN: &str = "/usr/local/bin/pithagoras-sync";
 /// Where `install` puts the program for one user on Linux, below the home
 /// directory: the user unit, the desktop entry and the windows all name it.

@@ -63,6 +63,8 @@ struct State {
     pairs: Mutex<Vec<PairRequest>>,
     devices: mpsc::UnboundedSender<DeviceLink>,
     next: AtomicUsize,
+    /// Set: the next pairing keeps this device id (`pair_next_as`).
+    same_device: Mutex<Option<String>>,
     /// Every byte devices sent: request heads and bodies, and each message.
     transcript: Mutex<Vec<u8>>,
 }
@@ -116,6 +118,7 @@ impl MockPortal {
             pairs: Mutex::new(Vec::new()),
             devices: tx,
             next: AtomicUsize::new(1),
+            same_device: Mutex::new(None),
             transcript: Mutex::new(Vec::new()),
         });
         let (acceptor, spki, cert_der) = if opts.tls {
@@ -203,6 +206,13 @@ impl MockPortal {
 
     pub fn add_code(&self, code: &str) {
         self.state.codes.lock().unwrap().push(code.into());
+    }
+
+    /// The next pairing gives the device `device_id` again, with a new token,
+    /// as a portal that pairs a device it knows may. Its old token keeps
+    /// working.
+    pub fn pair_next_as(&self, device_id: &str) {
+        *self.state.same_device.lock().unwrap() = Some(device_id.into());
     }
 
     /// Lets `token` connect as `device_id` without pairing.
@@ -359,7 +369,9 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(st: Arc<State>, mut io: S, head
         )
         .await;
     }
-    let device_id = format!("dev-{}", st.next.fetch_add(1, Ordering::SeqCst));
+    let same = st.same_device.lock().unwrap().take();
+    let device_id =
+        same.unwrap_or_else(|| format!("dev-{}", st.next.fetch_add(1, Ordering::SeqCst)));
     let token = random_token();
     st.tokens
         .lock()

@@ -18,6 +18,13 @@ use crate::secret::Secret;
 /// What every entry of this client carries, so it finds its own and only those.
 pub const APPLICATION: &str = "pithagoras-sync";
 
+/// Which client an entry belongs to: its config folder. Two clients of one
+/// user (another `XDG_CONFIG_HOME`, `APPDATA` or `PITHAGORAS_SYNC_CONFIG_DIR`)
+/// keep apart entries, and removing one's leaves the other's.
+pub fn scope(dirs: &crate::Dirs) -> String {
+    dirs.config.display().to_string()
+}
+
 /// Set (to anything), the client uses no keyring at all: an explicit `keyring`
 /// setting then fails, and the Windows default keeps the token in its file. The
 /// tests set it, so a run never writes to the keyring of the machine it runs on.
@@ -56,15 +63,16 @@ pub fn may_come_later(e: &str) -> bool {
         .any(|p| e.contains(p))
 }
 
-/// The keyring of this platform and session.
-pub fn system() -> Arc<dyn SecretStore> {
+/// The keyring of this platform and session, with the entries of the client
+/// that keeps its config in `dirs` (`scope`).
+pub fn system(dirs: &crate::Dirs) -> Arc<dyn SecretStore> {
     if std::env::var_os(NO_KEYRING_ENV).is_some() {
         return Arc::new(Unavailable(format!("no keyring: {NO_KEYRING_ENV} is set")));
     }
     #[cfg(windows)]
-    return Arc::new(credentials::CredentialManager);
+    return Arc::new(credentials::CredentialManager { scope: scope(dirs) });
     #[cfg(unix)]
-    return Arc::new(secret_service::SecretService::session());
+    return Arc::new(secret_service::SecretService::session(scope(dirs)));
     #[allow(unreachable_code)]
     Arc::new(Unavailable(
         "this system has no keyring the client knows".into(),
@@ -142,8 +150,8 @@ fn secret_from_bytes(bytes: Vec<u8>) -> Result<Secret, String> {
 }
 
 /// The Secret Service (`org.freedesktop.secrets`): GNOME Keyring, KWallet and
-/// KeePassXC serve it. Items carry `application=pithagoras-sync` and `name=<name>`
-/// and live in the default collection. The `plain` session is used: the bus is
+/// KeePassXC serve it. Items carry `application=pithagoras-sync`, `name=<name>`
+/// and `config=<config folder>` (`scope`) and live in the default collection. The `plain` session is used: the bus is
 /// this user's own, and the other algorithm only hides the secret from someone
 /// who can read that bus, who could ask the service for it as well.
 #[cfg(unix)]
@@ -242,17 +250,29 @@ pub mod secret_service {
     /// The Secret Service on the session bus, or on a given connection (tests).
     pub struct SecretService {
         conn: Option<zbus::Connection>,
+        /// The client's config folder (`super::scope`).
+        scope: String,
+        /// Held while a call unlocks the keyring (`unlock`).
+        unlocking: tokio::sync::Mutex<()>,
     }
 
     impl SecretService {
         /// Connects to the session bus at each use: a client that started before
         /// the desktop's keyring finds it later.
-        pub fn session() -> SecretService {
-            SecretService { conn: None }
+        pub fn session(scope: String) -> SecretService {
+            SecretService {
+                conn: None,
+                scope,
+                unlocking: tokio::sync::Mutex::new(()),
+            }
         }
 
-        pub fn with_connection(conn: zbus::Connection) -> SecretService {
-            SecretService { conn: Some(conn) }
+        pub fn with_connection(conn: zbus::Connection, scope: String) -> SecretService {
+            SecretService {
+                conn: Some(conn),
+                scope,
+                unlocking: tokio::sync::Mutex::new(()),
+            }
         }
 
         async fn connect(&self) -> Result<zbus::Connection, String> {
@@ -265,8 +285,12 @@ pub mod secret_service {
         }
     }
 
-    fn attributes(name: &str) -> HashMap<&str, &str> {
-        HashMap::from([("application", APPLICATION), ("name", name)])
+    fn attributes<'a>(scope: &'a str, name: &'a str) -> HashMap<&'a str, &'a str> {
+        HashMap::from([
+            ("application", APPLICATION),
+            ("name", name),
+            ("config", scope),
+        ])
     }
 
     /// A call with the time limit, its error in words.
@@ -348,7 +372,13 @@ pub mod secret_service {
         }
     }
 
+    /// Unlocks `paths`, through a prompt where the service asks for one. One
+    /// call at a time (`one`): two that find the keyring locked, as the token
+    /// and the password at the client's start, put one prompt in front of the
+    /// owner, not two. A call that waited for another's prompt and still finds
+    /// the keyring locked takes that answer as its own and asks nothing.
     async fn unlock(
+        one: &tokio::sync::Mutex<()>,
         conn: &zbus::Connection,
         service: &ServiceProxy<'_>,
         paths: &[OwnedObjectPath],
@@ -356,10 +386,19 @@ pub mod secret_service {
         if paths.is_empty() {
             return Ok(());
         }
+        let (_one, waited) = match one.try_lock() {
+            Ok(g) => (g, false),
+            Err(_) => (one.lock().await, true),
+        };
         let refs: Vec<ObjectPath<'_>> = paths.iter().map(|p| p.as_ref()).collect();
         let (_, p) = timed(service.unlock(&refs)).await?;
         if none(&p) {
             return Ok(());
+        }
+        if waited {
+            return Err(
+                "the keyring stayed locked: it was not unlocked at the prompt shown for another request at the same time".into(),
+            );
         }
         prompt(conn, &p)
             .await
@@ -402,11 +441,12 @@ pub mod secret_service {
         async fn get_secret(&self, name: &str) -> Result<Option<Secret>, String> {
             let conn = self.connect().await?;
             let service = timed(ServiceProxy::new(&conn)).await?;
-            let (unlocked, locked) = timed(service.search_items(attributes(name))).await?;
+            let (unlocked, locked) =
+                timed(service.search_items(attributes(&self.scope, name))).await?;
             let item = match (unlocked.first(), locked.first()) {
                 (Some(i), _) => i.clone(),
                 (None, Some(i)) => {
-                    unlock(&conn, &service, std::slice::from_ref(i)).await?;
+                    unlock(&self.unlocking, &conn, &service, std::slice::from_ref(i)).await?;
                     i.clone()
                 }
                 (None, None) => return Ok(None),
@@ -439,17 +479,17 @@ pub mod secret_service {
             )
             .await?;
             if timed(c.locked()).await? {
-                unlock(&conn, &service, &[collection]).await?;
+                unlock(&self.unlocking, &conn, &service, &[collection]).await?;
             }
             let session = open(&conn, &service).await?;
-            let attrs: HashMap<String, String> = attributes(name)
+            let attrs: HashMap<String, String> = attributes(&self.scope, name)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let props = HashMap::from([
                 (
                     "org.freedesktop.Secret.Item.Label",
-                    Value::from(format!("Pithagoras Sync: {name}")),
+                    Value::from(format!("Pithagoras Sync: {name} ({})", self.scope)),
                 ),
                 ("org.freedesktop.Secret.Item.Attributes", Value::from(attrs)),
             ]);
@@ -475,15 +515,17 @@ pub mod secret_service {
         async fn has_secret(&self, name: &str) -> Result<bool, String> {
             let conn = self.connect().await?;
             let service = timed(ServiceProxy::new(&conn)).await?;
-            let (unlocked, locked) = timed(service.search_items(attributes(name))).await?;
+            let (unlocked, locked) =
+                timed(service.search_items(attributes(&self.scope, name))).await?;
             Ok(!unlocked.is_empty() || !locked.is_empty())
         }
 
         async fn delete_secret(&self, name: &str) -> Result<(), String> {
             let conn = self.connect().await?;
             let service = timed(ServiceProxy::new(&conn)).await?;
-            let (unlocked, locked) = timed(service.search_items(attributes(name))).await?;
-            unlock(&conn, &service, &locked).await?;
+            let (unlocked, locked) =
+                timed(service.search_items(attributes(&self.scope, name))).await?;
+            unlock(&self.unlocking, &conn, &service, &locked).await?;
             for path in unlocked.into_iter().chain(locked) {
                 let item = timed(
                     ItemProxy::builder(&conn)
@@ -525,7 +567,7 @@ pub mod secret_service {
 }
 
 /// The Windows Credential Manager: generic credentials named
-/// `pithagoras-sync/<name>`, kept for this user on this machine
+/// `pithagoras-sync/<name> (<config folder>)` (`scope`), kept for this user on this machine
 /// (`CRED_PERSIST_LOCAL_MACHINE`, not roamed). `cmdkey /list` shows them. Not run
 /// by the tests (they run on Linux, or set `NO_KEYRING_ENV`).
 #[cfg(windows)]
@@ -539,19 +581,20 @@ pub mod credentials {
     use super::{APPLICATION, SecretStore, secret_from_bytes};
     use crate::approve::BoxFuture;
     use crate::secret::Secret;
+    use crate::win::wide;
 
-    pub struct CredentialManager;
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
+    pub struct CredentialManager {
+        /// The client's config folder (`super::scope`).
+        pub scope: String,
     }
 
-    fn target(name: &str) -> Vec<u16> {
-        wide(&format!("{APPLICATION}/{name}"))
+    impl CredentialManager {
+        fn target(&self, name: &str) -> Vec<u16> {
+            wide(&format!("{APPLICATION}/{name} ({})", self.scope))
+        }
     }
 
-    fn get(name: &str) -> Result<Option<Secret>, String> {
-        let target = target(name);
+    fn get(target: Vec<u16>) -> Result<Option<Secret>, String> {
         let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
         // SAFETY: the target is NUL-terminated; on success `cred` is freed below.
         if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) } == 0 {
@@ -580,8 +623,7 @@ pub mod credentials {
         secret_from_bytes(bytes).map(Some)
     }
 
-    fn set(name: &str, value: &Secret) -> Result<(), String> {
-        let mut target = target(name);
+    fn set(mut target: Vec<u16>, value: &Secret) -> Result<(), String> {
         let mut user = wide(APPLICATION);
         let mut blob = value.expose().as_bytes().to_vec();
         let cred = CREDENTIALW {
@@ -611,8 +653,7 @@ pub mod credentials {
         Ok(())
     }
 
-    fn delete(name: &str) -> Result<(), String> {
-        let target = target(name);
+    fn delete(target: Vec<u16>) -> Result<(), String> {
         // SAFETY: the target is NUL-terminated.
         if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
             // SAFETY: no preconditions.
@@ -629,7 +670,7 @@ pub mod credentials {
 
     impl SecretStore for CredentialManager {
         fn get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<Secret>, String>> {
-            Box::pin(async move { get(name) })
+            Box::pin(async move { get(self.target(name)) })
         }
 
         fn set<'a>(
@@ -637,11 +678,11 @@ pub mod credentials {
             name: &'a str,
             value: &'a Secret,
         ) -> BoxFuture<'a, Result<(), String>> {
-            Box::pin(async move { set(name, value) })
+            Box::pin(async move { set(self.target(name), value) })
         }
 
         fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
-            Box::pin(async move { delete(name) })
+            Box::pin(async move { delete(self.target(name)) })
         }
     }
 }
@@ -685,7 +726,10 @@ mod tests {
     async fn no_keyring_when_told_so() {
         // SAFETY: tests in this binary do not read this variable concurrently.
         unsafe { std::env::set_var(NO_KEYRING_ENV, "1") };
-        let e = system().get("token").await.unwrap_err();
+        let e = system(&crate::Dirs::under(std::path::Path::new("/nonexistent")))
+            .get("token")
+            .await
+            .unwrap_err();
         assert!(e.contains(NO_KEYRING_ENV), "{e}");
         assert!(secret_from_bytes(vec![0xff]).is_err());
     }

@@ -217,14 +217,26 @@ async fn sudo_run(
         .await
         .map_err(|_| format!("{} did not answer in time", sudo.display()))?
         .map_err(|e| format!("{}: {e}", sudo.display()))?;
-    let err = String::from_utf8_lossy(&out.stderr);
-    let last = err
+    Ok((out.status.success(), last_line(&out.stderr, input)))
+}
+
+/// The last line a program wrote, as plain text for a message (a window shows
+/// it, and puts it in its dialog program's argv): nothing when it holds the
+/// password, since a program may echo what it was given.
+#[cfg(unix)]
+pub fn last_line(out: &[u8], pw: Option<&Secret>) -> String {
+    let line = String::from_utf8_lossy(out)
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
         .unwrap_or_default()
-        .to_string();
-    Ok((out.status.success(), last))
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    match pw.map(Secret::expose) {
+        Some(pw) if !pw.is_empty() && line.contains(pw) => String::new(),
+        _ => line,
+    }
 }
 
 /// Reads a line from the terminal without echoing it. Never from a command line or
@@ -474,7 +486,7 @@ mod tests {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{log}'\nenv >> '{log}'\ncase \"$*\" in *-n*) [ -e '{nopw}' ] && exit 0; echo 'sudo: a password is required' >&2; exit 1;; esac\nread -r pw\n[ \"$pw\" = 'right pw' ] && exit 0\necho 'Sorry, try again.' >&2\necho 'sudo: 1 incorrect password attempt' >&2\nexit 1\n",
+                "#!/bin/sh\necho \"$*\" >> '{log}'\nenv >> '{log}'\ncase \"$*\" in *-n*) [ -e '{nopw}' ] && exit 0; echo 'sudo: a password is required' >&2; exit 1;; esac\nread -r pw\n[ \"$pw\" = 'right pw' ] && exit 0\ncase \"$pw\" in echoed*) echo \"sudo: no user named $pw\" >&2; exit 1;; esac\necho 'Sorry, try again.' >&2\necho 'sudo: 1 incorrect password attempt' >&2\nexit 1\n",
                 log = log.display(),
                 nopw = nopw.display()
             ),
@@ -501,10 +513,17 @@ mod tests {
                 "sudo: 1 incorrect password attempt".into()
             ))
         );
+        // A sudo (or a PAM module) that echoes the password: its line is not
+        // passed on, since the window puts it in a dialog program's argv.
+        let echoed = Secret::new("echoed pw".into());
+        assert_eq!(
+            check_with_sudo(&sudo, &echoed).await,
+            Ok(SudoCheck::Refused(String::new()))
+        );
         let log = std::fs::read_to_string(t.path().join("log")).unwrap();
         // Never in argv or the environment; no cached credentials used or kept.
         assert!(
-            !log.contains("right pw") && !log.contains("wrong pw"),
+            !log.contains("right pw") && !log.contains("wrong pw") && !log.contains("echoed"),
             "{log}"
         );
         assert!(

@@ -67,11 +67,15 @@ impl TokenStore {
         matches!(self.place, Place::Keyring { .. })
     }
 
-    /// For `status`: where the token is meant to be.
+    /// For `status`: where the token is. The Windows default names the file
+    /// it fell back to, since `load` reads that file while it is there.
     pub fn describe(&self) -> &'static str {
         match self.place {
             Place::File => "file",
             Place::Keyring { explicit: true } => "keyring",
+            Place::Keyring { explicit: false } if self.file.exists() => {
+                "file (the keyring did not take it)"
+            }
             Place::Keyring { explicit: false } => "keyring (the default here)",
         }
     }
@@ -191,14 +195,28 @@ impl TokenStore {
         Ok(note)
     }
 
+    /// Whether `delete` removes a keyring entry, asked without a prompt (the
+    /// plan of `uninstall --purge`). A keyring that cannot answer holds the
+    /// token when the client is `paired` and `load` reads it there, and
+    /// nothing otherwise: not paired, `unpair` removed it already; in the
+    /// file, `delete` leaves that keyring alone.
+    pub async fn keyring_holds(&self, paired: bool) -> bool {
+        self.keyring
+            .has(KEYRING_NAME)
+            .await
+            .unwrap_or_else(|_| paired && self.reads_keyring())
+    }
+
     /// Forgets the token (`unpair`, `uninstall --purge`): the file and the
-    /// keyring entry. A store on the file removes an entry an earlier setting
-    /// left, and only asks whether there is one, so it never prompts to unlock
-    /// a keyring. A delete that fails is an error, for the Windows default
-    /// too, unless the keyring then says it holds no entry.
+    /// keyring entry. Where the token is in the keyring, a delete that fails
+    /// is an error unless the keyring then says it holds no entry. Where it is
+    /// in the file (a file store, or the Windows default that fell back), an
+    /// entry an earlier setting left goes too, asked for without a prompt, and
+    /// a keyring that cannot answer is left alone: it never had this token.
     pub async fn delete(&self) -> Result<(), String> {
+        let in_keyring = self.reads_keyring();
         self.remove_file()?;
-        if self.uses_keyring() {
+        if in_keyring {
             self.remove_entry().await
         } else {
             self.remove_leftover().await
@@ -495,11 +513,28 @@ mod tests {
         *ks.fail.lock().unwrap() = Some("no service".into());
         store(t.path(), None, &ks, false).delete().await.unwrap();
         for (choice, windows) in [(Some(TokenStorage::Keyring), false), (None, true)] {
-            let e = store(t.path(), choice, &ks, windows)
-                .delete()
-                .await
-                .unwrap_err();
+            let s = store(t.path(), choice, &ks, windows);
+            assert!(s.keyring_holds(true).await);
+            assert!(!s.keyring_holds(false).await);
+            let e = s.delete().await.unwrap_err();
             assert!(e.contains("no service"), "{e}");
         }
+    }
+
+    /// The Windows default fell back to the file because the keyring failed:
+    /// `unpair` and `uninstall --purge` remove that file and do not wait for
+    /// the keyring, which never had the token, and `status` names the file.
+    #[tokio::test]
+    async fn a_token_the_default_kept_in_the_file_goes_without_the_keyring() {
+        let t = tempfile::tempdir().unwrap();
+        let ks = Arc::new(FakeStore::default());
+        *ks.fail.lock().unwrap() = Some("no service".into());
+        let s = store(t.path(), None, &ks, true);
+        assert!(s.save(T1).await.unwrap().is_some());
+        assert_eq!(s.describe(), "file (the keyring did not take it)");
+        assert!(!s.keyring_holds(true).await);
+        s.delete().await.unwrap();
+        assert!(!t.path().join("token").exists());
+        assert_eq!(s.describe(), "keyring (the default here)");
     }
 }

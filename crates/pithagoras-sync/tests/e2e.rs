@@ -1001,6 +1001,7 @@ fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
     std::fs::create_dir_all(&bin).unwrap();
     let log = env.root.join("dialogs.log");
     let envlog = env.root.join("dialogs.env");
+    let open = env.root.join("dialogs.parent");
     let ans = env.root.join("dialogs.answers");
     std::fs::write(
         &ans,
@@ -1012,9 +1013,10 @@ fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
                 log = log.display(),
                 envlog = envlog.display(),
+                open = open.display(),
                 ans = ans.display()
             ),
         )
@@ -1026,6 +1028,13 @@ fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+/// Whether a dialog program could read the memory of the process that showed
+/// it, as any process of the same user could (`/proc/<pid>/environ` stands in
+/// for `/proc/<pid>/mem`).
+fn dialog_parent_was_open(env: &Env) -> bool {
+    env.root.join("dialogs.parent").exists()
 }
 
 /// The dialogs shown so far: each one's arguments.
@@ -1150,8 +1159,77 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
         files_holding(&env.root, PW.as_bytes()),
         Vec::<PathBuf>::new()
     );
+    // The password passed through the window, whose memory no other process
+    // of the user could read.
+    assert!(!dialog_parent_was_open(&env));
     // The code is still unused.
     env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+}
+
+/// Something traces the window (a debugger, or a command of the agent that
+/// attached before it could stop that): it asks for no password and says why.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_asks_for_no_password_while_traced() {
+    use std::os::unix::process::CommandExt as _;
+    let env = Env::new();
+    looks_installed(&env);
+    let answer = format!("0|{PW}");
+    let path = fake_dialogs(&env, &["0|", &answer, "0|"]);
+    let mut cmd = env.cmd(&[
+        "gui",
+        "--link",
+        "pithagoras-sync://pair?portal=http://127.0.0.1:9&code=CODE9999",
+    ]);
+    cmd.env("PATH", &path).env("DISPLAY", ":99");
+    // Spawned and traced from one thread: only that thread is its tracer.
+    let code = tokio::task::spawn_blocking(move || {
+        let cmd = cmd.as_std_mut();
+        // SAFETY: ptrace only, async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // Reaped below with waitpid, as its tracer must.
+        #[allow(clippy::zombie_processes)]
+        let child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        // As the tracer: let it go on after every stop, until it exits.
+        loop {
+            let mut status = 0;
+            // SAFETY: waits for our own child.
+            if unsafe { libc::waitpid(pid, &mut status, libc::__WALL) } < 0 {
+                panic!("waitpid: {}", std::io::Error::last_os_error());
+            }
+            if libc::WIFEXITED(status) {
+                break libc::WEXITSTATUS(status);
+            }
+            if libc::WIFSIGNALED(status) {
+                break -libc::WTERMSIG(status);
+            }
+            if libc::WIFSTOPPED(status) {
+                let sig = match libc::WSTOPSIG(status) {
+                    libc::SIGTRAP => 0,
+                    s => s,
+                };
+                // SAFETY: the window is our tracee.
+                unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, sig) };
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 1);
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 1, "{shown:#?}");
+    assert!(
+        shown[0].contains("--error") && shown[0].contains("being traced"),
+        "{shown:#?}"
+    );
 }
 
 /// No to the question: nothing is paired, the code is not used.
@@ -2941,6 +3019,69 @@ async fn the_old_link_is_not_reported_as_the_new_pairing() {
         assert_ne!(s["link"]["state"], "connected", "{s}");
     }
     assert!(new.refused() > 0);
+    stop(daemon).await;
+}
+
+/// A pairing the portal answers with the device id it gave before, and a new
+/// token: the running client switches to that token, though only the time of
+/// the pairing tells the two apart in the config.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pairing_with_the_same_device_id_is_used() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into(), "CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let first = mock.next_device(WAIT).await.expect("the client connects");
+    let id = first.device_id.clone();
+    mock.pair_next_as(&id);
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "testbox"])
+        .await;
+    let again = mock
+        .next_device(WAIT)
+        .await
+        .expect("the client links again");
+    assert_eq!(again.device_id, id);
+    stop(daemon).await;
+}
+
+/// The portal removed the device: the client stays down until it is paired
+/// again. A policy change in between does not try the refused token once more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_waits_for_a_new_pairing() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into(), "CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let first = mock.next_device(WAIT).await.expect("the client connects");
+    mock.revoke(&first.device_id).await;
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        if s["link"]["state"] == "rejected" {
+            break;
+        }
+        assert!(std::time::Instant::now() < end, "{s}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    env.ok(&["mode", "ask"]).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(mock.refused(), 0, "the refused token was tried again");
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "testbox"])
+        .await;
+    mock.next_device(WAIT)
+        .await
+        .expect("the new pairing connects");
+    assert_eq!(mock.refused(), 0);
     stop(daemon).await;
 }
 

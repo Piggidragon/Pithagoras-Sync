@@ -576,15 +576,7 @@ impl RealHost {
 impl Host for RealHost {
     fn installed(&self) -> bool {
         if cfg!(windows) {
-            use crate::actions::Runner;
-            return crate::actions::System
-                .try_run(&crate::actions::argv(&[
-                    "schtasks",
-                    "/Query",
-                    "/TN",
-                    crate::install::TASK_NAME,
-                ]))
-                .is_ok();
+            return crate::install::task_installed(&crate::actions::System);
         }
         match linux_install(
             sync_ops::info::home().as_deref(),

@@ -510,19 +510,13 @@ mod win {
         MB_SETFOREGROUND, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
     };
 
+    use sync_policy::win::wide;
+
     use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip};
 
     /// The clipboard's text format.
     const CF_UNICODETEXT: u32 = 13;
     const IDNO: i32 = 7;
-
-    fn wide(s: &str) -> Vec<u16> {
-        // A NUL would end the text early; `shown` already escapes it.
-        s.replace('\0', " ")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
-    }
 
     fn message(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
         let t = wide(&clip(text, MAX_TEXT));

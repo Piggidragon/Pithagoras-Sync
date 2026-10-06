@@ -556,7 +556,7 @@ pub fn token_store(dirs: &Dirs, cfg: &DeviceConfig) -> sync_connector::token::To
     sync_connector::token::TokenStore::new(
         dirs.token_file(),
         cfg.token_storage,
-        sync_policy::keyring::system(),
+        sync_policy::keyring::system(dirs),
     )
 }
 
@@ -882,7 +882,7 @@ pub(crate) async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Re
                 SecretStorage::Memory => false,
                 SecretStorage::File => crate::secrets::file(dirs).exists(),
                 // Without unlocking it: a status is no reason for a prompt.
-                SecretStorage::Keyring => sync_policy::keyring::system()
+                SecretStorage::Keyring => sync_policy::keyring::system(dirs)
                     .has(crate::secrets::ELEVATION)
                     .await
                     .unwrap_or(false),
@@ -950,7 +950,7 @@ pub(crate) async fn keep_password(
             if storage == SecretStorage::Memory {
                 return Ok(Kept::Nowhere);
             }
-            let keyring = sync_policy::keyring::system();
+            let keyring = sync_policy::keyring::system(dirs);
             secrets::store(dirs, storage, keyring.as_ref(), &value).await?;
             Ok(Kept::ForNextStart)
         }
@@ -973,7 +973,7 @@ pub(crate) async fn forget_password(dirs: &Dirs) -> Result<(), String> {
         Some(_) => Ok(()),
         None => {
             let storage = load_config(dirs)?.policy.privilege.secret_storage;
-            let keyring = sync_policy::keyring::system();
+            let keyring = sync_policy::keyring::system(dirs);
             secrets::forget(dirs, storage, keyring.as_ref()).await
         }
     }
@@ -1110,6 +1110,11 @@ fn console_is_ours_alone() -> bool {
 
 /// The graphical flow (`gui`, a pairing link, a double click).
 async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
+    // The owner's login and sudo passwords pass through this process: as the
+    // client does, it keeps other processes of the user (the commands an agent
+    // runs among them) out of its memory, and asks for none while traced.
+    #[cfg(target_os = "linux")]
+    sync_policy::secret::undumpable();
     // What the commands it runs print (the purge's list) is for a terminal;
     // here nobody reads it, and a pipe closed meanwhile must not end an
     // uninstall halfway.
@@ -1135,6 +1140,11 @@ async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
             return Ok(ExitCode::from(1));
         }
     };
+    #[cfg(target_os = "linux")]
+    if sync_policy::secret::traced() {
+        d.error(lang.traced());
+        return Ok(ExitCode::from(1));
+    }
     let host = crate::gui::RealHost { dirs: dirs.clone() };
     // Awaited here, on the thread in `block_on`, never spawned: its dialogs and
     // programs block for minutes, and this way hold none of the runtime's
@@ -1923,14 +1933,7 @@ pub(crate) async fn purge(
         home.as_ref().map(|h| install::user_unit_folder(h))
     };
     let installed = if cfg!(windows) {
-        runner
-            .try_run(&actions::argv(&[
-                "schtasks",
-                "/Query",
-                "/TN",
-                install::TASK_NAME,
-            ]))
-            .is_ok()
+        install::task_installed(&runner)
     } else {
         unit_folder
             .as_ref()
@@ -1981,21 +1984,21 @@ pub(crate) async fn purge(
     let config = DeviceConfig::load(&dirs.config_file()).ok();
     let portal = config.as_ref().and_then(|c| c.portal.clone());
     // What the keyring keeps for the client, asked without a prompt: an entry
-    // where the config puts it, or one an earlier setting left. A keyring that
-    // cannot answer is taken to hold what the config puts there; removing it
-    // then fails with the reason.
-    let keyring = sync_policy::keyring::system();
-    let in_keyring = |name: &'static str, setting: bool| {
-        let keyring = keyring.clone();
-        async move { keyring.has(name).await.unwrap_or(setting) }
-    };
-    let tokens = config.as_ref().map(|c| token_store(dirs, c));
-    let token_setting = tokens.as_ref().is_some_and(|t| t.uses_keyring());
-    let keyring_token = in_keyring(sync_connector::token::KEYRING_NAME, token_setting).await;
+    // where the config puts it, or one an earlier setting left. The token store
+    // decides for the token, as `unpair` does. For the password, a keyring that
+    // cannot answer is taken to hold it where the config puts it there;
+    // removing it then fails with the reason.
+    let keyring = sync_policy::keyring::system(dirs);
+    let tokens = token_store(dirs, config.as_ref().unwrap_or(&DeviceConfig::default()));
+    let keyring_token = tokens.keyring_holds(portal.is_some()).await;
     let password_setting = config.as_ref().is_some_and(|c| {
         c.policy.privilege.secret_storage == sync_policy::config::SecretStorage::Keyring
     });
-    let keyring_password = linux && in_keyring(crate::secrets::ELEVATION, password_setting).await;
+    let keyring_password = linux
+        && keyring
+            .has(crate::secrets::ELEVATION)
+            .await
+            .unwrap_or(password_setting);
 
     let mut notes = Vec::new();
     if let Some(p) = &portal {
@@ -2113,13 +2116,8 @@ pub(crate) async fn purge(
     apply(&uninstall).map_err(after_stop)?;
     deleted.set(true);
     // The keyring first: the config that says what is there goes with the files.
-    if let Some(t) = tokens.as_ref().filter(|_| token_setting && keyring_token) {
-        t.delete().await.map_err(after_stop)?;
-    } else if keyring_token {
-        keyring
-            .delete(sync_connector::token::KEYRING_NAME)
-            .await
-            .map_err(|e| after_stop(format!("cannot remove the token from the keyring: {e}")))?;
+    if keyring_token {
+        tokens.delete().await.map_err(after_stop)?;
     }
     if keyring_password {
         crate::secrets::forget(
