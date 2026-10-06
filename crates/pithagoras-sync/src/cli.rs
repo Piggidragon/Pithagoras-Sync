@@ -844,27 +844,36 @@ fn sudo_status_text(v: &SudoView) -> String {
 /// but the elevation: the callers wait for answers, and whatever the owner changed
 /// meanwhile (the mode, a folder) must not be written back.
 async fn set_elevation(dirs: &Dirs, to: Elevation) -> Result<(), String> {
-    let mut cfg = load_config(dirs)?;
     let word = if to == Elevation::Sudo {
         "active"
     } else {
         "not active"
     };
-    if cfg.policy.privilege.elevation == to {
+    if switch_elevation(dirs, to).await? {
+        println!("Sudo access is {word} now.");
+    } else {
         println!("Sudo access is {word} already.");
-        return Ok(());
+    }
+    Ok(())
+}
+
+/// `set_elevation` without the words: whether it changed anything. The owner
+/// checks are the caller's.
+pub(crate) async fn switch_elevation(dirs: &Dirs, to: Elevation) -> Result<bool, String> {
+    let mut cfg = load_config(dirs)?;
+    if cfg.policy.privilege.elevation == to {
+        return Ok(false);
     }
     cfg.policy.privilege.elevation = to;
     cfg.save(&dirs.config_file())?;
-    println!("Sudo access is {word} now.");
     reload_running(dirs).await;
-    Ok(())
+    Ok(true)
 }
 
 /// Whether a password is stored: the running client holds one, or (when the
 /// client is not running) the file or the keyring has one the client will load,
 /// which it does only with file or keyring storage.
-async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
+pub(crate) async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
     Ok(
         match control::send(&dirs.socket(), Request::Status).await? {
             Some(r) => r.status.is_some_and(|s| s.elevation_password),
@@ -893,6 +902,36 @@ async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
             info::user().0
         ))?
     };
+    match keep_password(dirs, value).await? {
+        Kept::InClient => println!("Password stored in the client."),
+        Kept::ForNextStart => println!("Password stored for the client's next start."),
+        Kept::Nowhere => {
+            return Err(
+                "the client is not running, and it keeps the password in memory only (policy.privilege.secret_storage = memory); start it first".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where `keep_password` put the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// The running client holds it (and stores it as its storage says).
+    InClient,
+    /// In the file or the keyring, for the client's next start.
+    ForNextStart,
+    /// Nowhere: the client is not running and keeps it in memory only.
+    Nowhere,
+}
+
+/// Gives the password to the running client, or to the file or keyring for
+/// the client's next start. The owner checks are the caller's.
+pub(crate) async fn keep_password(
+    dirs: &Dirs,
+    value: sync_policy::secret::Secret,
+) -> Result<Kept, String> {
+    use crate::secrets;
     match control::send(
         &dirs.socket(),
         Request::SecretSet {
@@ -902,25 +941,43 @@ async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
     )
     .await?
     {
-        Some(r) if r.ok => println!("Password stored in the client."),
-        Some(r) => return Err(r.error.unwrap_or_default()),
-        None if load_config(dirs)?.policy.privilege.secret_storage != SecretStorage::Memory => {
+        Some(r) if r.ok => Ok(Kept::InClient),
+        Some(r) => Err(r.error.unwrap_or_default()),
+        None => {
             let storage = load_config(dirs)?.policy.privilege.secret_storage;
+            if storage == SecretStorage::Memory {
+                return Ok(Kept::Nowhere);
+            }
             let keyring = sync_policy::keyring::system();
             secrets::store(dirs, storage, keyring.as_ref(), &value).await?;
-            println!("Password stored for the client's next start.");
-        }
-        None => {
-            return Err(
-                "the client is not running, and it keeps the password in memory only (policy.privilege.secret_storage = memory); start it first".into(),
-            );
+            Ok(Kept::ForNextStart)
         }
     }
-    Ok(())
+}
+
+/// Forgets the password: in the running client, or where it is stored. The
+/// owner checks are the caller's.
+pub(crate) async fn forget_password(dirs: &Dirs) -> Result<(), String> {
+    use crate::secrets;
+    match control::send(
+        &dirs.socket(),
+        Request::SecretClear {
+            name: secrets::ELEVATION.into(),
+        },
+    )
+    .await?
+    {
+        Some(r) if !r.ok => Err(r.error.unwrap_or_default()),
+        Some(_) => Ok(()),
+        None => {
+            let storage = load_config(dirs)?.policy.privilege.secret_storage;
+            let keyring = sync_policy::keyring::system();
+            secrets::forget(dirs, storage, keyring.as_ref()).await
+        }
+    }
 }
 
 async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
-    use crate::secrets;
     sudo_supported(cfg!(target_os = "linux"))?;
     match cmd {
         SudoCmd::Status => {
@@ -985,22 +1042,7 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
         }
         SudoCmd::Clear { deactivate } => {
             owner::not_from_own_command(dirs).await?;
-            match control::send(
-                &dirs.socket(),
-                Request::SecretClear {
-                    name: secrets::ELEVATION.into(),
-                },
-            )
-            .await?
-            {
-                Some(r) if !r.ok => return Err(r.error.unwrap_or_default()),
-                Some(_) => {}
-                None => {
-                    let storage = load_config(dirs)?.policy.privilege.secret_storage;
-                    let keyring = sync_policy::keyring::system();
-                    secrets::forget(dirs, storage, keyring.as_ref()).await?;
-                }
-            }
+            forget_password(dirs).await?;
             println!("Password forgotten.");
             let cfg = load_config(dirs)?;
             if cfg.policy.privilege.elevation == Elevation::Sudo {
@@ -1073,23 +1115,20 @@ async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
         // SAFETY: FreeConsole has no preconditions.
         unsafe { windows_sys::Win32::System::Console::FreeConsole() };
     }
+    let lang = crate::i18n::Lang::detect();
     #[cfg(windows)]
-    let d: Box<dyn crate::dialogs::Dialogs> = Box::new(crate::dialogs::WinDialogs);
+    let d: Box<dyn crate::dialogs::Dialogs> = Box::new(crate::dialogs::WinDialogs(lang));
     #[cfg(not(windows))]
-    let d: Box<dyn crate::dialogs::Dialogs> = match crate::dialogs::Native::find() {
+    let d: Box<dyn crate::dialogs::Dialogs> = match crate::dialogs::Native::find(lang) {
         Some(n) => Box::new(n),
         None => {
-            crate::gui::say_without_dialogs(
-                dirs,
-                "Pithagoras Sync cannot show its windows here: there is no display, or neither zenity nor kdialog is installed. Install one of them, or use the command line (pithagoras-sync --help).",
-            )
-            .await;
+            crate::gui::say_without_dialogs(dirs, lang.no_dialogs()).await;
             return Ok(ExitCode::from(1));
         }
     };
     let host = crate::gui::RealHost { dirs: dirs.clone() };
     Ok(
-        match crate::gui::flow(d.as_ref(), &host, link.as_deref()).await {
+        match crate::gui::flow(d.as_ref(), &host, lang, link.as_deref()).await {
             crate::gui::Outcome::Done => ExitCode::SUCCESS,
             _ => ExitCode::from(1),
         },

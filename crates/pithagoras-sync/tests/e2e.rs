@@ -1120,6 +1120,158 @@ async fn a_pairing_link_the_owner_refuses_changes_nothing() {
     env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
 }
 
+/// In a German session the windows speak German, and the dialog program gets
+/// the language for its buttons.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_windows_follow_the_desktops_language() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let path = fake_dialogs(&env, &["1|"]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .env("LANG", "de_DE.UTF-8")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let shown = dialogs_shown(&env);
+    let q = shown[0].join("\n");
+    assert!(
+        q.contains("Diesen Computer mit dem Pithagoras-Portal"),
+        "{q}"
+    );
+    assert!(q.contains("koppeln?"), "{q}");
+    let denv = std::fs::read_to_string(env.root.join("dialogs.env")).unwrap();
+    assert!(denv.contains("LANG=de_DE.UTF-8"), "{denv}");
+    // Where that locale is not installed, the dialog program gets one that is
+    // (else it refuses the umlauts and shows nothing), and the language.
+    if let Some(l) = denv.lines().find_map(|l| l.strip_prefix("LC_ALL=")) {
+        assert!(
+            l.to_lowercase().replace('-', "").ends_with(".utf8"),
+            "{denv}"
+        );
+        assert!(denv.contains("LANGUAGE=de\n"), "{denv}");
+    }
+    assert!(!env.config().exists());
+}
+
+/// Every file below `dir` that holds `needle`.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() && !p.is_symlink() {
+            found.extend(files_holding(&p, needle));
+        } else if let Ok(b) = std::fs::read(&p)
+            && b.windows(needle.len()).any(|w| w == needle)
+        {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// The sudo password typed into a window: a wrong one is refused by sudo and
+/// never kept; the right one goes to the running client and sudo access is
+/// switched on after a yes. The password is in no dialog's arguments or
+/// environment, no file and no process's command line or environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sudo_password_can_be_set_in_the_window() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "elev"])
+        .await;
+    let sudo = fake_sudo(&env);
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.sudo_path",
+        &sudo.to_string_lossy(),
+    ])
+    .await;
+    looks_installed(&env);
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    let pw_answer = format!("0|{PW}");
+    let path = fake_dialogs(
+        &env,
+        &[
+            "0|sudo",
+            "0|set",
+            "0|not the password",
+            "0|",
+            "0|set",
+            &pw_answer,
+            "0|",
+            "0|",
+            "0|back",
+            "0|quit",
+        ],
+    );
+    let out = env
+        .cmd(&["gui"])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 10, "{shown:#?}");
+    assert!(shown[2].contains("--hide-text"), "{shown:#?}");
+    assert!(
+        shown[3].contains("sudo did not accept this password (sudo: 1 incorrect password attempt)"),
+        "{shown:#?}"
+    );
+    assert!(
+        shown[6].contains("The password is stored in the running client."),
+        "{shown:#?}"
+    );
+    assert!(shown[7].contains("Sudo access is on."), "{shown:#?}");
+    assert!(
+        shown[8].contains("Sudo access: on. Password: stored."),
+        "{shown:#?}"
+    );
+    // Checked with -k, the password on stdin: two checks, each asking first
+    // whether sudo needs one at all.
+    let validated = std::fs::read_to_string(env.root.join("fakesudo.validated")).unwrap();
+    assert_eq!(
+        validated.lines().collect::<Vec<_>>(),
+        ["-k -n -v", "-k -S -p  -v", "-k -n -v", "-k -S -p  -v"]
+    );
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(
+        r.out.contains("Password:    set (kept in memory)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        files_holding(&env.root, PW.as_bytes()),
+        Vec::<PathBuf>::new()
+    );
+    assert_eq!(in_proc(PW.as_bytes()), None);
+    stop(daemon).await;
+}
+
 /// Without a display, or without a dialog program, `gui` shows nothing: it
 /// says so on stderr and in the log file. Neither a start without a command
 /// nor any other command starts the dialogs there.
@@ -1281,7 +1433,8 @@ const PW: &str = "Elev8-pw \"q\\z";
 
 /// A stand-in for sudo: takes the password from stdin like `sudo -S`, compares
 /// its hash, then runs the command as is (the test machine is never touched as
-/// root).
+/// root). `-v` only checks the password (`-n -v`: whether none is needed) and
+/// logs its arguments to `fakesudo.validated`.
 fn fake_sudo(env: &Env) -> PathBuf {
     let mut c = std::process::Command::new("sha256sum")
         .stdin(Stdio::piped())
@@ -1301,6 +1454,15 @@ fn fake_sudo(env: &Env) -> PathBuf {
         &path,
         format!(
             r#"#!/bin/sh
+case " $* " in *" -v "*)
+  echo "$*" >> "$0.validated"
+  [ -e "$0.nopasswd" ] && exit 0
+  case " $* " in *" -n "*) echo "sudo: a password is required" >&2; exit 1;; esac
+  IFS= read -r pw || {{ echo "sudo: no password" >&2; exit 1; }}
+  h=$(printf '%s' "$pw" | sha256sum); pw=
+  [ "${{h%% *}}" = "{hash}" ] || {{ echo "sudo: 1 incorrect password attempt" >&2; exit 1; }}
+  exit 0;;
+esac
 case "$1" in -n) echo "sudo: a password is required" >&2; exit 1;; esac
 while [ "$1" != "--" ]; do shift; done; shift
 # A sudoers rule without a password: sudo leaves stdin alone.

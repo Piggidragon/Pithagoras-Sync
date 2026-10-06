@@ -154,6 +154,7 @@ pub fn desktop_entry(program: &Path) -> Result<String, String> {
 Type=Application
 Name=Pithagoras Sync
 Comment=Lets your Pithagoras portal's agent reach this computer
+Comment[de]=Lässt den Agenten deines Pithagoras-Portals diesen Computer erreichen
 Exec={} gui %u
 Icon=pithagoras-sync
 Terminal=false

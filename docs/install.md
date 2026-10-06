@@ -4,6 +4,8 @@ This page is for people who want to connect their computer to their Pithagoras p
 
 Pithagoras Sync works on Windows 10 and 11 and on Linux desktops (GNOME, KDE and others). On Linux it shows its windows with `zenity` or `kdialog`, which most desktops have; if neither is installed, install one of them (`sudo apt install zenity`) or use the command line.
 
+The windows speak English or German, as your desktop does: on Linux the language settings of your session (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`), on Windows the display language. Any other language gets English. The quotes below are the English texts; the German windows say the same in German. The command line stays English.
+
 ## 1. Download and start it
 
 - **Windows:** download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases) and double click it. The program is not signed yet, so Windows SmartScreen may say "Windows protected your PC": click "More info", then "Run anyway". (Signing is planned, issue #7.)
@@ -44,13 +46,29 @@ From now on the portal's agent can ask to use this computer. Until you change it
 
 Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows a menu:
 
-- **Status:** whether it runs, the portal, the mode, the folders it may use.
+- **Status:** whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on.
 - **Pair again:** pair with another portal, or again with the same one (it asks before it replaces the pairing).
+- **Sudo access** (Linux only): see below.
 - **Open log:** the client's log in a text editor.
 - **Uninstall:** see below.
 - **Quit:** closes the window; the client keeps running in the background.
 
-## 5. Uninstall
+## 5. Sudo access (Linux)
+
+The portal's agent can run commands as root (`sudo <command>`) only if you allow it here and give the client your sudo password. The password stays on this computer; the agent never sees it, and every such command still asks you first.
+
+Choose **Sudo access** in the menu. A window says whether sudo access is on and whether a password is stored, and offers:
+
+- **Enter the password:** a field that shows dots, not what you type. The program checks the password with `sudo` itself before it keeps anything: a wrong one is refused ("sudo did not accept this password"), and nothing changes. A right one goes to the running client (or, if you chose to keep it in a file or the keyring, there, for the client's next start). It then asks "Switch sudo access on now?"; **Yes** switches it on, **No** keeps the password and leaves sudo access off.
+- **Switch sudo access off** (when it is on): the password stays.
+- **Forget the password** (when one is stored): it asks first, and if sudo access is on, whether to switch it off too.
+- **Back.**
+
+If `sudo` asks you no password on this computer (a rule in sudoers says so), there is nothing to store and the window says so; switching sudo access on then is a terminal command, `pithagoras-sync sudo activate --no-password`, because the window cannot tell that you are the one asking.
+
+By default the client keeps the password in its memory only, so after a restart (a reboot, an update) enter it again. Without the client running it cannot take it then: the window says to start the client first. [permissions.md](permissions.md) explains the other places (`policy.privilege.secret_storage`).
+
+## 6. Uninstall
 
 Choose **Uninstall** in the menu. It asks twice:
 
@@ -62,5 +80,5 @@ Either way the client stops, no longer starts at login, the menu entry goes and 
 ## What the windows never do
 
 - They never pair, install or uninstall without your Yes.
-- They never show or send your passwords. Storing the password for `sudo` stays a terminal command (`pithagoras-sync sudo set`); the windows have no password field.
+- They never show or send your passwords. The sudo password is typed into a field that hides it, checked with `sudo` on this computer and kept only here; it never goes to the portal, into a log or onto a command line.
 - On Linux, a command that the portal's agent runs on this computer cannot use them to pair or uninstall: they refuse before they show anything, as the command line does. Windows has no such check yet ([windows.md](windows.md)).

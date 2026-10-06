@@ -1,35 +1,79 @@
-//! `gui`: install, pair and uninstall without a terminal. One flow, driven by
-//! the state it finds (not installed, installed but not paired, paired) and the
-//! owner's answers in the OS's own dialogs (`dialogs`). What it does to the
-//! system goes through `Host`, the same code the commands run, so the tests
-//! drive the flow with fake dialogs and a fake host.
+//! `gui`: install, pair and uninstall without a terminal, and set up sudo
+//! access. One flow, driven by the state it finds (not installed, installed but
+//! not paired, paired) and the owner's answers in the OS's own dialogs
+//! (`dialogs`), in the desktop's language (`i18n`). What it does to the system
+//! goes through `Host`, the same code the commands run, so the tests drive the
+//! flow with fake dialogs and a fake host.
 //!
 //! A pairing link comes from a web page and is untrusted: it is parsed strictly,
 //! shown as what was parsed (never the raw link) and acted on only after the
 //! owner said yes. Every step that changes something is refused, as the command
 //! line refuses it, when the flow was started by a command the client runs for
 //! the portal.
+//!
+//! The sudo password is typed into a dialog that does not show it and checked
+//! with sudo before anything is stored. That check is also what proves the owner
+//! switches sudo access on, as the `su` password check does in a terminal: a
+//! command of the agent that clicks through the windows does not know it.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use sync_connector::LinkState;
 use sync_connector::url::PairUri;
-use sync_policy::Dirs;
+use sync_policy::secret::Secret;
+use sync_policy::{Dirs, Mode};
+use sync_proto::methods::FolderInfo;
 
+use crate::cli::Kept;
 use crate::dialogs::{Dialogs, MAX_ANSWER, shown};
+use crate::i18n::Lang;
+use crate::secrets::SudoCheck;
 
 /// How long the flow waits for a new pairing to connect.
 pub const LINK_WAIT: Duration = Duration::from_secs(10);
-
-/// What the flow says when it asks for the link.
-pub const ENTRY_TEXT: &str = "Paste the pairing link from the portal's Devices page (Settings, Devices, Pair a device). It starts with pithagoras-sync://pair?";
 
 /// Whether the link came up after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Link {
     Connected(String),
-    /// Not connected (yet), and why.
-    Down(String),
+    /// Not connected (yet): the link's state, `None` when the client does not
+    /// run, and its detail.
+    Down(Option<LinkState>, Option<String>),
+}
+
+/// Where the client's log is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogPlace {
+    File(String),
+    /// The journal of this systemd user unit.
+    Journal(&'static str),
+}
+
+/// What the menu's Status shows. Text in it is escaped (`shown`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusView {
+    /// The running client's link state and detail; `None` when it does not run.
+    pub link: Option<(LinkState, Option<String>)>,
+    /// The portal's URL and this device's name there.
+    pub portal: Option<(String, String)>,
+    pub paused: bool,
+    pub mode: Mode,
+    /// Full mode: how long until it falls back to ask, `None` for never.
+    pub full_left_ms: Option<i64>,
+    pub folders: Vec<FolderInfo>,
+    pub approvals_waiting: usize,
+    /// Whether sudo access is on, where there is sudo access to set up.
+    pub sudo: Option<bool>,
+    /// The settings could not be read.
+    pub problem: Option<String>,
+}
+
+/// Sudo access and its password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SudoState {
+    pub active: bool,
+    pub password: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,10 +94,10 @@ pub trait Host {
     fn paired(&self) -> Option<String>;
     /// The name this device pairs as.
     fn device_name(&self) -> String;
-    /// Who installs (the user) and where the program goes.
-    fn install_target(&self) -> (String, String);
-    /// Where the client's log is, as the owner can find it.
-    fn log_place(&self) -> String;
+    /// Who installs (the user) and where the program goes, when known.
+    fn install_target(&self) -> (String, Option<String>);
+    /// Where the client's log is.
+    fn log_place(&self) -> LogPlace;
     /// Refuses when the flow runs as a command the client runs for the portal.
     async fn owner_check(&self) -> Result<(), String>;
     /// `install`; returns its notes.
@@ -62,56 +106,65 @@ pub trait Host {
     async fn pair(&self, link: &str) -> Result<Vec<String>, String>;
     /// Waits up to `LINK_WAIT` for the client to connect.
     async fn wait_for_link(&self) -> Link;
-    /// What `status` prints.
-    async fn status(&self) -> String;
+    /// What `status` reports.
+    async fn status(&self) -> StatusView;
     fn open_log(&self) -> Result<(), String>;
-    /// `uninstall`, or `uninstall --purge`; returns what to tell the owner.
+    /// `uninstall`, or `uninstall --purge`; returns the program, which stays.
     async fn uninstall(&self, purge: bool) -> Result<String, String>;
+    /// Whether sudo access can be set up here (Linux, not as root).
+    fn sudo_available(&self) -> bool;
+    /// As `sudo status` finds it.
+    async fn sudo_state(&self) -> Result<SudoState, String>;
+    /// Checks the password with sudo.
+    async fn sudo_check(&self, pw: &Secret) -> Result<SudoCheck, String>;
+    /// `sudo set` without the prompt: to the running client or the storage.
+    async fn keep_password(&self, pw: Secret) -> Result<Kept, String>;
+    /// `sudo activate` or `sudo deactivate`, without their checks.
+    async fn switch_sudo(&self, on: bool) -> Result<(), String>;
+    /// `sudo clear`, without its questions.
+    async fn forget_password(&self) -> Result<(), String>;
 }
-
-/// The menu of a paired device.
-const MENU: &[(&str, &str)] = &[
-    ("status", "Status"),
-    ("pair", "Pair again"),
-    ("log", "Open log"),
-    ("uninstall", "Uninstall"),
-    ("quit", "Quit"),
-];
 
 /// Parses a link as `pair` would; the error as a dialog shows it. A plain-http
 /// portal is taken only on this computer (`localhost` or a loopback address):
 /// the connection would refuse anything else after the owner said yes, and the
 /// question would have asked about a portal that cannot be reached.
-fn parse(link: &str) -> Result<PairUri, String> {
+fn parse(t: Lang, link: &str) -> Result<PairUri, String> {
     if link.len() > MAX_ANSWER {
-        return Err("This is not a pairing link: it is far too long.".into());
+        return Err(t.link_too_long().into());
     }
-    let u = PairUri::parse(link)
-        .map_err(|e| format!("This pairing link cannot be used: {}", shown(&e)))?;
+    let u = PairUri::parse(link).map_err(|e| t.link_unusable(&shown(&e)))?;
     let host = &u.portal.host;
     let local = host == "localhost"
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.to_canonical().is_loopback());
     if !u.portal.tls && !local {
-        return Err(format!(
-            "This pairing link names a portal on another machine over plain http ({}). Plain http is only for a portal on this computer: use the portal's https address.",
-            shown(&u.portal.to_string())
-        ));
+        return Err(t.link_plain_http(&shown(&u.portal.to_string())));
     }
     Ok(u)
 }
 
+/// The owner check, with its refusal shown.
+async fn owner_ok(d: &dyn Dialogs, h: &impl Host, t: Lang) -> bool {
+    match h.owner_check().await {
+        Ok(()) => true,
+        Err(_) => {
+            d.error(t.own_command());
+            false
+        }
+    }
+}
+
 /// Runs the flow. `link` is the pairing link the OS started the program with.
-pub async fn flow(d: &dyn Dialogs, h: &impl Host, link: Option<&str>) -> Outcome {
+pub async fn flow(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<&str>) -> Outcome {
     // A command of the client's own gets no further than this, so it cannot
     // put questions on the owner's screen either. Each step checks again.
-    if let Err(e) = h.owner_check().await {
-        d.error(&shown(&e));
+    if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
     // A link is checked before anything else happens, the install included.
-    let link = match link.map(parse) {
+    let link = match link.map(|l| parse(t, l)) {
         None => None,
         Some(Ok(u)) => Some(u),
         Some(Err(e)) => {
@@ -121,79 +174,64 @@ pub async fn flow(d: &dyn Dialogs, h: &impl Host, link: Option<&str>) -> Outcome
     };
     if !h.installed() {
         let (user, path) = h.install_target();
-        let q = format!(
-            "Install Pithagoras Sync for {}?\n\nIt copies the program to {}, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).",
-            shown(&user),
-            shown(&path)
-        );
+        let q = t.install_question(&shown(&user), path.map(|p| shown(&p)).as_deref());
         if !d.question(&q) {
             return Outcome::Cancelled;
         }
-        if let Err(e) = h.owner_check().await {
-            d.error(&shown(&e));
+        if !owner_ok(d, h, t).await {
             return Outcome::Failed;
         }
         if let Err(e) = h.install().await {
-            d.error(&format!("Installing failed: {}", shown(&e)));
+            d.error(&t.install_failed(&shown(&e)));
             return Outcome::Failed;
         }
         if link.is_none() && h.paired().is_some() {
-            return after(d, h).await;
+            return after(d, h, t).await;
         }
     }
     if let Some(u) = link {
-        return pair(d, h, &u).await;
+        return pair(d, h, t, &u).await;
     }
     if h.paired().is_none() {
-        return ask_and_pair(d, h).await;
+        return ask_and_pair(d, h, t).await;
     }
-    menu(d, h).await
+    menu(d, h, t).await
 }
 
 /// Asks for the link until one parses or the owner cancels, then pairs.
-async fn ask_and_pair(d: &dyn Dialogs, h: &impl Host) -> Outcome {
+async fn ask_and_pair(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     loop {
-        let Some(text) = d.entry(ENTRY_TEXT) else {
+        let Some(text) = d.entry(t.entry_text()) else {
             return Outcome::Cancelled;
         };
-        match parse(text.trim()) {
-            Ok(u) => return pair(d, h, &u).await,
+        match parse(t, text.trim()) {
+            Ok(u) => return pair(d, h, t, &u).await,
             Err(e) => d.error(&e),
         }
     }
 }
 
 /// Confirms with the parsed values, then pairs as `pair` does.
-async fn pair(d: &dyn Dialogs, h: &impl Host, uri: &PairUri) -> Outcome {
+async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome {
     let portal = shown(&uri.portal.to_string());
     let name = shown(&h.device_name());
-    let pin = if uri.spki.is_some() {
-        " Its certificate is pinned by the link."
-    } else {
-        ""
-    };
+    let pinned = uri.spki.is_some();
     let q = match h.paired() {
-        Some(old) => format!(
-            "This computer is paired with {}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}",
-            shown(&old)
-        ),
-        None => format!(
-            "Pair this computer with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nIts agent can then ask to use this computer's files and shell. What it may do is decided on this computer: until you change it, every call asks you first."
-        ),
+        Some(old) => t.replace_question(&shown(&old), &portal, &name, pinned),
+        None => t.pair_question(&portal, &name, pinned),
     };
     if !d.question(&q) {
         return Outcome::Cancelled;
     }
-    if let Err(e) = h.owner_check().await {
-        d.error(&shown(&e));
+    if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
     // Rebuilt from what was parsed and shown, so only that is acted on.
     let link = link_of(uri);
     match h.pair(&link).await {
-        Ok(_) => after(d, h).await,
+        Ok(_) => after(d, h, t).await,
         Err(e) => {
-            d.error(&format!("Pairing failed: {}", shown(&e)));
+            d.error(&t.pair_failed(&shown(&e)));
             Outcome::Failed
         }
     }
@@ -224,72 +262,201 @@ fn link_of(u: &PairUri) -> String {
 }
 
 /// Waits for the link, then says how things stand.
-async fn after(d: &dyn Dialogs, h: &impl Host) -> Outcome {
-    let log = shown(&h.log_place());
+async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    let log = shown(&t.log_place(&h.log_place()));
     match h.wait_for_link().await {
-        Link::Connected(portal) => d.info(&format!(
-            "Pithagoras Sync is running, connected to {}, and starts at login.\n\nLog: {log}",
-            shown(&portal)
-        )),
-        Link::Down(why) => d.info(&format!(
-            "Installed, not connected yet: {}\n\nLog: {log}",
-            shown(&why)
-        )),
+        Link::Connected(portal) => d.info(&t.connected(&shown(&portal), &log)),
+        Link::Down(state, detail) => {
+            let why = t.link_state(state, detail.map(|d| shown(&d)).as_deref());
+            d.info(&t.not_connected(&why, &log))
+        }
     }
     Outcome::Done
 }
 
-async fn menu(d: &dyn Dialogs, h: &impl Host) -> Outcome {
+async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    let mut keys = vec!["status", "pair"];
+    if h.sudo_available() {
+        keys.push("sudo");
+    }
+    keys.extend(["log", "uninstall", "quit"]);
+    let items: Vec<(&'static str, &str)> = keys.iter().map(|k| (*k, t.label(k))).collect();
     loop {
-        let text = format!(
-            "Pithagoras Sync is installed and paired with {}.",
-            shown(&h.paired().unwrap_or_default())
-        );
-        match d.menu(&text, MENU) {
+        let text = t.menu_text(&shown(&h.paired().unwrap_or_default()));
+        match d.menu(&text, &items) {
             None | Some("quit") => return Outcome::Done,
             Some("status") => {
-                // Every portal value in it is escaped already (`status_text`).
+                // Every value in it is escaped already.
                 let s = h.status().await;
-                d.info(&s);
+                d.info(&t.status(&s));
             }
             Some("pair") => {
-                ask_and_pair(d, h).await;
+                ask_and_pair(d, h, t).await;
+            }
+            Some("sudo") => {
+                sudo_menu(d, h, t).await;
             }
             Some("log") => {
                 if let Err(e) = h.open_log() {
-                    d.error(&format!(
-                        "Cannot open the log: {}\n\nIt is here: {}",
-                        shown(&e),
-                        shown(&h.log_place())
-                    ));
+                    let place = t.log_place(&h.log_place());
+                    d.error(&t.log_open_failed(&shown(&e), &shown(&place)));
                 }
             }
-            Some("uninstall") => return uninstall(d, h).await,
+            Some("uninstall") => return uninstall(d, h, t).await,
             Some(_) => return Outcome::Done,
         }
     }
 }
 
-async fn uninstall(d: &dyn Dialogs, h: &impl Host) -> Outcome {
-    if !d.question(
-        "Uninstall Pithagoras Sync? The client stops and no longer starts at login, and pairing links no longer open it.",
-    ) {
-        return Outcome::Cancelled;
+/// Sudo access: the password (set or forget it) and switching it off. It is
+/// switched on only right after the password was checked (`set_password`).
+async fn sudo_menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    loop {
+        let st = match h.sudo_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                d.error(&t.sudo_failed(&shown(&e)));
+                return Outcome::Failed;
+            }
+        };
+        let mut keys = vec!["set"];
+        if st.active {
+            keys.push("off");
+        }
+        if st.password {
+            keys.push("forget");
+        }
+        keys.push("back");
+        let items: Vec<(&'static str, &str)> = keys.iter().map(|k| (*k, t.label(k))).collect();
+        match d.menu(&t.sudo_text(st), &items) {
+            Some("set") => {
+                set_password(d, h, t).await;
+            }
+            Some("off") => {
+                if owner_ok(d, h, t).await {
+                    switch_sudo(d, h, t, false).await;
+                }
+            }
+            Some("forget") => {
+                forget_password(d, h, t, st).await;
+            }
+            _ => return Outcome::Done,
+        }
     }
-    let purge = d.question(
-        "Also remove the pairing and all settings?\n\nYes: the pairing, the settings with their folders, the logs and everything else the client keeps go (remove the device in the portal as well). No: they stay for a later install.",
-    );
-    if let Err(e) = h.owner_check().await {
-        d.error(&shown(&e));
-        return Outcome::Failed;
-    }
-    match h.uninstall(purge).await {
-        Ok(said) => {
-            d.info(&said);
+}
+
+/// Switches sudo access and says so.
+async fn switch_sudo(d: &dyn Dialogs, h: &impl Host, t: Lang, on: bool) -> Outcome {
+    match h.switch_sudo(on).await {
+        Ok(()) => {
+            d.info(t.sudo_now(on));
             Outcome::Done
         }
         Err(e) => {
-            d.error(&format!("Uninstalling failed: {}", shown(&e)));
+            d.error(&t.sudo_failed(&shown(&e)));
+            Outcome::Failed
+        }
+    }
+}
+
+/// `sudo set`: the password, checked with sudo, then kept; then the offer to
+/// switch sudo access on. A password sudo did not take is never stored.
+async fn set_password(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    let (user, _) = h.install_target();
+    let Some(pw) = d.password(&t.password_prompt(&shown(&user))) else {
+        return Outcome::Cancelled;
+    };
+    if pw.expose().is_empty() {
+        d.error(t.password_empty());
+        return Outcome::Failed;
+    }
+    if crate::secrets::check(pw.expose()).is_err() {
+        d.error(&t.password_not_one_line(crate::secrets::MAX_LEN));
+        return Outcome::Failed;
+    }
+    match h.sudo_check(&pw).await {
+        Ok(SudoCheck::Accepted) => {}
+        Ok(SudoCheck::NoPasswordNeeded) => {
+            d.info(t.sudo_needs_no_password());
+            return Outcome::Cancelled;
+        }
+        Ok(SudoCheck::Refused(why)) => {
+            d.error(&t.sudo_refused(&shown(&why)));
+            return Outcome::Failed;
+        }
+        Err(e) => {
+            d.error(&t.sudo_check_failed(&shown(&e)));
+            return Outcome::Failed;
+        }
+    }
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    let kept = match h.keep_password(pw).await {
+        Ok(Kept::Nowhere) => {
+            d.error(t.not_kept());
+            return Outcome::Failed;
+        }
+        Ok(k) => k,
+        Err(e) => {
+            d.error(&t.store_failed(&shown(&e)));
+            return Outcome::Failed;
+        }
+    };
+    // Read again: the dialogs may have waited a long time.
+    if h.sudo_state().await.is_ok_and(|s| s.active) {
+        d.info(&format!("{}\n\n{}", t.kept(kept), t.sudo_now(true)));
+        return Outcome::Done;
+    }
+    if !d.question(&t.activate_question(kept)) {
+        return Outcome::Done;
+    }
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    switch_sudo(d, h, t, true).await
+}
+
+/// `sudo clear`: forgets the password, then offers to switch sudo access off.
+async fn forget_password(d: &dyn Dialogs, h: &impl Host, t: Lang, st: SudoState) -> Outcome {
+    if !d.question(t.forget_question()) {
+        return Outcome::Cancelled;
+    }
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    if let Err(e) = h.forget_password().await {
+        d.error(&t.sudo_failed(&shown(&e)));
+        return Outcome::Failed;
+    }
+    if !st.active {
+        d.info(t.forgotten());
+        return Outcome::Done;
+    }
+    if d.question(&t.also_off_question()) && owner_ok(d, h, t).await {
+        return switch_sudo(d, h, t, false).await;
+    }
+    Outcome::Done
+}
+
+async fn uninstall(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    if !d.question(t.uninstall_question()) {
+        return Outcome::Cancelled;
+    }
+    let purge = d.question(t.purge_question());
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    match h.uninstall(purge).await {
+        Ok(program) => {
+            d.info(&t.uninstalled(purge, &shown(&program)));
+            Outcome::Done
+        }
+        Err(e) => {
+            d.error(&t.uninstall_failed(&shown(&e)));
             Outcome::Failed
         }
     }
@@ -339,34 +506,31 @@ impl Host for RealHost {
             )
     }
 
-    fn install_target(&self) -> (String, String) {
+    fn install_target(&self) -> (String, Option<String>) {
         let user = sync_ops::info::user().0;
         let path = if cfg!(windows) {
-            std::env::var("LOCALAPPDATA")
-                .map(|l| {
-                    format!(
-                        r"{}\Programs\pithagoras-sync\pithagoras-sync.exe",
-                        l.trim_end_matches('\\')
-                    )
-                })
-                .unwrap_or_else(|_| "your programs folder".into())
+            std::env::var("LOCALAPPDATA").ok().map(|l| {
+                format!(
+                    r"{}\Programs\pithagoras-sync\pithagoras-sync.exe",
+                    l.trim_end_matches('\\')
+                )
+            })
         } else {
-            sync_ops::info::home()
-                .map(|h| h.join(".local/bin/pithagoras-sync").display().to_string())
-                .unwrap_or_else(|| "~/.local/bin/pithagoras-sync".into())
+            Some(
+                sync_ops::info::home()
+                    .map(|h| h.join(".local/bin/pithagoras-sync").display().to_string())
+                    .unwrap_or_else(|| "~/.local/bin/pithagoras-sync".into()),
+            )
         };
         (user, path)
     }
 
-    fn log_place(&self) -> String {
+    fn log_place(&self) -> LogPlace {
         let file = crate::cli::log_file(&self.dirs);
         if cfg!(windows) || file.exists() {
-            file.display().to_string()
+            LogPlace::File(file.display().to_string())
         } else {
-            format!(
-                "the journal (journalctl --user -u {})",
-                crate::install::UNIT_NAME
-            )
+            LogPlace::Journal(crate::install::UNIT_NAME)
         }
     }
 
@@ -389,9 +553,8 @@ impl Host for RealHost {
 
     async fn wait_for_link(&self) -> Link {
         use crate::control::{self, Request};
-        use sync_connector::LinkState;
         let deadline = tokio::time::Instant::now() + LINK_WAIT;
-        let mut last = "the client is not running".to_string();
+        let mut last = (None, None);
         loop {
             if let Ok(Some(r)) = control::send(&self.dirs.socket(), Request::Status).await
                 && let Some(s) = r.status
@@ -399,20 +562,76 @@ impl Host for RealHost {
                 if s.link.state == LinkState::Connected {
                     return Link::Connected(s.portal.unwrap_or_default());
                 }
-                last = s
-                    .link
-                    .detail
-                    .unwrap_or_else(|| format!("{:?}", s.link.state).to_lowercase());
+                last = (Some(s.link.state), s.link.detail);
             }
             if tokio::time::Instant::now() >= deadline {
-                return Link::Down(last);
+                return Link::Down(last.0, last.1);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    async fn status(&self) -> String {
-        crate::cli::status_report(&self.dirs).await
+    async fn status(&self) -> StatusView {
+        use crate::control::{self, Request};
+        use sync_policy::config::Elevation;
+        let now = sync_policy::system_clock()();
+        let cfg = crate::cli::load_config(&self.dirs);
+        let sudo = self.sudo_available().then(|| {
+            cfg.as_ref()
+                .is_ok_and(|c| c.policy.privilege.elevation == Elevation::Sudo)
+        });
+        let folder = |f: &FolderInfo| FolderInfo {
+            path: shown(&f.path),
+            ..f.clone()
+        };
+        if let Ok(Some(r)) = control::send(&self.dirs.socket(), Request::Status).await
+            && let Some(s) = r.status
+        {
+            return StatusView {
+                link: Some((s.link.state, s.link.detail.as_deref().map(shown))),
+                portal: s.portal.zip(s.name).map(|(p, n)| (shown(&p), shown(&n))),
+                paused: s.paused,
+                mode: s.mode,
+                full_left_ms: s.mode_expires_ms.map(|t| t - now),
+                folders: s.folders.iter().map(folder).collect(),
+                approvals_waiting: s.approvals_waiting,
+                sudo,
+                problem: None,
+            };
+        }
+        match cfg {
+            Ok(c) => StatusView {
+                link: None,
+                portal: c.portal.as_ref().map(|p| (shown(&p.url), shown(&p.name))),
+                paused: false,
+                mode: c.policy.effective_mode(c.profile, now),
+                full_left_ms: c.policy.full.until_ms.map(|t| t - now),
+                folders: c
+                    .policy
+                    .folders
+                    .iter()
+                    .map(|f| FolderInfo {
+                        path: shown(&f.path.display().to_string()),
+                        access: f.access,
+                        execute: f.execute,
+                    })
+                    .collect(),
+                approvals_waiting: 0,
+                sudo,
+                problem: None,
+            },
+            Err(e) => StatusView {
+                link: None,
+                portal: None,
+                paused: false,
+                mode: Mode::Ask,
+                full_left_ms: None,
+                folders: Vec::new(),
+                approvals_waiting: 0,
+                sudo,
+                problem: Some(shown(&e)),
+            },
+        }
     }
 
     fn open_log(&self) -> Result<(), String> {
@@ -438,16 +657,54 @@ impl Host for RealHost {
             .unwrap_or_default();
         if purge {
             crate::cli::purge(&self.dirs, false, false, true).await?;
-            Ok(format!(
-                "Pithagoras Sync is uninstalled, and its pairing and settings are removed. Remove the device in the portal as well (Settings, Devices).\n\nThe program itself stays: {program}. Delete it when you no longer need it."
-            ))
         } else {
             let plan = crate::cli::uninstall_plan(false)?;
             crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)?;
-            Ok(format!(
-                "Pithagoras Sync is uninstalled. Its pairing and settings stay for a later install.\n\nThe program itself stays: {program}."
-            ))
         }
+        Ok(program)
+    }
+
+    fn sudo_available(&self) -> bool {
+        cfg!(target_os = "linux") && !crate::cli::is_root()
+    }
+
+    async fn sudo_state(&self) -> Result<SudoState, String> {
+        use sync_policy::config::Elevation;
+        let cfg = crate::cli::load_config(&self.dirs)?;
+        let p = &cfg.policy.privilege;
+        Ok(SudoState {
+            active: p.elevation == Elevation::Sudo,
+            password: crate::cli::sudo_password_set(&self.dirs, p.secret_storage).await?,
+        })
+    }
+
+    async fn sudo_check(&self, pw: &Secret) -> Result<SudoCheck, String> {
+        #[cfg(unix)]
+        {
+            let cfg = crate::cli::load_config(&self.dirs)?;
+            crate::secrets::check_with_sudo(&cfg.policy.privilege.sudo_path, pw).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pw;
+            Err("sudo access is Linux only".into())
+        }
+    }
+
+    async fn keep_password(&self, pw: Secret) -> Result<Kept, String> {
+        crate::cli::keep_password(&self.dirs, pw).await
+    }
+
+    async fn switch_sudo(&self, on: bool) -> Result<(), String> {
+        use sync_policy::config::Elevation;
+        let to = if on { Elevation::Sudo } else { Elevation::Off };
+        crate::cli::switch_elevation(&self.dirs, to)
+            .await
+            .map(|_| ())
+    }
+
+    async fn forget_password(&self) -> Result<(), String> {
+        crate::cli::forget_password(&self.dirs).await
     }
 }
 
@@ -507,15 +764,45 @@ mod tests {
 
     const LINK: &str = "pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example&code=AB12CD34";
 
-    #[derive(Default)]
     struct FakeHost {
         installed: Mutex<bool>,
         paired: Mutex<Option<String>>,
         /// Started by one of the client's own commands.
         own_command: bool,
+        /// The owner checks after this many pass fail (a client's command that
+        /// took over meanwhile).
+        own_from: Option<usize>,
+        checks: Mutex<usize>,
         fail: Option<&'static str>,
         link_down: bool,
+        sudo: bool,
+        sudo_active: Mutex<bool>,
+        /// The password the running client holds.
+        password: Mutex<Option<String>>,
+        /// What sudo says to a password other than "right pw".
+        sudo_says: SudoCheck,
+        kept: Kept,
         did: Mutex<Vec<String>>,
+    }
+
+    impl Default for FakeHost {
+        fn default() -> FakeHost {
+            FakeHost {
+                installed: Mutex::new(false),
+                paired: Mutex::new(None),
+                own_command: false,
+                own_from: None,
+                checks: Mutex::new(0),
+                fail: None,
+                link_down: false,
+                sudo: true,
+                sudo_active: Mutex::new(false),
+                password: Mutex::new(None),
+                sudo_says: SudoCheck::Refused("sudo: 1 incorrect password attempt".into()),
+                kept: Kept::InClient,
+                did: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl FakeHost {
@@ -542,17 +829,19 @@ mod tests {
         fn device_name(&self) -> String {
             "laptop".into()
         }
-        fn install_target(&self) -> (String, String) {
+        fn install_target(&self) -> (String, Option<String>) {
             (
                 "alice".into(),
-                "/home/alice/.local/bin/pithagoras-sync".into(),
+                Some("/home/alice/.local/bin/pithagoras-sync".into()),
             )
         }
-        fn log_place(&self) -> String {
-            "the journal".into()
+        fn log_place(&self) -> LogPlace {
+            LogPlace::Journal("pithagoras-sync.service")
         }
         async fn owner_check(&self) -> Result<(), String> {
-            if self.own_command {
+            let mut n = self.checks.lock().unwrap();
+            *n += 1;
+            if self.own_command || self.own_from.is_some_and(|f| *n > f) {
                 return Err(
                     "policy changes cannot come from commands the client runs for the portal"
                         .into(),
@@ -573,13 +862,23 @@ mod tests {
         }
         async fn wait_for_link(&self) -> Link {
             if self.link_down {
-                Link::Down("connecting: refused (401)".into())
+                Link::Down(Some(LinkState::Connecting), Some("refused (401)".into()))
             } else {
                 Link::Connected(self.paired().unwrap_or_default())
             }
         }
-        async fn status(&self) -> String {
-            "Portal:    https://portal.example as laptop\n".into()
+        async fn status(&self) -> StatusView {
+            StatusView {
+                link: Some((LinkState::Connected, None)),
+                portal: Some(("https://portal.example".into(), "laptop".into())),
+                paused: false,
+                mode: Mode::Ask,
+                full_left_ms: None,
+                folders: Vec::new(),
+                approvals_waiting: 0,
+                sudo: Some(*self.sudo_active.lock().unwrap()),
+                problem: None,
+            }
         }
         fn open_log(&self) -> Result<(), String> {
             self.step("log")
@@ -590,7 +889,41 @@ mod tests {
             if purge {
                 *self.paired.lock().unwrap() = None;
             }
-            Ok("Uninstalled.".into())
+            Ok("/home/alice/.local/bin/pithagoras-sync".into())
+        }
+        fn sudo_available(&self) -> bool {
+            self.sudo
+        }
+        async fn sudo_state(&self) -> Result<SudoState, String> {
+            Ok(SudoState {
+                active: *self.sudo_active.lock().unwrap(),
+                password: self.password.lock().unwrap().is_some(),
+            })
+        }
+        async fn sudo_check(&self, pw: &Secret) -> Result<SudoCheck, String> {
+            self.step("sudo check")?;
+            Ok(if pw.expose() == "right pw" {
+                SudoCheck::Accepted
+            } else {
+                self.sudo_says.clone()
+            })
+        }
+        async fn keep_password(&self, pw: Secret) -> Result<Kept, String> {
+            self.step("keep")?;
+            if self.kept != Kept::Nowhere {
+                *self.password.lock().unwrap() = Some(pw.expose().to_string());
+            }
+            Ok(self.kept)
+        }
+        async fn switch_sudo(&self, on: bool) -> Result<(), String> {
+            self.step(if on { "sudo on" } else { "sudo off" })?;
+            *self.sudo_active.lock().unwrap() = on;
+            Ok(())
+        }
+        async fn forget_password(&self) -> Result<(), String> {
+            self.step("forget")?;
+            *self.password.lock().unwrap() = None;
+            Ok(())
         }
     }
 
@@ -609,10 +942,19 @@ mod tests {
         }
     }
 
-    async fn run(h: &FakeHost, answers: &[&str], link: Option<&str>) -> (Outcome, Vec<String>) {
+    async fn run_in(
+        t: Lang,
+        h: &FakeHost,
+        answers: &[&str],
+        link: Option<&str>,
+    ) -> (Outcome, Vec<String>) {
         let d = Fake::with(answers);
-        let o = flow(&d, h, link).await;
+        let o = flow(&d, h, t, link).await;
         (o, d.seen())
+    }
+
+    async fn run(h: &FakeHost, answers: &[&str], link: Option<&str>) -> (Outcome, Vec<String>) {
+        run_in(Lang::En, h, answers, link).await
     }
 
     #[tokio::test]
@@ -640,7 +982,9 @@ mod tests {
             ),
             "{seen:?}"
         );
-        assert!(seen[3].contains("Log: the journal"));
+        assert!(
+            seen[3].contains("Log: the journal (journalctl --user -u pithagoras-sync.service)")
+        );
         assert_eq!(h.did()[0], "install");
         assert!(h.did()[1].starts_with(
             "pair pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example&code=AB12CD34"
@@ -683,6 +1027,29 @@ mod tests {
         let (_, seen) = run(&h, &["pick:pair", "cancel", "pick:quit"], None).await;
         assert!(seen[1].starts_with("entry:"), "{seen:?}");
         assert!(h.did().is_empty());
+        // Sudo access: the password cancelled, forgetting refused, the menu left.
+        let h = paired();
+        *h.password.lock().unwrap() = Some("right pw".into());
+        run(
+            &h,
+            &[
+                "pick:sudo",
+                "pick:set",
+                "cancel",
+                "pick:forget",
+                "no",
+                "pick:back",
+                "pick:quit",
+            ],
+            None,
+        )
+        .await;
+        assert!(h.did().is_empty(), "{:?}", h.did());
+        // No to switching sudo access on: the password is kept, nothing else.
+        let h = paired();
+        run(&h, &["pick:sudo", "pick:set", "pw:right pw", "no"], None).await;
+        assert_eq!(h.did(), ["sudo check", "keep"]);
+        assert!(!*h.sudo_active.lock().unwrap());
     }
 
     #[tokio::test]
@@ -722,35 +1089,39 @@ mod tests {
             "pithagoras-sync://pair?portal=https://x.example%1b[2K&code=AB".to_string(),
         ] {
             // Not installed: no question about installing comes first.
-            let h = FakeHost::default();
-            let (o, seen) = run(&h, &["yes", "yes"], Some(&bad)).await;
-            assert_eq!(o, Outcome::Failed, "{bad}");
-            assert_eq!(seen.len(), 1, "{seen:?}");
-            assert!(seen[0].starts_with("error: "), "{seen:?}");
-            assert!(
-                !seen[0].chars().any(|c| c.is_control() && c != '\n'),
-                "{seen:?}"
-            );
-            assert!(h.did().is_empty());
+            for t in [Lang::En, Lang::De] {
+                let h = FakeHost::default();
+                let (o, seen) = run_in(t, &h, &["yes", "yes"], Some(&bad)).await;
+                assert_eq!(o, Outcome::Failed, "{bad}");
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert!(seen[0].starts_with("error: "), "{seen:?}");
+                assert!(
+                    !seen[0].chars().any(|c| c.is_control() && c != '\n'),
+                    "{seen:?}"
+                );
+                assert!(h.did().is_empty());
+            }
         }
     }
 
     #[tokio::test]
     async fn the_confirmation_shows_parsed_values_with_control_characters_escaped() {
-        let h = installed();
         // A base path with an escape sequence and a line break in it.
         let link = "pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example%2Fa%1b%5B2K%0aPaired&code=AB12";
-        let (o, seen) = run(&h, &["no"], Some(link)).await;
-        assert_eq!(o, Outcome::Cancelled);
-        let q = &seen[0];
-        assert!(
-            q.contains("https://portal.example/a\\u{1b}[2K\\nPaired"),
-            "{q}"
-        );
-        assert!(
-            !q.contains("pithagoras-sync://"),
-            "the raw link is not shown: {q}"
-        );
+        for t in [Lang::En, Lang::De] {
+            let h = installed();
+            let (o, seen) = run_in(t, &h, &["no"], Some(link)).await;
+            assert_eq!(o, Outcome::Cancelled);
+            let q = &seen[0];
+            assert!(
+                q.contains("https://portal.example/a\\u{1b}[2K\\nPaired"),
+                "{q}"
+            );
+            assert!(
+                !q.contains("pithagoras-sync://"),
+                "the raw link is not shown: {q}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -788,14 +1159,21 @@ mod tests {
         assert!(seen[0].starts_with(
             "menu: Pithagoras Sync is installed and paired with https://old.example."
         ));
-        assert!(seen[1].starts_with("info: Portal:"), "{seen:?}");
+        assert!(
+            seen[1].starts_with(
+                "info: Client: running, connected\nPortal: https://portal.example as \"laptop\""
+            ),
+            "{seen:?}"
+        );
         assert_eq!(h.did()[0], "log");
         assert!(h.did()[1].starts_with("pair "));
         assert_eq!(h.did()[2], "uninstall");
+        let last = seen.last().unwrap();
         assert!(
-            seen.last().unwrap().starts_with("info: Uninstalled."),
+            last.starts_with("info: Pithagoras Sync is uninstalled. Its pairing and settings stay"),
             "{seen:?}"
         );
+        assert!(last.contains("The program itself stays: /home/alice/.local/bin/pithagoras-sync"));
         // Yes to "also remove the pairing" purges.
         let h = paired();
         run(&h, &["pick:uninstall", "yes", "yes"], None).await;
@@ -869,6 +1247,274 @@ mod tests {
         .await;
         assert!(h.did().is_empty(), "{:?}", h.did());
         assert_eq!(h.paired().as_deref(), Some("https://old.example"));
+    }
+
+    /// The password, checked with sudo, then kept, then sudo access on: in that
+    /// order, and the password in no window's text.
+    #[tokio::test]
+    async fn sudo_access_is_set_up_with_a_checked_password() {
+        let h = paired();
+        let (_, seen) = run(
+            &h,
+            &[
+                "pick:sudo",
+                "pick:set",
+                "pw:right pw",
+                "yes",
+                "pick:back",
+                "pick:quit",
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(h.did(), ["sudo check", "keep", "sudo on"]);
+        assert_eq!(h.password.lock().unwrap().as_deref(), Some("right pw"));
+        assert!(seen[1].starts_with("menu: Sudo access lets"), "{seen:?}");
+        assert!(seen[1].contains("Sudo access: off. Password: not stored."));
+        assert!(
+            seen[2].starts_with("password: The password sudo asks alice for."),
+            "{seen:?}"
+        );
+        assert!(seen[3].starts_with(
+            "question: The password is stored in the running client.\n\nSwitch sudo access on now?"
+        ));
+        assert_eq!(seen[4], "info: Sudo access is on.");
+        assert!(
+            seen[5].contains("Sudo access: on. Password: stored."),
+            "{seen:?}"
+        );
+        assert!(seen.iter().all(|s| !s.contains("right pw")), "{seen:?}");
+        // Already on: the password is replaced, no question.
+        let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw"], None).await;
+        assert_eq!(h.did()[3..], ["sudo check", "keep"]);
+        assert!(
+            seen[3].ends_with("running client.\n\nSudo access is on."),
+            "{seen:?}"
+        );
+        // Off, then the password forgotten.
+        run(
+            &h,
+            &["pick:sudo", "pick:off", "pick:forget", "yes", "pick:back"],
+            None,
+        )
+        .await;
+        assert_eq!(h.did()[5..], ["sudo off", "forget"]);
+        assert!(h.password.lock().unwrap().is_none());
+        // Forgotten while on: the offer to switch it off too.
+        *h.sudo_active.lock().unwrap() = true;
+        *h.password.lock().unwrap() = Some("right pw".into());
+        let (_, seen) = run(&h, &["pick:sudo", "pick:forget", "yes", "yes"], None).await;
+        assert_eq!(h.did()[7..], ["forget", "sudo off"]);
+        assert!(seen[3].contains("Switch it off too?"), "{seen:?}");
+    }
+
+    /// A password sudo refuses, or one sudo does not ask for, is never kept and
+    /// switches nothing on.
+    #[tokio::test]
+    async fn a_password_sudo_does_not_take_is_never_kept() {
+        let h = paired();
+        let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:wrong\x1b[2K"], None).await;
+        assert_eq!(h.did(), ["sudo check"]);
+        assert!(
+            seen[3].starts_with(
+                "error: sudo did not accept this password (sudo: 1 incorrect password attempt)"
+            ),
+            "{seen:?}"
+        );
+        // sudo asks no password here: any text would pass, so nothing is proven.
+        let h = FakeHost {
+            sudo_says: SudoCheck::NoPasswordNeeded,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:anything", "yes"], None).await;
+        assert_eq!(h.did(), ["sudo check"]);
+        assert!(seen[3].contains("--no-password"), "{seen:?}");
+        assert!(!*h.sudo_active.lock().unwrap());
+        // Empty, or more than one line: sudo is not even asked.
+        let h = paired();
+        for pw in ["pw:", "pw:a\nb"] {
+            let (_, seen) = run(&h, &["pick:sudo", "pick:set", pw], None).await;
+            assert!(seen[3].starts_with("error: "), "{seen:?}");
+        }
+        assert!(h.did().is_empty());
+        // Not running and memory only: nothing stored, nothing switched on.
+        let h = FakeHost {
+            kept: Kept::Nowhere,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw", "yes"], None).await;
+        assert_eq!(h.did(), ["sudo check", "keep"]);
+        assert!(
+            seen[3].starts_with("error: The client is not running"),
+            "{seen:?}"
+        );
+        assert!(!*h.sudo_active.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sudo_access_is_refused_from_the_clients_own_commands() {
+        // Started by one: no window at all.
+        let h = FakeHost {
+            own_command: true,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw", "yes"], None).await;
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(h.did().is_empty());
+    }
+
+    /// Each step checks again: before the password is asked for, before it is
+    /// kept, before sudo access is switched on or off, and before forgetting.
+    #[tokio::test]
+    async fn every_sudo_step_checks_the_owner_again() {
+        let set = ["pick:sudo", "pick:set", "pw:right pw", "yes"];
+        for (passing, did) in [
+            (1, &[][..]),
+            (2, &["sudo check"][..]),
+            (3, &["sudo check", "keep"][..]),
+        ] {
+            let h = FakeHost {
+                own_from: Some(passing),
+                ..paired()
+            };
+            let (_, seen) = run(&h, &set, None).await;
+            assert_eq!(h.did(), did, "{seen:?}");
+            assert!(!*h.sudo_active.lock().unwrap());
+            if passing == 1 {
+                assert!(seen.iter().all(|s| !s.starts_with("password:")), "{seen:?}");
+            }
+        }
+        let h = FakeHost {
+            own_from: Some(1),
+            ..paired()
+        };
+        *h.sudo_active.lock().unwrap() = true;
+        *h.password.lock().unwrap() = Some("right pw".into());
+        run(&h, &["pick:sudo", "pick:off", "pick:forget", "yes"], None).await;
+        assert!(h.did().is_empty(), "{:?}", h.did());
+        // Forgotten, then the check before switching off fails.
+        let h = FakeHost {
+            own_from: Some(2),
+            ..paired()
+        };
+        *h.sudo_active.lock().unwrap() = true;
+        *h.password.lock().unwrap() = Some("right pw".into());
+        run(&h, &["pick:sudo", "pick:forget", "yes", "yes"], None).await;
+        assert_eq!(h.did(), ["forget"]);
+        assert!(*h.sudo_active.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn no_sudo_menu_where_there_is_no_sudo_access_to_set_up() {
+        let h = FakeHost {
+            sudo: false,
+            ..paired()
+        };
+        let (o, seen) = run(&h, &["pick:sudo"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_windows_speak_german() {
+        let h = FakeHost::default();
+        let (_, seen) = run_in(Lang::De, &h, &["yes", &format!("text:{LINK}"), "yes"], None).await;
+        assert!(
+            seen[0].starts_with("question: Pithagoras Sync für alice installieren?"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[1].starts_with("entry: Füge den Kopplungslink"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[2].contains("Pithagoras-Portal https://portal.example als „laptop“ koppeln?"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[3].starts_with(
+                "info: Pithagoras Sync läuft, ist mit https://portal.example verbunden"
+            )
+        );
+        assert!(seen[3].contains("Protokoll: das Journal"));
+        // The menu, the status and sudo access.
+        let (_, seen) = run_in(
+            Lang::De,
+            &h,
+            &[
+                "pick:status",
+                "pick:sudo",
+                "pick:set",
+                "pw:wrong",
+                "pick:back",
+                "pick:quit",
+            ],
+            None,
+        )
+        .await;
+        assert!(seen[0].starts_with("menu: Pithagoras Sync ist installiert und mit"));
+        assert!(seen[1].contains("Client: läuft, verbunden"), "{seen:?}");
+        assert!(
+            seen[1].contains("Modus: ask: Jeder Dateizugriff"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[3].contains("Sudo-Zugriff: ausgeschaltet. Passwort: nicht gespeichert."),
+            "{seen:?}"
+        );
+        assert!(seen[4].starts_with("password: Das Passwort, nach dem sudo alice fragt"));
+        assert!(seen[5].starts_with("error: sudo hat dieses Passwort nicht angenommen"));
+        // Refused from the client's own commands, in German too.
+        let h = FakeHost {
+            own_command: true,
+            ..FakeHost::default()
+        };
+        let (_, seen) = run_in(Lang::De, &h, &[], None).await;
+        assert!(
+            seen[0].starts_with("error: Änderungen an den Rechten"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_names_mode_folders_and_waiting_approvals() {
+        use sync_policy::Access;
+        let s = StatusView {
+            link: Some((LinkState::Waiting, Some("refused (401)".into()))),
+            portal: None,
+            paused: true,
+            mode: Mode::Full,
+            full_left_ms: Some(65 * 60_000 + 5),
+            folders: vec![FolderInfo {
+                path: "/home/alice/work".into(),
+                access: Access::Rw,
+                execute: true,
+            }],
+            approvals_waiting: 2,
+            sudo: None,
+            problem: None,
+        };
+        let en = Lang::En.status(&s);
+        assert!(
+            en.contains("Client: running, not connected: waiting to try again: refused (401)"),
+            "{en}"
+        );
+        assert!(en.contains("Portal: not paired"), "{en}");
+        assert!(en.contains("PAUSED"), "{en}");
+        assert!(en.contains("(falls back to ask in 1h 05m)"), "{en}");
+        assert!(
+            en.contains("  /home/alice/work (read and write, commands)"),
+            "{en}"
+        );
+        assert!(en.contains("Waiting for you: 2"), "{en}");
+        assert!(!en.contains("Sudo"), "{en}");
+        let de = Lang::De.status(&s);
+        assert!(de.contains("(fällt in 1 h 05 min auf ask zurück)"), "{de}");
+        assert!(
+            de.contains("  /home/alice/work (lesen und schreiben, Befehle)"),
+            "{de}"
+        );
+        assert!(de.contains("Wartet auf dich: 2"), "{de}");
     }
 
     #[test]

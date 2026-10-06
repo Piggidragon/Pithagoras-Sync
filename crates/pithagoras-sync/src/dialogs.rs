@@ -7,10 +7,14 @@
 //! through `shown` first: control characters become visible escapes and it is
 //! cut, so it cannot redraw or bury what the owner reads. The dialog programs
 //! may read markup, so text is also escaped for that or marked as plain.
+//!
+//! A password (`password`) comes back through the dialog program's stdout,
+//! never its argv or environment, and goes straight into a `Secret`.
 
 use std::path::{Path, PathBuf};
 
 use sync_policy::approve::visible;
+use sync_policy::secret::Secret;
 
 pub const TITLE: &str = "Pithagoras Sync";
 
@@ -44,6 +48,8 @@ pub trait Dialogs {
     fn question(&self, text: &str) -> bool;
     /// One line typed or pasted in; `None` when cancelled.
     fn entry(&self, text: &str) -> Option<String>;
+    /// One line typed in without showing it; `None` when cancelled.
+    fn password(&self, text: &str) -> Option<Secret>;
     /// One of `items` (key, label), by its key; `None` when cancelled.
     fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str>;
 }
@@ -55,6 +61,7 @@ pub enum Ask<'a> {
     Error(&'a str),
     Question(&'a str),
     Entry(&'a str),
+    Password(&'a str),
     Menu(&'a str, &'a [(&'static str, &'a str)]),
 }
 
@@ -105,8 +112,11 @@ impl Helper {
                         a.push("--width=480".into());
                         a.push(format!("--text={}", clipped(t)));
                     }
-                    Ask::Entry(t) => {
+                    Ask::Entry(t) | Ask::Password(t) => {
                         a.push("--entry".into());
+                        if matches!(ask, Ask::Password(_)) {
+                            a.push("--hide-text".into());
+                        }
                         a.push("--width=560".into());
                         a.push(format!("--text={}", pango(&clipped(t))));
                     }
@@ -141,6 +151,7 @@ impl Helper {
                     Ask::Error(t) => a.extend(["--error".into(), text(t)]),
                     Ask::Question(t) => a.extend(["--yesno".into(), text(t)]),
                     Ask::Entry(t) => a.extend(["--inputbox".into(), text(t), String::new()]),
+                    Ask::Password(t) => a.extend(["--password".into(), text(t)]),
                     Ask::Menu(t, items) => {
                         a.extend(["--menu".into(), text(t)]);
                         for (k, l) in *items {
@@ -233,24 +244,110 @@ pub fn find_helper(path: &std::ffi::OsStr, desktop: &str) -> Option<Helper> {
     }
 }
 
+/// A locale name as `locale -a` spells it: the codeset in lower case without
+/// dashes (`de_DE.UTF-8` is `de_DE.utf8`).
+fn normal_locale(name: &str) -> String {
+    let (base, modifier) = match name.split_once('@') {
+        Some((b, m)) => (b, Some(m)),
+        None => (name, None),
+    };
+    let mut out = match base.split_once('.') {
+        Some((l, cs)) => format!(
+            "{l}.{}",
+            cs.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        ),
+        None => base.to_string(),
+    };
+    if let Some(m) = modifier {
+        out.push('@');
+        out.push_str(m);
+    }
+    out
+}
+
+/// What the dialog program's locale needs changed, given the locales
+/// installed (`locale -a`). GLib takes the arguments in the locale's
+/// charset: with a locale that is not installed (or not UTF-8) it refuses a
+/// text with an umlaut or an ellipsis, and the window never shows (a question
+/// then reads as No). Such a locale is replaced by an installed UTF-8 one,
+/// and the language of the windows goes into `LANGUAGE` for the buttons.
+/// Nothing changes when the locale works, or nothing better is installed.
+pub fn locale_fix(
+    var: impl Fn(&str) -> Option<String>,
+    installed: &[String],
+    lang: crate::i18n::Lang,
+) -> Vec<(&'static str, String)> {
+    let set = |v: &str| var(v).filter(|s| !s.is_empty());
+    let current = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|v| set(v))
+        .unwrap_or_else(|| "C".into());
+    let normal = normal_locale(&current);
+    let installed: Vec<String> = installed.iter().map(|l| normal_locale(l.trim())).collect();
+    let utf8 = |l: &str| l.split(['@']).next().is_some_and(|b| b.ends_with(".utf8"));
+    if utf8(&normal) && installed.contains(&normal) {
+        return Vec::new();
+    }
+    let Some(better) = ["C.utf8", "en_US.utf8"]
+        .iter()
+        .find(|l| installed.iter().any(|i| i == *l))
+    else {
+        return Vec::new();
+    };
+    let code = match lang {
+        crate::i18n::Lang::De => "de",
+        crate::i18n::Lang::En => "en",
+    };
+    vec![("LC_ALL", better.to_string()), ("LANGUAGE", code.into())]
+}
+
+/// The locales installed for the dialog programs: `locale -a`, or none known.
+fn installed_locales(path: &std::ffi::OsStr) -> Vec<String> {
+    let Some(prog) = on_path("locale", path) else {
+        return Vec::new();
+    };
+    std::process::Command::new(prog)
+        .arg("-a")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The desktop's dialog program.
 pub struct Native {
     helper: Helper,
+    /// Locale variables set over the session's (`locale_fix`).
+    locale: Vec<(&'static str, String)>,
 }
 
 impl Native {
-    pub fn new(helper: Helper) -> Native {
-        Native { helper }
+    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>) -> Native {
+        Native { helper, locale }
     }
 
     /// The dialog program of this session, if there is a display and one.
-    pub fn find() -> Option<Native> {
+    pub fn find(lang: crate::i18n::Lang) -> Option<Native> {
         if !has_display() {
             return None;
         }
         let path = std::env::var_os("PATH")?;
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-        find_helper(&path, &desktop).map(Native::new)
+        let helper = find_helper(&path, &desktop)?;
+        let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
+        Some(Native::new(helper, locale))
     }
 
     /// Runs the program; its exit code and up to `MAX_ANSWER` bytes of its
@@ -268,10 +365,15 @@ impl Native {
                 cmd.env(v, x);
             }
         }
+        for (k, v) in &self.locale {
+            cmd.env(k, v);
+        }
         let Ok(mut child) = cmd.spawn() else {
             return (None, None);
         };
-        let mut out = Vec::new();
+        // Room for all of it from the start: a buffer grown on the way would
+        // leave copies of a password behind.
+        let mut out = Vec::with_capacity(MAX_ANSWER + 1);
         let read = child.stdout.take().map(|mut s| {
             let ok = (&mut s)
                 .take(MAX_ANSWER as u64 + 1)
@@ -282,9 +384,17 @@ impl Native {
             ok
         });
         let status = child.wait().ok().and_then(|s| s.code());
-        let text = (read == Some(true) && out.len() <= MAX_ANSWER)
-            .then(|| String::from_utf8(std::mem::take(&mut out)).ok())
-            .flatten();
+        let text = if read == Some(true) && out.len() <= MAX_ANSWER {
+            match String::from_utf8(std::mem::take(&mut out)) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    e.into_bytes().fill(0);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         out.fill(0);
         (status, text)
     }
@@ -310,6 +420,23 @@ impl Dialogs for Native {
         }
     }
 
+    fn password(&self, text: &str) -> Option<Secret> {
+        match self.run(&Ask::Password(text)) {
+            (Some(0), Some(mut t)) => {
+                // Only the line end goes; the rest is never copied.
+                while t.ends_with(['\n', '\r']) {
+                    t.pop();
+                }
+                Some(Secret::new(t))
+            }
+            (_, Some(t)) => {
+                drop(Secret::new(t));
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
         match self.run(&Ask::Menu(text, items)) {
             (Some(0), Some(t)) => {
@@ -322,12 +449,13 @@ impl Dialogs for Native {
     }
 }
 
-/// `MessageBoxW`: Yes/No, OK/Cancel and information boxes. There is no input
-/// box, so the pairing link is taken from the clipboard after the owner copied
-/// it; a menu is a row of Yes/No/Cancel questions. Not run by the tests (see
-/// windows.md).
+/// `MessageBoxW`: Yes/No, OK/Cancel and information boxes, with its own texts
+/// in `.0`'s language (Windows labels the buttons). There is no input box, so
+/// the pairing link is taken from the clipboard after the owner copied it; a
+/// menu is a row of Yes/No/Cancel questions. There is no password to ask for:
+/// sudo is Linux only. Not run by the tests (see windows.md).
 #[cfg(windows)]
-pub struct WinDialogs;
+pub struct WinDialogs(pub crate::i18n::Lang);
 
 #[cfg(windows)]
 mod win {
@@ -340,7 +468,7 @@ mod win {
         MB_SETFOREGROUND, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
     };
 
-    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, TITLE, WinDialogs, clip};
+    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip};
 
     /// The clipboard's text format.
     const CF_UNICODETEXT: u32 = 13;
@@ -418,18 +546,20 @@ mod win {
         }
 
         fn entry(&self, text: &str) -> Option<String> {
-            let t = format!("{text}\n\nCopy it, then press OK: it is read from the clipboard.");
+            let t = format!("{text}\n\n{}", self.0.clipboard_hint());
             if message(&t, MB_OKCANCEL | MB_ICONQUESTION) != IDOK {
                 return None;
             }
             clipboard().map(|s| s.trim().to_string())
         }
 
+        fn password(&self, _text: &str) -> Option<Secret> {
+            None
+        }
+
         fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
             for (key, label) in items {
-                let t = format!(
-                    "{text}\n\n{label}?\n\nYes: {label}. No: the next choice. Cancel: close."
-                );
+                let t = self.0.menu_step(text, label);
                 match message(&t, MB_YESNOCANCEL | MB_ICONQUESTION) {
                     IDYES => return Some(key),
                     IDNO => continue,
@@ -445,7 +575,8 @@ mod win {
 #[derive(Default)]
 pub struct Fake {
     pub shown: std::sync::Mutex<Vec<String>>,
-    /// Answers in order: `yes`, `no`, `cancel`, `text:<line>`, `pick:<key>`.
+    /// Answers in order: `yes`, `no`, `cancel`, `text:<line>`, `pw:<password>`,
+    /// `pick:<key>`.
     pub answers: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
 
@@ -491,6 +622,12 @@ impl Dialogs for Fake {
             .map(str::to_string)
     }
 
+    fn password(&self, text: &str) -> Option<Secret> {
+        self.next("password", text)
+            .strip_prefix("pw:")
+            .map(|p| Secret::new(p.to_string()))
+    }
+
     fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
         let a = self.next("menu", text);
         let key = a.strip_prefix("pick:")?;
@@ -527,6 +664,10 @@ mod tests {
         // Texts that zenity reads as markup are escaped.
         let a = z.args(&Ask::Entry("a <i>b</i> & c"));
         assert_eq!(a.last().unwrap(), "--text=a &lt;i&gt;b&lt;/i&gt; &amp; c");
+        // A password is not shown as it is typed.
+        let a = z.args(&Ask::Password("pw <x>"));
+        assert_eq!(&a[1..3], ["--entry", "--hide-text"]);
+        assert_eq!(a.last().unwrap(), "--text=pw &lt;x&gt;");
         let a = z.args(&Ask::Menu(
             "Paired with <x>",
             &[("status", "Status"), ("quit", "Quit")],
@@ -559,6 +700,8 @@ mod tests {
         );
         let a = k.args(&Ask::Entry("Paste the link"));
         assert_eq!(&a[2..], ["--inputbox", "<qt>Paste the link</qt>", ""]);
+        let a = k.args(&Ask::Password("Passwort für <b>"));
+        assert_eq!(&a[2..], ["--password", "<qt>Passwort für &lt;b&gt;</qt>"]);
         let a = k.args(&Ask::Menu("m", &[("log", "Open log")]));
         assert_eq!(&a[2..], ["--menu", "<qt>m</qt>", "log", "Open log"]);
         // A text that starts with a dash is still inside `<qt>`.
@@ -596,6 +739,48 @@ mod tests {
             find_helper(&path, "GNOME"),
             Some(Helper::Kdialog(t.path().join("kdialog")))
         );
+    }
+
+    #[test]
+    fn the_dialog_program_gets_a_working_utf8_locale() {
+        use crate::i18n::Lang;
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let installed: Vec<String> = ["C", "C.utf8", "POSIX", "de_DE.utf8"]
+            .map(String::from)
+            .to_vec();
+        // Installed and UTF-8: left alone.
+        assert!(locale_fix(vars(&[("LANG", "de_DE.UTF-8")]), &installed, Lang::De).is_empty());
+        assert!(locale_fix(vars(&[("LC_ALL", "C.UTF-8")]), &installed, Lang::En).is_empty());
+        // Not installed, not UTF-8, or none at all: C.UTF-8, the language kept.
+        for v in [
+            &[("LANG", "fr_FR.UTF-8")][..],
+            &[("LANG", "de_DE.ISO-8859-1")][..],
+            &[("LANG", "de_DE")][..],
+            &[("LANG", "de_DE.UTF-8"), ("LC_ALL", "C")][..],
+            &[][..],
+        ] {
+            let m: std::collections::HashMap<&str, &str> = v.iter().copied().collect();
+            let fix = locale_fix(|k| m.get(k).map(|s| s.to_string()), &installed, Lang::De);
+            assert_eq!(
+                fix,
+                [
+                    ("LC_ALL", "C.utf8".to_string()),
+                    ("LANGUAGE", "de".to_string())
+                ],
+                "{v:?}"
+            );
+        }
+        // Nothing better installed, or nothing known: left alone.
+        assert!(locale_fix(vars(&[("LANG", "C")]), &["C".to_string()], Lang::En).is_empty());
+        assert!(locale_fix(vars(&[("LANG", "C")]), &[], Lang::En).is_empty());
+        assert_eq!(normal_locale("de_DE.UTF-8@euro"), "de_DE.utf8@euro");
     }
 
     #[test]

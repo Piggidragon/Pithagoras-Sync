@@ -147,6 +147,85 @@ pub async fn forget(
     Ok(())
 }
 
+/// What sudo says to a password (`check_with_sudo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SudoCheck {
+    Accepted,
+    /// sudo asks this user no password: any text would pass, so a password
+    /// proves nothing and there is none to store.
+    NoPasswordNeeded,
+    /// Refused, with the last line sudo wrote (not escaped).
+    Refused(String),
+}
+
+/// How long a check may take (PAM may wait for a fingerprint reader first).
+pub const SUDO_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Checks `pw` with the sudo the client runs, as the windows' proof that the
+/// owner types it (a command of the agent does not know it) and against typos.
+/// First `sudo -k -n -v`: if that passes, sudo asks no password here. Then
+/// `sudo -k -S -p "" -v` with the password on stdin, never in argv or the
+/// environment. `-k` neither uses nor leaves cached credentials, so the check
+/// unlocks nothing for later. sudo gets an empty environment but `PATH` and
+/// `LC_ALL=C`.
+#[cfg(unix)]
+pub async fn check_with_sudo(sudo: &Path, pw: &Secret) -> Result<SudoCheck, String> {
+    let (ok, _) = sudo_run(sudo, &["-k", "-n", "-v"], None).await?;
+    if ok {
+        return Ok(SudoCheck::NoPasswordNeeded);
+    }
+    let (ok, said) = sudo_run(sudo, &["-k", "-S", "-p", "", "-v"], Some(pw)).await?;
+    Ok(if ok {
+        SudoCheck::Accepted
+    } else {
+        SudoCheck::Refused(said)
+    })
+}
+
+/// Runs sudo once: whether it succeeded, and its last line on stderr.
+#[cfg(unix)]
+async fn sudo_run(
+    sudo: &Path,
+    args: &[&str],
+    input: Option<&Secret>,
+) -> Result<(bool, String), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(sudo)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", sudo.display()))?;
+    if let (Some(pw), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Written as it is, then the line end: no copy is made. A sudo that
+        // reads nothing (or exits) is no error here; its exit code tells.
+        let _ = stdin.write_all(pw.expose().as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+    }
+    let out = tokio::time::timeout(SUDO_CHECK_WAIT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("{} did not answer in time", sudo.display()))?
+        .map_err(|e| format!("{}: {e}", sudo.display()))?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    let last = err
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    Ok((out.status.success(), last))
+}
+
 /// Reads a line from the terminal without echoing it. Never from a command line or
 /// the environment.
 #[cfg(unix)]
@@ -368,6 +447,69 @@ mod tests {
         *ks.fail.lock().unwrap() = None;
         forget(&dirs, SecretStorage::Keyring, &ks).await.unwrap();
         assert!(ks.entries.lock().unwrap().is_empty());
+    }
+
+    /// A stand-in sudo: it logs its arguments and environment, passes `-n`
+    /// when `nopw` exists, and takes "right pw" on stdin.
+    #[cfg(unix)]
+    fn fake_sudo(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("sudo");
+        let log = dir.join("log");
+        let nopw = dir.join("nopw");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\nenv >> '{log}'\ncase \"$*\" in *-n*) [ -e '{nopw}' ] && exit 0; echo 'sudo: a password is required' >&2; exit 1;; esac\nread -r pw\n[ \"$pw\" = 'right pw' ] && exit 0\necho 'Sorry, try again.' >&2\necho 'sudo: 1 incorrect password attempt' >&2\nexit 1\n",
+                log = log.display(),
+                nopw = nopw.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sudo_checks_the_password_from_stdin_and_caches_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let sudo = fake_sudo(t.path());
+        let right = Secret::new("right pw".into());
+        assert_eq!(
+            check_with_sudo(&sudo, &right).await,
+            Ok(SudoCheck::Accepted)
+        );
+        let wrong = Secret::new("wrong pw".into());
+        assert_eq!(
+            check_with_sudo(&sudo, &wrong).await,
+            Ok(SudoCheck::Refused(
+                "sudo: 1 incorrect password attempt".into()
+            ))
+        );
+        let log = std::fs::read_to_string(t.path().join("log")).unwrap();
+        // Never in argv or the environment; no cached credentials used or kept.
+        assert!(
+            !log.contains("right pw") && !log.contains("wrong pw"),
+            "{log}"
+        );
+        assert!(
+            log.contains("-k -n -v") && log.contains("-k -S -p  -v"),
+            "{log}"
+        );
+        assert!(!log.contains("HOME="), "{log}");
+        // sudo asks no password: nothing is proven.
+        std::fs::write(t.path().join("nopw"), "").unwrap();
+        assert_eq!(
+            check_with_sudo(&sudo, &wrong).await,
+            Ok(SudoCheck::NoPasswordNeeded)
+        );
+        // No sudo there.
+        assert!(
+            check_with_sudo(&t.path().join("none"), &right)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

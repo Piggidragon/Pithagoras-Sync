@@ -7,6 +7,7 @@ pub mod control;
 pub mod daemon;
 pub mod dialogs;
 pub mod gui;
+pub mod i18n;
 pub mod install;
 pub mod logfile;
 pub mod owner;

@@ -1,0 +1,690 @@
+//! The languages of the windows (`gui`, `dialogs`): English and German, chosen
+//! from the desktop's language. Every text the windows show is a method here
+//! with one arm per language, so a text cannot exist in one language only. The
+//! command line stays English.
+//!
+//! Values in the texts (a portal URL, a path, an error) come escaped by the
+//! caller (`dialogs::shown`); errors from below the windows (the connector, the
+//! keyring, the system) stay in English inside the translated sentence.
+
+use sync_connector::LinkState;
+use sync_policy::{Access, Mode};
+
+use crate::cli::Kept;
+use crate::gui::{LogPlace, StatusView, SudoState};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    En,
+    De,
+}
+
+impl Lang {
+    /// The language of a locale or language name: `de`, `de_AT.UTF-8`,
+    /// `de-CH`, `en_GB`; `None` for one the windows do not speak.
+    pub fn from_code(code: &str) -> Option<Lang> {
+        let primary = code
+            .split(['_', '.', '@', '-'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match primary.as_str() {
+            "de" => Some(Lang::De),
+            "en" => Some(Lang::En),
+            _ => None,
+        }
+    }
+
+    /// The language from locale variables as gettext reads them: the first set
+    /// of `LC_ALL`, `LC_MESSAGES` and `LANG` is the locale; unless it is `C`,
+    /// `LANGUAGE` is a list of preferred languages before it. English when
+    /// nothing names a language spoken here.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Lang {
+        let set = |v: &str| var(v).filter(|s| !s.is_empty());
+        let Some(locale) = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|v| set(v))
+        else {
+            return Lang::En;
+        };
+        if locale == "C" || locale == "POSIX" || locale.starts_with("C.") {
+            return Lang::En;
+        }
+        set("LANGUAGE")
+            .and_then(|list| list.split(':').find_map(Lang::from_code))
+            .or_else(|| Lang::from_code(&locale))
+            .unwrap_or(Lang::En)
+    }
+
+    /// The language of this session: the locale on Linux, the user's display
+    /// language on Windows.
+    pub fn detect() -> Lang {
+        #[cfg(windows)]
+        {
+            // SAFETY: no arguments, no preconditions.
+            let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() };
+            // The primary language is the low 10 bits; LANG_GERMAN is 0x07.
+            if id & 0x3ff == 0x07 {
+                Lang::De
+            } else {
+                Lang::En
+            }
+        }
+        #[cfg(not(windows))]
+        Lang::from_vars(|v| std::env::var(v).ok())
+    }
+
+    fn pick(self, en: &'static str, de: &'static str) -> &'static str {
+        match self {
+            Lang::En => en,
+            Lang::De => de,
+        }
+    }
+
+    // Pairing links.
+
+    pub fn entry_text(self) -> &'static str {
+        self.pick(
+            "Paste the pairing link from the portal's Devices page (Settings, Devices, Pair a device). It starts with pithagoras-sync://pair?",
+            "Füge den Kopplungslink von der Geräteseite des Portals ein (Einstellungen, Geräte, Gerät koppeln). Er beginnt mit pithagoras-sync://pair?",
+        )
+    }
+
+    pub fn link_too_long(self) -> &'static str {
+        self.pick(
+            "This is not a pairing link: it is far too long.",
+            "Das ist kein Kopplungslink: Er ist viel zu lang.",
+        )
+    }
+
+    pub fn link_unusable(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("This pairing link cannot be used: {e}"),
+            Lang::De => format!("Dieser Kopplungslink ist nicht verwendbar: {e}"),
+        }
+    }
+
+    pub fn link_plain_http(self, portal: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "This pairing link names a portal on another machine over plain http ({portal}). Plain http is only for a portal on this computer: use the portal's https address."
+            ),
+            Lang::De => format!(
+                "Dieser Kopplungslink nennt ein Portal auf einem anderen Rechner über unverschlüsseltes http ({portal}). Unverschlüsseltes http ist nur für ein Portal auf diesem Computer gedacht: Verwende die https-Adresse des Portals."
+            ),
+        }
+    }
+
+    // Install and pair.
+
+    pub fn install_question(self, user: &str, path: Option<&str>) -> String {
+        match self {
+            Lang::En => format!(
+                "Install Pithagoras Sync for {user}?\n\nIt copies the program to {}, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).",
+                path.unwrap_or("your programs folder")
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync für {user} installieren?\n\nDas Programm wird nach {} kopiert, beim Anmelden gestartet und öffnet pithagoras-sync://-Links (den Kopplungslink im Portal).",
+                path.unwrap_or("deinen Programme-Ordner")
+            ),
+        }
+    }
+
+    pub fn install_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Installing failed: {e}"),
+            Lang::De => format!("Die Installation ist fehlgeschlagen: {e}"),
+        }
+    }
+
+    /// The flow was started by a command the client runs for the portal.
+    pub fn own_command(self) -> &'static str {
+        self.pick(
+            "Policy changes cannot come from commands the client runs for the portal.",
+            "Änderungen an den Rechten können nicht von Befehlen kommen, die der Client für das Portal ausführt.",
+        )
+    }
+
+    fn pin_note(self, pinned: bool) -> &'static str {
+        if !pinned {
+            return "";
+        }
+        self.pick(
+            " Its certificate is pinned by the link.",
+            " Sein Zertifikat ist durch den Link festgelegt.",
+        )
+    }
+
+    pub fn pair_question(self, portal: &str, name: &str, pinned: bool) -> String {
+        let pin = self.pin_note(pinned);
+        match self {
+            Lang::En => format!(
+                "Pair this computer with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nIts agent can then ask to use this computer's files and shell. What it may do is decided on this computer: until you change it, every call asks you first."
+            ),
+            Lang::De => format!(
+                "Diesen Computer mit dem Pithagoras-Portal {portal} als „{name}“ koppeln?{pin}\n\nSein Agent kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. Was er darf, wird auf diesem Computer entschieden: Bis du es änderst, fragt dich jeder Aufruf zuerst."
+            ),
+        }
+    }
+
+    pub fn replace_question(self, old: &str, portal: &str, name: &str, pinned: bool) -> String {
+        let pin = self.pin_note(pinned);
+        match self {
+            Lang::En => format!(
+                "This computer is paired with {old}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}"
+            ),
+            Lang::De => format!(
+                "Dieser Computer ist mit {old} gekoppelt.\n\nDie Kopplung durch das Portal {portal} als „{name}“ ersetzen?{pin}"
+            ),
+        }
+    }
+
+    pub fn pair_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Pairing failed: {e}"),
+            Lang::De => format!("Die Kopplung ist fehlgeschlagen: {e}"),
+        }
+    }
+
+    pub fn log_place(self, p: &LogPlace) -> String {
+        match (p, self) {
+            (LogPlace::File(f), _) => f.clone(),
+            (LogPlace::Journal(unit), Lang::En) => {
+                format!("the journal (journalctl --user -u {unit})")
+            }
+            (LogPlace::Journal(unit), Lang::De) => {
+                format!("das Journal (journalctl --user -u {unit})")
+            }
+        }
+    }
+
+    pub fn connected(self, portal: &str, log: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pithagoras Sync is running, connected to {portal}, and starts at login.\n\nLog: {log}"
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync läuft, ist mit {portal} verbunden und startet beim Anmelden.\n\nProtokoll: {log}"
+            ),
+        }
+    }
+
+    pub fn not_connected(self, why: &str, log: &str) -> String {
+        match self {
+            Lang::En => format!("Installed, not connected yet: {why}\n\nLog: {log}"),
+            Lang::De => {
+                format!("Installiert, aber noch nicht verbunden: {why}\n\nProtokoll: {log}")
+            }
+        }
+    }
+
+    /// The link's state; `None` when the client does not run. `detail` is
+    /// escaped.
+    pub fn link_state(self, state: Option<LinkState>, detail: Option<&str>) -> String {
+        let word = match state {
+            None => self.pick("the client is not running", "der Client läuft nicht"),
+            Some(LinkState::Connecting) => self.pick("connecting", "verbindet"),
+            Some(LinkState::Connected) => self.pick("connected", "verbunden"),
+            Some(LinkState::Waiting) => {
+                self.pick("waiting to try again", "wartet auf den nächsten Versuch")
+            }
+            Some(LinkState::Rejected) => self.pick(
+                "the portal refused this device",
+                "das Portal hat dieses Gerät abgelehnt",
+            ),
+            Some(LinkState::Paused) => self.pick("paused", "pausiert"),
+            Some(LinkState::Stopped) => self.pick("stopped", "angehalten"),
+        };
+        match detail {
+            Some(d) => format!("{word}: {d}"),
+            None => word.to_string(),
+        }
+    }
+
+    // The menu of a paired device.
+
+    pub fn menu_text(self, portal: &str) -> String {
+        match self {
+            Lang::En => format!("Pithagoras Sync is installed and paired with {portal}."),
+            Lang::De => format!("Pithagoras Sync ist installiert und mit {portal} gekoppelt."),
+        }
+    }
+
+    /// The label of a menu item, by its key.
+    pub fn label(self, key: &str) -> &'static str {
+        match key {
+            "status" => "Status",
+            "pair" => self.pick("Pair again", "Neu koppeln"),
+            "sudo" => self.pick("Sudo access", "Sudo-Zugriff"),
+            "log" => self.pick("Open log", "Protokoll öffnen"),
+            "uninstall" => self.pick("Uninstall", "Deinstallieren"),
+            "set" => self.pick("Enter the password", "Passwort eingeben"),
+            "off" => self.pick("Switch sudo access off", "Sudo-Zugriff ausschalten"),
+            "forget" => self.pick("Forget the password", "Passwort vergessen"),
+            "back" => self.pick("Back", "Zurück"),
+            _ => self.pick("Close", "Schließen"),
+        }
+    }
+
+    pub fn log_open_failed(self, e: &str, place: &str) -> String {
+        match self {
+            Lang::En => format!("Cannot open the log: {e}\n\nIt is here: {place}"),
+            Lang::De => {
+                format!("Das Protokoll lässt sich nicht öffnen: {e}\n\nEs liegt hier: {place}")
+            }
+        }
+    }
+
+    // Status.
+
+    fn mode_text(self, mode: Mode, left_ms: Option<i64>) -> String {
+        let what = match mode {
+            Mode::Ask => self.pick(
+                "ask: every file access and every command asks you first",
+                "ask: Jeder Dateizugriff und jeder Befehl fragt dich zuerst",
+            ),
+            Mode::Folders => self.pick(
+                "folders: files and commands only in the folders below",
+                "folders: Dateien und Befehle nur in den Ordnern unten",
+            ),
+            Mode::Full => self.pick(
+                "full: the agent acts with your rights and is mostly not asked",
+                "full: Der Agent handelt mit deinen Rechten und wird meist nicht gefragt",
+            ),
+        };
+        if mode != Mode::Full {
+            return what.to_string();
+        }
+        match left_ms {
+            Some(left) => {
+                let mins = left.max(0) / 60_000;
+                let (h, m) = (mins / 60, mins % 60);
+                match self {
+                    Lang::En => format!("{what} (falls back to ask in {h}h {m:02}m)"),
+                    Lang::De => format!("{what} (fällt in {h} h {m:02} min auf ask zurück)"),
+                }
+            }
+            None => format!("{what} ({})", self.pick("no expiry", "ohne Ablauf")),
+        }
+    }
+
+    /// What the menu's Status shows. Values in `s` are escaped.
+    pub fn status(self, s: &StatusView) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let client = match &s.link {
+            None => self.pick("not running", "läuft nicht").to_string(),
+            Some((LinkState::Connected, _)) => self
+                .pick("running, connected", "läuft, verbunden")
+                .to_string(),
+            Some((state, detail)) => format!(
+                "{}: {}",
+                self.pick("running, not connected", "läuft, nicht verbunden"),
+                self.link_state(Some(*state), detail.as_deref())
+            ),
+        };
+        let _ = writeln!(out, "Client: {client}");
+        let portal = match &s.portal {
+            Some((url, name)) => match self {
+                Lang::En => format!("{url} as \"{name}\""),
+                Lang::De => format!("{url} als „{name}“"),
+            },
+            None => self.pick("not paired", "nicht gekoppelt").to_string(),
+        };
+        let _ = writeln!(out, "Portal: {portal}");
+        if s.paused {
+            let _ = writeln!(
+                out,
+                "{}",
+                self.pick(
+                    "PAUSED: every call is refused until `pithagoras-sync unlock`.",
+                    "PAUSIERT: Jeder Aufruf wird abgelehnt bis `pithagoras-sync unlock`.",
+                )
+            );
+        }
+        let _ = writeln!(
+            out,
+            "{}: {}",
+            self.pick("Mode", "Modus"),
+            self.mode_text(s.mode, s.full_left_ms)
+        );
+        let folders = self.pick("Folders", "Ordner");
+        if s.folders.is_empty() {
+            let _ = writeln!(out, "{folders}: {}", self.pick("none", "keine"));
+        } else {
+            let _ = writeln!(out, "{folders}:");
+        }
+        for f in &s.folders {
+            let access = match f.access {
+                Access::Ro => self.pick("read only", "nur lesen"),
+                Access::Rw => self.pick("read and write", "lesen und schreiben"),
+            };
+            let exec = if f.execute {
+                self.pick(", commands", ", Befehle")
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  {} ({access}{exec})", f.path);
+        }
+        if s.approvals_waiting > 0 {
+            let _ = writeln!(
+                out,
+                "{}: {} ({})",
+                self.pick("Waiting for you", "Wartet auf dich"),
+                s.approvals_waiting,
+                self.pick(
+                    "answer in the portal's Devices tab",
+                    "beantworte sie im Geräte-Tab des Portals"
+                )
+            );
+        }
+        if let Some(on) = s.sudo {
+            let _ = writeln!(out, "{}: {}", self.label("sudo"), self.on_off(on));
+        }
+        if let Some(p) = &s.problem {
+            let _ = writeln!(out, "{}: {p}", self.pick("Problem", "Problem"));
+        }
+        out
+    }
+
+    fn on_off(self, on: bool) -> &'static str {
+        if on {
+            self.pick("on", "eingeschaltet")
+        } else {
+            self.pick("off", "ausgeschaltet")
+        }
+    }
+
+    // Uninstall.
+
+    pub fn uninstall_question(self) -> &'static str {
+        self.pick(
+            "Uninstall Pithagoras Sync? The client stops and no longer starts at login, and pairing links no longer open it.",
+            "Pithagoras Sync deinstallieren? Der Client wird beendet und startet nicht mehr beim Anmelden, und Kopplungslinks öffnen ihn nicht mehr.",
+        )
+    }
+
+    pub fn purge_question(self) -> &'static str {
+        self.pick(
+            "Also remove the pairing and all settings?\n\nYes: the pairing, the settings with their folders, the logs and everything else the client keeps go (remove the device in the portal as well). No: they stay for a later install.",
+            "Auch die Kopplung und alle Einstellungen entfernen?\n\nJa: Die Kopplung, die Einstellungen mit ihren Ordnern, die Protokolle und alles andere, was der Client aufbewahrt, werden entfernt (entferne das Gerät auch im Portal). Nein: Sie bleiben für eine spätere Installation erhalten.",
+        )
+    }
+
+    pub fn uninstall_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Uninstalling failed: {e}"),
+            Lang::De => format!("Die Deinstallation ist fehlgeschlagen: {e}"),
+        }
+    }
+
+    pub fn uninstalled(self, purged: bool, program: &str) -> String {
+        match (self, purged) {
+            (Lang::En, true) => format!(
+                "Pithagoras Sync is uninstalled, and its pairing and settings are removed. Remove the device in the portal as well (Settings, Devices).\n\nThe program itself stays: {program}. Delete it when you no longer need it."
+            ),
+            (Lang::En, false) => format!(
+                "Pithagoras Sync is uninstalled. Its pairing and settings stay for a later install.\n\nThe program itself stays: {program}."
+            ),
+            (Lang::De, true) => format!(
+                "Pithagoras Sync ist deinstalliert, seine Kopplung und Einstellungen sind entfernt. Entferne das Gerät auch im Portal (Einstellungen, Geräte).\n\nDas Programm selbst bleibt: {program}. Lösche es, wenn du es nicht mehr brauchst."
+            ),
+            (Lang::De, false) => format!(
+                "Pithagoras Sync ist deinstalliert. Kopplung und Einstellungen bleiben für eine spätere Installation erhalten.\n\nDas Programm selbst bleibt: {program}."
+            ),
+        }
+    }
+
+    // Sudo access.
+
+    pub fn sudo_text(self, s: SudoState) -> String {
+        let pw = if s.password {
+            self.pick("stored", "gespeichert")
+        } else {
+            self.pick("not stored", "nicht gespeichert")
+        };
+        match self {
+            Lang::En => format!(
+                "Sudo access lets the portal's agent run `sudo <command>` on this computer; each such command asks you first, unless you exempted it in the settings.\n\nSudo access: {}. Password: {pw}.",
+                self.on_off(s.active)
+            ),
+            Lang::De => format!(
+                "Mit Sudo-Zugriff kann der Agent des Portals auf diesem Computer `sudo <Befehl>` ausführen; jeder solche Befehl fragt dich zuerst, außer du hast ihn in den Einstellungen ausgenommen.\n\nSudo-Zugriff: {}. Passwort: {pw}.",
+                self.on_off(s.active)
+            ),
+        }
+    }
+
+    pub fn password_prompt(self, user: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "The password sudo asks {user} for.\n\nIt is checked with sudo, then kept on this computer only; it is never sent to the portal."
+            ),
+            Lang::De => format!(
+                "Das Passwort, nach dem sudo {user} fragt.\n\nEs wird mit sudo geprüft und dann nur auf diesem Computer aufbewahrt; es wird nie an das Portal gesendet."
+            ),
+        }
+    }
+
+    pub fn password_empty(self) -> &'static str {
+        self.pick(
+            "The password is empty. Nothing changed.",
+            "Das Passwort ist leer. Es wurde nichts geändert.",
+        )
+    }
+
+    pub fn password_not_one_line(self, max: usize) -> String {
+        match self {
+            Lang::En => {
+                format!("The password must be one line of at most {max} bytes. Nothing changed.")
+            }
+            Lang::De => format!(
+                "Das Passwort muss eine Zeile mit höchstens {max} Bytes sein. Es wurde nichts geändert."
+            ),
+        }
+    }
+
+    pub fn sudo_refused(self, detail: &str) -> String {
+        match self {
+            Lang::En => format!("sudo did not accept this password ({detail}). Nothing changed."),
+            Lang::De => format!(
+                "sudo hat dieses Passwort nicht angenommen ({detail}). Es wurde nichts geändert."
+            ),
+        }
+    }
+
+    pub fn sudo_needs_no_password(self) -> &'static str {
+        self.pick(
+            "sudo asks you no password on this computer, so there is nothing to store. To let the agent use sudo all the same, run in a terminal: pithagoras-sync sudo activate --no-password",
+            "sudo fragt dich auf diesem Computer nach keinem Passwort, also gibt es nichts zu speichern. Damit der Agent sudo trotzdem nutzen kann, führe in einem Terminal aus: pithagoras-sync sudo activate --no-password",
+        )
+    }
+
+    pub fn sudo_check_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("The password could not be checked: {e}. Nothing changed."),
+            Lang::De => {
+                format!("Das Passwort konnte nicht geprüft werden: {e}. Es wurde nichts geändert.")
+            }
+        }
+    }
+
+    /// Where the password went; `Kept::Nowhere` is `not_kept`.
+    pub fn kept(self, k: Kept) -> &'static str {
+        match k {
+            Kept::InClient => self.pick(
+                "The password is stored in the running client.",
+                "Das Passwort ist im laufenden Client gespeichert.",
+            ),
+            Kept::ForNextStart => self.pick(
+                "The password is stored for the client's next start.",
+                "Das Passwort ist für den nächsten Start des Clients gespeichert.",
+            ),
+            Kept::Nowhere => self.not_kept(),
+        }
+    }
+
+    pub fn not_kept(self) -> &'static str {
+        self.pick(
+            "The client is not running, and it keeps the password in memory only, so it cannot be stored now. Start the client first, then try again.",
+            "Der Client läuft nicht und bewahrt das Passwort nur im Arbeitsspeicher auf, daher kann es jetzt nicht gespeichert werden. Starte zuerst den Client und versuche es dann erneut.",
+        )
+    }
+
+    pub fn store_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Storing the password failed: {e}"),
+            Lang::De => format!("Das Passwort konnte nicht gespeichert werden: {e}"),
+        }
+    }
+
+    pub fn activate_question(self, kept: Kept) -> String {
+        let kept = self.kept(kept);
+        match self {
+            Lang::En => format!(
+                "{kept}\n\nSwitch sudo access on now? The agent may then run `sudo <command>`; each such command asks you first."
+            ),
+            Lang::De => format!(
+                "{kept}\n\nSudo-Zugriff jetzt einschalten? Der Agent darf dann `sudo <Befehl>` ausführen; jeder solche Befehl fragt dich zuerst."
+            ),
+        }
+    }
+
+    pub fn sudo_now(self, on: bool) -> &'static str {
+        if on {
+            self.pick("Sudo access is on.", "Sudo-Zugriff ist eingeschaltet.")
+        } else {
+            self.pick("Sudo access is off.", "Sudo-Zugriff ist ausgeschaltet.")
+        }
+    }
+
+    pub fn sudo_stays_off(self) -> &'static str {
+        self.pick(
+            "Sudo access stays off.",
+            "Sudo-Zugriff bleibt ausgeschaltet.",
+        )
+    }
+
+    pub fn forget_question(self) -> &'static str {
+        self.pick(
+            "Forget the stored sudo password?",
+            "Das gespeicherte sudo-Passwort vergessen?",
+        )
+    }
+
+    pub fn forgotten(self) -> &'static str {
+        self.pick("The password is forgotten.", "Das Passwort ist gelöscht.")
+    }
+
+    pub fn also_off_question(self) -> String {
+        format!(
+            "{}\n\n{}",
+            self.forgotten(),
+            self.pick(
+                "Sudo access is still on, but works only for what sudoers allows without a password. Switch it off too?",
+                "Sudo-Zugriff ist noch eingeschaltet, funktioniert aber nur für das, was sudoers ohne Passwort erlaubt. Auch ausschalten?",
+            )
+        )
+    }
+
+    pub fn sudo_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Changing sudo access failed: {e}"),
+            Lang::De => format!("Sudo-Zugriff konnte nicht geändert werden: {e}"),
+        }
+    }
+
+    // Outside the windows.
+
+    pub fn no_dialogs(self) -> &'static str {
+        self.pick(
+            "Pithagoras Sync cannot show its windows here: there is no display, or neither zenity nor kdialog is installed. Install one of them, or use the command line (pithagoras-sync --help).",
+            "Pithagoras Sync kann hier keine Fenster anzeigen: Es gibt keine Anzeige, oder weder zenity noch kdialog ist installiert. Installiere eines davon oder nutze die Kommandozeile (pithagoras-sync --help).",
+        )
+    }
+
+    /// Windows: the entry is a message box, the link is read from the
+    /// clipboard.
+    pub fn clipboard_hint(self) -> &'static str {
+        self.pick(
+            "Copy it, then press OK: it is read from the clipboard.",
+            "Kopiere ihn und drücke dann OK: Er wird aus der Zwischenablage gelesen.",
+        )
+    }
+
+    /// Windows: one item of a menu, as a Yes/No/Cancel question.
+    pub fn menu_step(self, text: &str, label: &str) -> String {
+        match self {
+            Lang::En => {
+                format!("{text}\n\n{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
+            }
+            Lang::De => format!(
+                "{text}\n\n{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen."
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    #[test]
+    fn the_language_follows_the_locale_as_gettext_reads_it() {
+        let l = |p: &[(&str, &str)]| Lang::from_vars(vars(p));
+        assert_eq!(l(&[]), Lang::En);
+        assert_eq!(l(&[("LANG", "de_DE.UTF-8")]), Lang::De);
+        assert_eq!(l(&[("LANG", "de_AT.UTF-8")]), Lang::De);
+        assert_eq!(l(&[("LANG", "en_US.UTF-8")]), Lang::En);
+        // An unknown language is English.
+        assert_eq!(l(&[("LANG", "fr_FR.UTF-8")]), Lang::En);
+        // LC_ALL before LC_MESSAGES before LANG; an empty one is unset.
+        assert_eq!(l(&[("LANG", "en_US"), ("LC_MESSAGES", "de_DE")]), Lang::De);
+        assert_eq!(
+            l(&[
+                ("LANG", "de_DE"),
+                ("LC_MESSAGES", "de_DE"),
+                ("LC_ALL", "en_GB")
+            ]),
+            Lang::En
+        );
+        assert_eq!(l(&[("LANG", "de_DE"), ("LC_ALL", "")]), Lang::De);
+        // LANGUAGE lists preferences; its first language spoken here wins,
+        // unless the locale is C.
+        assert_eq!(
+            l(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "fr:de:en")]),
+            Lang::De
+        );
+        assert_eq!(l(&[("LANG", "de_DE.UTF-8"), ("LANGUAGE", "en")]), Lang::En);
+        assert_eq!(l(&[("LANG", "C.UTF-8"), ("LANGUAGE", "de")]), Lang::En);
+        assert_eq!(l(&[("LC_ALL", "C"), ("LANG", "de_DE")]), Lang::En);
+    }
+
+    #[test]
+    fn every_menu_label_has_both_languages() {
+        for key in [
+            "status",
+            "pair",
+            "sudo",
+            "log",
+            "uninstall",
+            "set",
+            "off",
+            "forget",
+            "back",
+            "quit",
+        ] {
+            assert!(!Lang::En.label(key).is_empty());
+            assert!(!Lang::De.label(key).is_empty());
+        }
+        assert_eq!(Lang::De.label("uninstall"), "Deinstallieren");
+    }
+}
