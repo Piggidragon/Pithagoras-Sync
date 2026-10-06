@@ -792,7 +792,7 @@ async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), Failed> {
     let tmp = dir.join(format!(".pithagoras-sync.update.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let written = write_new(&tmp, &data)
-        .map_err(|e| write_error(e, &tmp, exe))
+        .map_err(|e| write_error(e, &tmp, exe, &RealFs, my_uid()))
         .and_then(|()| check_runs(&tmp, &plan.version));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
@@ -816,23 +816,49 @@ fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// A folder this user may not write to holds a program someone else installed:
-/// say who updates it rather than a bare errno.
-fn write_error(e: std::io::Error, path: &Path, exe: &Path) -> String {
+/// This user's uid; on Windows, where `write_error` does not look at owners, 0.
+fn my_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    0
+}
+
+/// A folder this user may not write to: say why and who can update the program
+/// in it rather than a bare errno. Only a folder of root's is root's to update.
+fn write_error(e: std::io::Error, path: &Path, exe: &Path, fs: &dyn Fs, me: u32) -> String {
     if e.kind() != std::io::ErrorKind::PermissionDenied {
         return format!("{}: {e}", path.display());
     }
-    let dir = exe.parent().unwrap_or(exe).display();
+    let folder = exe.parent().unwrap_or(exe);
+    let dir = folder.display();
+    let head = format!(
+        "{} cannot be replaced by this {} ({dir} is not writable here)",
+        exe.display(),
+        if cfg!(windows) { "account" } else { "user" }
+    );
     if cfg!(windows) {
-        format!(
-            "{} cannot be replaced by this account ({dir} is not writable here): run `update` as the account that installed it, or in an elevated PowerShell",
-            exe.display()
-        )
-    } else {
-        format!(
-            "{} cannot be replaced by this user ({dir} is not writable here): it was installed by root, as `setup` and `install --system` do, so root updates it: sudo pithagoras-sync update",
-            exe.display()
-        )
+        return format!(
+            "{head}: run `update` as the account that installed it, or in an elevated PowerShell"
+        );
+    }
+    match fs.lstat(folder).ok().flatten().map(|n| n.uid) {
+        Some(0) => format!(
+            "{head}: it was installed by root, as `setup` and `install --system` do, so root updates it: sudo pithagoras-sync update"
+        ),
+        Some(uid) if uid == me => {
+            format!("{head}: the folder is this user's own, so make it writable: chmod u+w {dir}")
+        }
+        Some(uid) => {
+            let who = fs
+                .user_name(uid)
+                .map_or(format!("uid {uid}"), |n| format!("user {n} ({uid})"));
+            format!("{head}: it belongs to {who}, so run `update` as that user")
+        }
+        None => head,
     }
 }
 
@@ -1512,6 +1538,41 @@ mod tests {
         // A client newer than the file is not restarted onto the older file.
         assert!(!is_older("0.3.0", "0.2.0"));
         assert!(!is_older("dev", "0.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_not_writable_names_who_updates_it() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let tmp = Path::new("/home/svc/bin/.pithagoras-sync.update.1");
+        let fs = layout(&[("/home/svc/bin", 1000, 1000, 0o40555, None)]);
+        // This user's own read-only folder: no word of root or sudo.
+        let mine = Path::new("/home/svc/bin/pithagoras-sync");
+        let e = write_error(denied(), tmp, mine, &fs, 1000);
+        assert!(
+            e.ends_with(
+                "the folder is this user's own, so make it writable: chmod u+w /home/svc/bin"
+            ),
+            "{e}"
+        );
+        assert!(!e.contains("root") && !e.contains("sudo"), "{e}");
+        // Another user's folder: that user updates it.
+        let e = write_error(denied(), tmp, mine, &fs, 1001);
+        assert!(
+            e.ends_with("it belongs to user svc (1000), so run `update` as that user"),
+            "{e}"
+        );
+        assert!(!e.contains("sudo"), "{e}");
+        // Root's folder, as `setup` makes it: root updates it.
+        let bin = Path::new("/usr/local/bin/pithagoras-sync");
+        let e = write_error(denied(), tmp, bin, &fs, 1000);
+        assert!(
+            e.ends_with("so root updates it: sudo pithagoras-sync update"),
+            "{e}"
+        );
+        // Anything other than a refusal is said as it is.
+        let e = write_error(std::io::ErrorKind::StorageFull.into(), tmp, bin, &fs, 1000);
+        assert!(!e.contains("cannot be replaced"), "{e}");
     }
 
     #[test]
