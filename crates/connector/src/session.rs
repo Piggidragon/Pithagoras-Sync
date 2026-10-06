@@ -616,6 +616,14 @@ async fn exec_start(
 ) {
     let started = async {
         let p: ExecStartParams = parse(params)?;
+        if p.command.len() > MAX_COMMAND {
+            return Err(RpcError::new(
+                code::TOO_LARGE,
+                format!(
+                    "commands are limited to {MAX_COMMAND} bytes; run a longer script from a file"
+                ),
+            ));
+        }
         let allowed = authorize(
             shared,
             id,

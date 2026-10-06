@@ -191,6 +191,43 @@ impl Snapshot {
     }
 }
 
+/// What the deny and always-ask command lists say about a command.
+#[derive(Default)]
+struct CommandLists {
+    refusal: Option<String>,
+    always_ask: Option<String>,
+}
+
+impl CommandLists {
+    /// Checked on the blocking pool: a long command against a rule that is tried
+    /// at every word takes up to a second per list, which on the runtime's few
+    /// worker threads would hold up every other call and `panic`.
+    async fn check(snap: &Arc<Snapshot>, command: &str) -> CommandLists {
+        let (snap, command) = (snap.clone(), command.to_string());
+        tokio::task::spawn_blocking(move || {
+            let Ok(rules) = &snap.rules else {
+                return CommandLists::default();
+            };
+            let refusal = rules.command_refusal(&command);
+            let always_ask = match refusal {
+                Some(_) => None,
+                None => rules.always_ask(&command),
+            };
+            CommandLists {
+                refusal,
+                always_ask,
+            }
+        })
+        .await
+        .unwrap_or_else(|e| CommandLists {
+            refusal: Some(format!(
+                "checking the command against the rules failed: {e}"
+            )),
+            always_ask: None,
+        })
+    }
+}
+
 enum Verdict {
     Allow(Permit),
     Prompt {
@@ -471,7 +508,20 @@ impl Engine {
         if call.portal_tainted {
             self.mark_tainted(call.chat);
         }
-        let verdict = match self.decide(call, &req) {
+        // One snapshot for the command lists and the rest of the decision, so a
+        // reload in between cannot leave a new rule unchecked.
+        let snap = self.snapshot();
+        let lists = match &req {
+            Request::Exec { command, .. } => {
+                let lists = CommandLists::check(&snap, command).await;
+                if self.is_paused() {
+                    return Err(Refusal::Denied(deny(&cwd, "the device is paused".into())));
+                }
+                lists
+            }
+            _ => CommandLists::default(),
+        };
+        let verdict = match self.decide(&snap, call, &req, lists) {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -611,8 +661,13 @@ impl Engine {
         })
     }
 
-    fn decide(&self, call: &Call<'_>, req: &Request<'_>) -> Result<Verdict, PathError> {
-        let snap = self.snapshot();
+    fn decide(
+        &self,
+        snap: &Snapshot,
+        call: &Call<'_>,
+        req: &Request<'_>,
+        lists: CommandLists,
+    ) -> Result<Verdict, PathError> {
         let policy = &snap.policy;
         let rules = match &snap.rules {
             Ok(r) => r,
@@ -736,7 +791,7 @@ impl Engine {
                         r.rights
                     )));
                 }
-                if let Some(why) = rules.command_refusal(command) {
+                if let Some(why) = lists.refusal {
                     return Ok(Verdict::Deny(why));
                 }
                 let never_ask = rules.never_ask(command);
@@ -819,7 +874,7 @@ impl Engine {
                 if !never_ask {
                     reasons.extend(asks);
                 }
-                if let Some(why) = rules.always_ask(command) {
+                if let Some(why) = lists.always_ask {
                     reasons.push(why);
                 }
                 if taint_prompts {

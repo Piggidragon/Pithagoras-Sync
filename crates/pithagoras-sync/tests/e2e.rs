@@ -337,6 +337,63 @@ async fn pair_run_exec_panic_unlock() {
     assert!(!log.contains('\x1b'), "{log}");
 }
 
+/// A deny rule that is slow on a long one-line command takes up to a second per
+/// command to check. Those checks run beside the client's two worker threads, so
+/// `status` and `panic` answer while the most commands the device starts at once
+/// are being checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_answers_while_long_commands_are_checked() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE4321".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE4321"), "--name", "testbox"])
+        .await;
+    env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
+        .await;
+    env.ok(&["mode", "folders"]).await;
+    env.ok(&[
+        "config",
+        "add",
+        "policy.commands.deny",
+        r#"{"regex": "^.*(\\b\\w+\\b\\s*){10}shutdown"}"#,
+    ])
+    .await;
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.expect("the client connects");
+    // 6 KB in 2000 two-byte words: a few seconds for this rule without a limit.
+    let cmd = format!("echo{}", " ä".repeat(2000));
+    let mut calls = Vec::new();
+    for stream in 1..=16 {
+        calls.push(
+            dl.start_call(
+                "exec.start",
+                json!({"stream": stream, "command": cmd, "cwd": env.p("home/proj"), "ctx": {"chat": "c1"}}),
+            )
+            .await,
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    let status_took = started.elapsed();
+    assert_eq!(status["link"]["state"], "connected");
+    env.ok(&["panic"]).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(4),
+        "status took {status_took:?}, status and panic {took:?}"
+    );
+    assert_eq!(dl.closed(WAIT).await.unwrap().0, 1000);
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["paused"], true);
+    drop(calls);
+    drop(dl);
+    stop(daemon).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_the_client_runs_cannot_change_its_policy() {
     let env = Env::new();

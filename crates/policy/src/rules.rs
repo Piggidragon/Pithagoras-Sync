@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -456,9 +457,9 @@ impl CmdMatch {
     }
 
     /// Whether a match on a part from a later word is also a match on the part
-    /// from its first word: a regex without `^` or `\A` (it is searched, and a
-    /// later piece is the end of the first one), and a glob that starts with one
-    /// `*` (it takes any start).
+    /// from its first word: a regex that does not anchor at the start (it is
+    /// searched, and a later piece is the end of the first one), and a glob that
+    /// starts with one `*` (it takes any start).
     /// Such a rule needs one try per part, not one per word.
     fn found_from_the_head(&self) -> bool {
         match self {
@@ -468,7 +469,7 @@ impl CmdMatch {
                 let g = g.glob().glob();
                 g.starts_with('*') && !g.starts_with("**")
             }
-            CmdMatch::Regex(r) => !r.as_str().contains('^') && !r.as_str().contains("\\A"),
+            CmdMatch::Regex(r) => !anchors_at_start(r.as_str()),
         }
     }
 
@@ -480,6 +481,62 @@ impl CmdMatch {
             CmdMatch::Regex(r) => r.is_match(cmd),
         }
     }
+}
+
+/// Whether a regex may anchor at the start of the text: a `^` or `\A` outside a
+/// character class. A `^` that negates a class (`[^#]`) or is escaped (`\^`)
+/// does not. Any doubt counts as anchored, which only costs time: such a rule is
+/// tried at every word. Verbose mode (`x`) is a doubt, since a `#` comment there
+/// may hold an unmatched `[`.
+fn anchors_at_start(re: &str) -> bool {
+    let b = re.as_bytes();
+    if b.windows(2).enumerate().any(|(i, w)| {
+        w == b"(?"
+            && b[i + 2..]
+                .iter()
+                .take_while(|c| !matches!(c, b')' | b':'))
+                .any(|&c| c == b'x')
+    }) {
+        return true;
+    }
+    // How deep in (nested) classes; right after a class's `[` a `^` negates, and
+    // right after that `[` or `[^` a `]` is a literal.
+    let (mut depth, mut opened, mut negated) = (0usize, false, false);
+    let mut i = 0;
+    while i < b.len() {
+        let (after_open, after_caret) = (opened, negated);
+        (opened, negated) = (false, false);
+        match b[i] {
+            b'\\' => {
+                if depth == 0 && b.get(i + 1) == Some(&b'A') {
+                    return true;
+                }
+                i += 1;
+            }
+            b'[' if depth > 0 && ascii_class(&b[i..]).is_some() => {
+                i += ascii_class(&b[i..]).unwrap_or(0);
+            }
+            b'[' => {
+                depth += 1;
+                opened = true;
+            }
+            b'^' if after_open => negated = true,
+            b']' if depth > 0 && !after_open && !after_caret => depth -= 1,
+            b'^' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth != 0
+}
+
+/// The length less one of an ASCII class (`[:alpha:]`, `[:^digit:]`) at the
+/// start of `b`, as a class inside a class reads it.
+fn ascii_class(b: &[u8]) -> Option<usize> {
+    let rest = b.strip_prefix(b"[:")?;
+    let rest = rest.strip_prefix(b"^").unwrap_or(rest);
+    let name = rest.iter().take_while(|c| c.is_ascii_lowercase()).count();
+    (name > 0 && rest[name..].starts_with(b":]")).then(|| b.len() - rest.len() + name + 1)
 }
 
 /// Whitespace runs to single spaces, trimmed.
@@ -496,9 +553,30 @@ pub fn simple_command(cmd: &str) -> bool {
 
 /// Most bytes one command's check against the deny or the always-ask rules may
 /// scan for rules that must be tried at every word (a glob that does not start
-/// with `*`, a regex with `^` or `\A`): such a rule costs the command's length
-/// once per word. Past it the command counts as matching (fail closed).
-const MAX_RULE_WORK: usize = 256 << 20;
+/// with `*`, a regex anchored at the start): such a rule costs the command's
+/// length once per word. Past it the command counts as matching (fail closed).
+const MAX_RULE_WORK: usize = 16 << 20;
+
+/// Longest one command's check against the deny or the always-ask rules may
+/// take. What a byte costs depends on the rule (a regex that scans each piece to
+/// its end with many states costs microseconds), so the bytes alone do not bound
+/// the time. Past it the command counts as matching (fail closed).
+const MAX_RULE_TIME: Duration = Duration::from_secs(1);
+
+/// What is left for checking one command against one list of rules.
+struct Budget {
+    work: usize,
+    until: Instant,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget {
+            work: MAX_RULE_WORK,
+            until: Instant::now() + MAX_RULE_TIME,
+        }
+    }
+}
 
 /// The pieces of a command a deny or always-ask rule is checked against: the whole
 /// command, and each part between separators from every word on, so that
@@ -560,19 +638,27 @@ impl Pieces {
     }
 
     /// Whether `m` matches a piece; `None` when finding out would scan more than
-    /// what is left of `budget`.
-    fn matched(&self, m: &CmdMatch, budget: &mut usize) -> Option<bool> {
-        match m {
+    /// what is left of `budget`, or take longer.
+    fn matched(&self, m: &CmdMatch, budget: &mut Budget) -> Option<bool> {
+        let pieces: Box<dyn Iterator<Item = &str>> = match m {
             // A comparison or a prefix check costs at most the rule's length per
             // piece (an exact match compares lengths first).
-            CmdMatch::Exact(_) | CmdMatch::Prefix(_) => Some(self.all().any(|p| m.matches(p))),
-            _ if m.found_from_the_head() => Some(self.heads().any(|p| m.matches(p))),
+            CmdMatch::Exact(_) | CmdMatch::Prefix(_) => Box::new(self.all()),
+            _ if m.found_from_the_head() => Box::new(self.heads()),
             _ => {
-                let work = self.work();
-                *budget = budget.checked_sub(work)?;
-                Some(self.all().any(|p| m.matches(p)))
+                budget.work = budget.work.checked_sub(self.work())?;
+                Box::new(self.all())
+            }
+        };
+        for p in pieces {
+            if Instant::now() >= budget.until {
+                return None;
+            }
+            if m.matches(p) {
+                return Some(true);
             }
         }
+        Some(false)
     }
 }
 
@@ -669,7 +755,7 @@ impl Compiled {
     pub fn command_refusal(&self, cmd: &str) -> Option<String> {
         if !self.deny_cmd.is_empty() {
             let ps = Pieces::new(cmd);
-            let mut budget = MAX_RULE_WORK;
+            let mut budget = Budget::new();
             for (r, m) in &self.deny_cmd {
                 match ps.matched(m, &mut budget) {
                     Some(true) => return Some(format!("the command matches the deny rule {r}")),
@@ -711,7 +797,7 @@ impl Compiled {
             return None;
         }
         let ps = Pieces::new(cmd);
-        let mut budget = MAX_RULE_WORK;
+        let mut budget = Budget::new();
         for (r, m) in &self.always_ask {
             match ps.matched(m, &mut budget) {
                 Some(true) => return Some(format!("the command matches the always-ask rule {r}")),
@@ -813,6 +899,10 @@ mod tests {
             rule("regex", r"^rm\s"),
             rule("regex", r"\Arm\s"),
             rule("regex", r"[^a]rm"),
+            rule("regex", r"[^#]*\brm\b"),
+            rule("regex", r"[]^]?rm\s"),
+            rule("regex", r"[[:^space:]]rm"),
+            rule("regex", r"\^?rm\s"),
             rule("glob", "*shutdown*"),
             rule("glob", "*.ssh/*"),
             rule("glob", "rm *"),
@@ -838,7 +928,7 @@ mod tests {
             let m = CmdMatch::new(r).unwrap();
             for cmd in cmds {
                 let before = suffix_strings(cmd).iter().any(|p| m.matches(p));
-                let mut budget = MAX_RULE_WORK;
+                let mut budget = Budget::new();
                 assert_eq!(
                     Pieces::new(cmd).matched(&m, &mut budget),
                     Some(before),
@@ -900,6 +990,120 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_caret_anchors_a_regex_only_outside_a_class() {
+        for re in [
+            r"\brm\b",
+            r"[^#]*\brm\b",
+            r"[^a]rm",
+            r"\^rm",
+            r"[]^]rm",
+            r"[^]^]rm",
+            r"[\]^]rm",
+            r"[[:^space:]^]rm",
+            r"[a[^b]^]rm",
+            r"\\Arm",
+        ] {
+            assert!(!anchors_at_start(re), "{re}");
+        }
+        for re in [
+            r"^rm",
+            r"\Arm",
+            r"(?m)^rm",
+            r"x|^rm",
+            r"[^#]^rm",
+            r"[^^]^rm]",
+            r"[]]^rm",
+            r"[[:a]]^rm:]",
+            r"\\^rm",
+            // A comment in verbose mode could hide a `[`: counted as anchored.
+            "(?x)rm # [\n^rm",
+            "(?ix:rm)",
+        ] {
+            assert!(anchors_at_start(re), "{re}");
+        }
+        assert!(
+            CmdMatch::new(&rule("regex", r"[^#]*\brm\b"))
+                .unwrap()
+                .found_from_the_head()
+        );
+    }
+
+    /// One line of `words` words: each a two-byte letter, so a regex with `\b`
+    /// cannot take the fast ASCII path.
+    fn one_line(words: usize) -> String {
+        let mut cmd = String::from("echo");
+        for _ in 0..words {
+            cmd.push_str(" ä");
+        }
+        cmd
+    }
+
+    #[test]
+    fn a_rule_with_a_negated_class_is_checked_from_the_head_of_a_long_command() {
+        // 6000 words: tried at every word, the rule would scan 50 MB.
+        let cmd = one_line(6000);
+        let c = compiled(Commands {
+            deny: vec![rule("regex", r"[^#]*\bshutdown\b")],
+            always_ask: vec![rule("regex", r"[^#]*\bcurl\b")],
+            ..Default::default()
+        });
+        assert_eq!(c.command_refusal(&cmd), None);
+        assert_eq!(c.always_ask(&cmd), None);
+        let tail = format!("{cmd}; sudo shutdown now");
+        assert!(
+            c.command_refusal(&tail)
+                .unwrap()
+                .contains("matches the deny rule")
+        );
+    }
+
+    #[test]
+    fn a_rule_tried_at_every_word_has_a_small_budget() {
+        // 50 MB to scan: a fifth of the old budget, but past the one now.
+        let cmd = one_line(6000);
+        let c = compiled(Commands {
+            deny: vec![rule("regex", "^rm ")],
+            always_ask: vec![rule("glob", "git push*")],
+            ..Default::default()
+        });
+        assert!(
+            c.command_refusal(&cmd)
+                .unwrap()
+                .contains("too long to check")
+        );
+        assert!(c.always_ask(&cmd).unwrap().contains("too long to check"));
+    }
+
+    #[test]
+    fn a_slow_rule_is_cut_off_in_time() {
+        // Within the budget in bytes (6 MB), but each byte costs this rule a lot:
+        // some seconds without a limit in time.
+        let cmd = one_line(2000);
+        let slow = rule("regex", r"^.*(\b\w+\b\s*){10}shutdown");
+        let c = compiled(Commands {
+            deny: vec![slow.clone()],
+            always_ask: vec![slow],
+            ..Default::default()
+        });
+        for check in [Compiled::command_refusal, Compiled::always_ask] {
+            let started = Instant::now();
+            assert!(check(&c, &cmd).unwrap().contains("too long to check"));
+            assert!(
+                started.elapsed() < MAX_RULE_TIME * 3,
+                "{:?}",
+                started.elapsed()
+            );
+        }
+        // Out of time before a piece is tried: no answer.
+        let m = CmdMatch::new(&rule("regex", "^rm")).unwrap();
+        let mut spent = Budget {
+            work: MAX_RULE_WORK,
+            until: Instant::now(),
+        };
+        assert_eq!(Pieces::new("ls; rm x").matched(&m, &mut spent), None);
     }
 
     #[test]

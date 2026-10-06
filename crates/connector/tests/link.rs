@@ -475,6 +475,26 @@ async fn the_portal_cannot_widen_mode_folders_or_protections() {
     r.stop().await;
 }
 
+/// A command longer than the shell could take is refused before the policy sees
+/// it, so its rules never scan it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_over_the_limit_is_too_large() {
+    let fx = Fx::new();
+    let policy = fx.folders(&[("home/proj", Access::Rw)]);
+    let (_mock, _dev, r, dl) = connected(&fx, policy, Profile::Headless, headless()).await;
+    let start = |stream: u32, command: String| json!({"stream": stream, "command": command, "cwd": fx.p("home/proj"), "ctx": ctx()});
+    let long = format!("echo {}", "a".repeat(sync_proto::methods::MAX_COMMAND - 4));
+    let e = dl.call("exec.start", start(1, long.clone())).await;
+    assert_eq!(err_code(e), code::TOO_LARGE);
+    assert!(!fx.audit().contains("echo aaaa"), "{}", fx.audit());
+    // At the limit it goes on to the policy (which asks here, and nobody answers).
+    let e = dl
+        .call("exec.start", start(2, long[..long.len() - 1].to_string()))
+        .await;
+    assert_eq!(err_code(e), code::DENIED);
+    r.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn malformed_frames_get_errors_and_change_nothing() {
     let fx = Fx::new();

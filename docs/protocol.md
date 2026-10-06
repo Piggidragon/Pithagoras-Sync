@@ -288,6 +288,7 @@ Params:
 
 - There is no `env`: the device runs commands in its own scrubbed login environment (`PATH`, `HOME`, `LANG` and a short list, plus what the owner passes through; never `PORTAL_*`). An `env` field is refused as unknown.
 - `timeout_ms` (optional) is capped by the device (4 hours by default).
+- `command` has at most 128 KiB (about the most Linux passes to a shell as one argument); a longer one is `TOO_LARGE` before the policy sees it.
 - The answer is `{}` once the command started (or an error, and nothing else follows). Then come `ExecOutput` frames on `stream` (stdout and stderr merged, `seq` from 0), and last the `exec.exit` notification (section 9).
 - Output beyond the device's cap (16 MiB by default) is dropped; `exec.exit` says `truncated`. Output of background processes after the shell's exit is not forwarded.
 - Each command runs in its own process scope. On Linux a small shim between client and shell is a child subreaper, so everything the command starts stays below it; when the client runs in a systemd unit with `Delegate=yes` the command also gets its own cgroup. On Windows the scope is a Job Object, kept while processes are left in it. Timeout, `exec.signal`, pause and the end of the connection kill the whole scope, `setsid` and `nohup` children included. A process that another service starts for the command (`systemd-run --user`, a Windows scheduled task or WMI) is outside the scope.
@@ -479,6 +480,7 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | `fs.grep` and `fs.find` running at once | 4 (more wait) |
 | grep pattern, grep or find glob | 4096 bytes; compiled pattern and search cache 8 MiB each |
 | Read or write size | 64 MiB |
+| `exec.start` command | 128 KiB |
 | Upload stall | 60 s |
 | Running commands | 16 (config `exec.max_running`) |
 | Command timeout | 4 h (config `exec.max_timeout_secs`) |

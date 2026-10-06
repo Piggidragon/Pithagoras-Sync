@@ -176,6 +176,11 @@ pub struct FindParams {
     pub ctx: Ctx,
 }
 
+/// Longest command `exec.start` takes, in bytes: about the most Linux passes to
+/// the shell as one argument (`MAX_ARG_STRLEN`), and a bound on what the device's
+/// command rules have to scan.
+pub const MAX_COMMAND: usize = 128 * 1024;
+
 /// `exec.start`. There is deliberately no `env`: the device runs commands in its own
 /// scrubbed environment, and an `env` field is refused as unknown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
