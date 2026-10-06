@@ -120,7 +120,7 @@ impl Helper {
                                 "--hide-column=1",
                                 "--print-column=1",
                                 "--width=480",
-                                "--height=340",
+                                "--height=400",
                             ]
                             .map(String::from),
                         );

@@ -580,7 +580,13 @@ pub async fn pair_device(
     let paired = pair::pair(uri, &name).await?;
     let notes = token_store(dirs, &cfg)
         .save(&paired.token)
-        .await?
+        .await
+        .map_err(|e| {
+            format!(
+                "{e}. The portal paired the device {} already, but this computer could not keep its token: remove that device in the portal (Settings, Devices) and pair again with a new code",
+                sync_policy::approve::visible(&paired.portal.device_id)
+            )
+        })?
         .into_iter()
         .collect();
     cfg.portal = Some(paired.portal.clone());

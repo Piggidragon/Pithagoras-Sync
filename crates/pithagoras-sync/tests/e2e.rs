@@ -19,6 +19,8 @@ struct Env {
     _t: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
+    /// More variables every command gets (a private session bus).
+    vars: Vec<(String, String)>,
 }
 
 impl Env {
@@ -30,7 +32,12 @@ impl Env {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         std::fs::write(home.join(".ssh/id_ed25519"), "secret").unwrap();
-        Env { _t: t, root, home }
+        Env {
+            _t: t,
+            root,
+            home,
+            vars: Vec::new(),
+        }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -46,6 +53,7 @@ impl Env {
             .env("USER", "tester")
             // A secret in the client's own environment must not reach commands.
             .env("PORTAL_SECRET", "must-not-leak")
+            .envs(self.vars.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .kill_on_drop(true);
         c
@@ -2217,4 +2225,113 @@ async fn a_detached_client_writes_its_log_to_a_file() {
     assert!(!log.contains('\x1b'), "{log}");
     let stderr = std::fs::read_to_string(env.root.join("stderr.txt")).unwrap();
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// The token and the elevation password in the keyring: the fake Secret
+/// Service of the testkit on a private bus stands in for the desktop's, so no
+/// real keyring is touched. The token moves with `token_storage` both ways
+/// without being lost, a cancelled unlock prompt is an error and never a
+/// fallback, and `unpair` and `sudo clear` take the entries out again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_and_the_password_in_the_keyring() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into(), "CODE8888".into()],
+    })
+    .await;
+    let in_keyring = |name: &str| {
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .find(|(_, a, _)| a.get("name").map(String::as_str) == Some(name))
+            .map(|(.., v)| String::from_utf8(v.clone()).unwrap())
+    };
+    let token_file = env.home.join(".config/pithagoras-sync/token");
+
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "kbox"])
+        .await;
+    let token = in_keyring("token").expect("the token is in the keyring");
+    assert!(!token_file.exists());
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains("token_storage = \"keyring\""), "{cfg}");
+    assert!(!cfg.contains(&token));
+    let daemon = env.start();
+    mock.next_device(WAIT)
+        .await
+        .expect("connects with the keyring's token");
+    let out = env.ok(&["status"]).await;
+    assert!(out.contains("Token:     kept in the keyring"), "{out}");
+
+    // To the file and back: the token goes along, the old place loses it.
+    env.ok(&["config", "set", "token_storage", "file"]).await;
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), token);
+    assert_eq!(in_keyring("token"), None);
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    assert_eq!(in_keyring("token").as_deref(), Some(token.as_str()));
+    assert!(!token_file.exists());
+
+    // Locked, and the owner cancels the unlock prompt: pairing again fails and
+    // leaves the old token where it was; nothing lands in the file instead.
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+    }
+    let out = env
+        .cmd(&["pair", &mock.pair_uri("CODE8888")])
+        .output()
+        .await
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("cancelled") && err.contains("keyring"),
+        "{err}"
+    );
+    assert!(!token_file.exists());
+    {
+        let mut s = state.lock().unwrap();
+        s.answer = Some(true);
+    }
+
+    // The password: kept in the keyring, never in the file or the client's log.
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(in_keyring("elevation").as_deref(), Some(PW));
+    assert!(
+        !env.home
+            .join(".config/pithagoras-sync/elevation.secret")
+            .exists()
+    );
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("set (kept in keyring)"), "{}", r.out);
+    env.ok(&["sudo", "clear"]).await;
+    assert_eq!(in_keyring("elevation"), None);
+
+    env.ok(&["unpair"]).await;
+    assert_eq!(in_keyring("token"), None);
+    stop(daemon).await;
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    assert!(!log.contains(PW) && !log.contains(&token), "{log}");
 }
