@@ -174,7 +174,12 @@ pub struct PairUri {
 
 impl PairUri {
     pub fn parse(s: &str) -> Result<PairUri, String> {
-        let query = strip_prefix_ci(s.trim(), "pithagoras-sync://pair?")
+        // Windows hands a link from the browser or the shell over with an empty
+        // path made `/` (`pithagoras-sync://pair/?...`): that one form is taken
+        // too, no other path.
+        let s = s.trim();
+        let query = strip_prefix_ci(s, "pithagoras-sync://pair?")
+            .or_else(|| strip_prefix_ci(s, "pithagoras-sync://pair/?"))
             .ok_or("a pairing URI starts with pithagoras-sync://pair?")?;
         let (mut portal, mut code, mut spki) = (None, None, None);
         for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -306,12 +311,30 @@ mod tests {
                 .unwrap_err()
                 .contains("the path may hold only")
         );
+        // As Windows starts the handler for a link from Edge, Chrome, Firefox or
+        // `Start-Process` (ShellExecute): the empty path made `/`, the escapes
+        // kept, the scheme's case as written.
+        let link = "portal=http%3A%2F%2F127.0.0.1%3A18080&code=AB12CD34";
+        let plain = PairUri::parse(&format!("pithagoras-sync://pair?{link}")).unwrap();
+        for windows in [
+            format!("pithagoras-sync://pair/?{link}"),
+            format!("Pithagoras-Sync://pair/?{link}"),
+            format!(" pithagoras-sync://pair/?{link}\r\n"),
+        ] {
+            assert_eq!(PairUri::parse(&windows).unwrap(), plain, "{windows}");
+        }
         // Cut inside a character where the prefix ends: refused, not a panic.
         assert!(PairUri::parse(&format!("{}é", "a".repeat(22))).is_err());
         assert_eq!(strip_prefix_ci("aé", "ab"), None);
         assert_eq!(strip_prefix_ci("HTTPS://x", "https://"), Some("x"));
         for bad in [
             "https://portal.example",
+            "pithagoras-sync://pair//?portal=https://x&code=AB",
+            "pithagoras-sync://pair/x?portal=https://x&code=AB",
+            "pithagoras-sync://pair/portal=https://x&code=AB",
+            "pithagoras-sync://pair/",
+            "pithagoras-sync://pair.example/?portal=https://x&code=AB",
+            "pithagoras-sync:pair?portal=https://x&code=AB",
             "pithagoras-sync://pair?code=AB",
             "pithagoras-sync://pair?portal=https://x",
             "pithagoras-sync://pair?portal=https://x&code=A B",
