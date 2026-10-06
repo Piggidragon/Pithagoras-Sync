@@ -1080,6 +1080,14 @@ pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
     sync_connector::url::strip_prefix_ci(arg, &scheme).map(|_| arg.to_string())
 }
 
+/// Whether SIGPIPE may end this command quietly when its output is cut off
+/// (`| head`), as it does command line tools. Never the client itself, nor the
+/// graphical flow: a start without a command is how a double click begins it,
+/// and it writes the password to a `sudo` that may have exited.
+pub fn dies_on_sigpipe(cmd: Option<&Cmd>) -> bool {
+    !matches!(cmd, None | Some(Cmd::Run { .. } | Cmd::Gui { .. }))
+}
+
 /// Whether a start without a command is a double click or the menu's: no
 /// terminal and a display to show windows on (the units `install` and `setup`
 /// write always name `run`). On Windows: a console window that Windows opened
@@ -1139,47 +1147,6 @@ async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
             _ => ExitCode::from(1),
         },
     )
-}
-
-/// What `status` says, as one text: the running client's, or the config's
-/// when none runs.
-pub async fn status_report(dirs: &Dirs) -> String {
-    use std::fmt::Write;
-    use sync_policy::approve::visible;
-    if let Ok(Some(r)) = control::send(&dirs.socket(), Request::Status).await
-        && let Some(s) = r.status
-    {
-        return status_text(&s);
-    }
-    let mut out = String::from("pithagoras-sync is not running.\n");
-    match DeviceConfig::load(&dirs.config_file()) {
-        Ok(cfg) => {
-            match &cfg.portal {
-                Some(p) => {
-                    let _ = writeln!(
-                        out,
-                        "Paired with {} as {} (token kept in the {}).",
-                        visible(&p.url),
-                        visible(&p.name),
-                        token_store(dirs, &cfg).describe()
-                    );
-                }
-                None => out.push_str("Not paired.\n"),
-            }
-            let _ = writeln!(
-                out,
-                "Mode: {}",
-                mode_text(
-                    cfg.policy.effective_mode(cfg.profile, now_ms()),
-                    cfg.policy.full.until_ms
-                )
-            );
-        }
-        Err(e) => {
-            let _ = writeln!(out, "{}", visible(&e));
-        }
-    }
-    out
 }
 
 pub async fn run(cli: Cli) -> Result<ExitCode, String> {
@@ -1791,7 +1758,7 @@ pub(crate) fn install_plan(
     let mut plan = install::user_plan(&home, exe, &info::user().0, linger);
     // In a graphical session: the menu entry and the handler of pairing links.
     if !headless {
-        let program = home.join(".local/bin/pithagoras-sync");
+        let program = install::user_program(&home);
         plan.extend(install::desktop_plan(&data_home(&home), &program)?);
     }
     Ok(plan)
@@ -2171,6 +2138,22 @@ mod tests {
     use crate::control::Status;
     use clap::{CommandFactory, Parser};
     use sync_connector::{LinkState, LinkStatus};
+
+    #[test]
+    fn only_the_short_commands_die_on_sigpipe() {
+        let cmd = |args: &[&str]| {
+            let argv: Vec<&str> = std::iter::once("pithagoras-sync")
+                .chain(args.iter().copied())
+                .collect();
+            Cli::try_parse_from(argv).unwrap().cmd
+        };
+        for args in [&[][..], &["gui"], &["run"]] {
+            assert!(!super::dies_on_sigpipe(cmd(args).as_ref()), "{args:?}");
+        }
+        for args in [&["status"][..], &["folder", "list"]] {
+            assert!(super::dies_on_sigpipe(cmd(args).as_ref()), "{args:?}");
+        }
+    }
 
     #[test]
     fn a_lone_argument_is_a_link_only_with_the_scheme() {

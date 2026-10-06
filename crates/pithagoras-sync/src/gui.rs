@@ -619,8 +619,8 @@ impl Host for RealHost {
         } else {
             Some(
                 sync_ops::info::home()
-                    .map(|h| h.join(".local/bin/pithagoras-sync").display().to_string())
-                    .unwrap_or_else(|| "~/.local/bin/pithagoras-sync".into()),
+                    .map(|h| crate::install::user_program(&h).display().to_string())
+                    .unwrap_or_else(|| format!("~/{}", crate::install::USER_PROGRAM)),
             )
         };
         (user, path)

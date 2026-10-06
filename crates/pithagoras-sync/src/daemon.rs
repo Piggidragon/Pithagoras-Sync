@@ -706,11 +706,18 @@ async fn supervise(
         let current = (cfg.portal.clone(), cfg.token.clone());
         let (stop, stop_rx) = watch::channel(false);
         let mut task = tokio::spawn(link::run(d.device.clone(), cfg, status.clone(), stop_rx));
+        // A reload since the link started whose token was not read again.
+        let mut unread = false;
         loop {
             tokio::select! {
                 end = &mut task => {
                     if let Ok(link::LinkEnd::Rejected(why)) = end {
                         warn!("{why}");
+                    }
+                    // A pairing that kept the device id may have brought a
+                    // new token: it is read now.
+                    if unread {
+                        break;
                     }
                     // Down until the owner pairs again (or the client stops).
                     tokio::select! {
@@ -719,25 +726,25 @@ async fn supervise(
                     }
                 }
                 _ = relink.recv() => {
-                    let now = tokio::select! {
-                        c = d.link_config() => c,
-                        _ = until(&mut shutdown) => {
-                            stop.send_replace(true);
-                            let _ = (&mut task).await;
-                            return;
+                    let cfg = d.store.config();
+                    let tokens = d.tokens(&cfg);
+                    let same = if cfg.portal.as_ref() != Some(&current.0) {
+                        false
+                    } else if tokens.reads_keyring() {
+                        // Every read may ask to unlock the keyring, and a
+                        // reload comes with each policy change. A new pairing
+                        // changes the config (its device id); one that did not
+                        // is read when this link ends.
+                        unread = true;
+                        true
+                    } else {
+                        match tokens.load().await {
+                            Ok(t) => t == current.1,
+                            Err(e) => {
+                                warn!("the token could not be read again ({e}); the link stays as it is");
+                                true
+                            }
                         }
-                    };
-                    let same = match now {
-                        Ok(Some(c)) => (c.portal.clone(), c.token.clone()) == current,
-                        Ok(None) => false,
-                        // A keyring that cannot be read now (locked, its prompt
-                        // cancelled, gone for a moment) says nothing about the
-                        // pairing: a new pairing changes the config as well.
-                        Err(e) if current_portal_kept(&d, &current.0) => {
-                            warn!("the token could not be read again ({e}); the link stays as it is");
-                            true
-                        }
-                        Err(_) => false,
                     };
                     if !same {
                         stop.send_replace(true);
@@ -753,11 +760,6 @@ async fn supervise(
             }
         }
     }
-}
-
-/// Whether the config still names the portal the link runs for.
-fn current_portal_kept(d: &Daemon, portal: &sync_policy::config::PortalConfig) -> bool {
-    d.store.config().portal.as_ref() == Some(portal)
 }
 
 async fn until(rx: &mut watch::Receiver<bool>) {

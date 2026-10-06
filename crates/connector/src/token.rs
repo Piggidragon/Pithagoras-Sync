@@ -102,16 +102,46 @@ impl TokenStore {
         }
     }
 
-    /// Where the token is now, wherever this store may have put it; `None`
-    /// when there is none.
+    /// Whether `load` reads the keyring, which may ask to be unlocked.
+    pub fn reads_keyring(&self) -> bool {
+        match self.place {
+            Place::File => false,
+            Place::Keyring { explicit: false } => !self.file.exists(),
+            Place::Keyring { explicit: true } => true,
+        }
+    }
+
+    /// The token `load` would use; `None` when there is none. A file next to
+    /// a keyring the owner chose is not it: `load` never reads that file.
     async fn current(&self) -> Result<Option<String>, String> {
-        if self.file.exists() {
-            return load_token(&self.file).map(Some);
+        if self.reads_keyring() {
+            self.read_keyring().await
+        } else if self.file.exists() {
+            load_token(&self.file).map(Some)
+        } else {
+            Ok(None)
         }
-        if self.uses_keyring() {
-            return self.read_keyring().await;
+    }
+
+    /// Removes a keyring entry this store does not use (one an earlier
+    /// `token_storage` left). Only asks whether there is one, which needs no
+    /// unlocking, and leaves a keyring that cannot answer alone.
+    async fn remove_leftover(&self) -> Result<(), String> {
+        match self.keyring.has(KEYRING_NAME).await {
+            Ok(true) => self.remove_entry().await,
+            _ => Ok(()),
         }
-        Ok(None)
+    }
+
+    /// Deletes the keyring entry. A failed delete is an error unless the
+    /// keyring then says there is no entry.
+    async fn remove_entry(&self) -> Result<(), String> {
+        match self.keyring.delete(KEYRING_NAME).await {
+            Err(e) if self.keyring.has(KEYRING_NAME).await != Ok(false) => {
+                Err(format!("cannot remove the token from the keyring: {e}"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Writes the token to this store's place. `Ok(true)` when it is in the
@@ -161,20 +191,18 @@ impl TokenStore {
         Ok(note)
     }
 
-    /// Forgets the token (`unpair`, `uninstall --purge`): the file, and the
-    /// keyring entry where this store uses the keyring. A store on the file
-    /// leaves the keyring alone, so it never asks to unlock one. Where the
-    /// keyring is only the default (Windows), one that fails cannot hold the
-    /// token either, since saving there fell back to the file: that is no error.
+    /// Forgets the token (`unpair`, `uninstall --purge`): the file and the
+    /// keyring entry. A store on the file removes an entry an earlier setting
+    /// left, and only asks whether there is one, so it never prompts to unlock
+    /// a keyring. A delete that fails is an error, for the Windows default
+    /// too, unless the keyring then says it holds no entry.
     pub async fn delete(&self) -> Result<(), String> {
         self.remove_file()?;
-        if let Place::Keyring { explicit } = self.place
-            && let Err(e) = self.keyring.delete(KEYRING_NAME).await
-            && explicit
-        {
-            return Err(format!("cannot remove the token from the keyring: {e}"));
+        if self.uses_keyring() {
+            self.remove_entry().await
+        } else {
+            self.remove_leftover().await
         }
-        Ok(())
     }
 
     /// Moves the token from this store to `to` (`config set token_storage`): it
@@ -201,12 +229,19 @@ impl TokenStore {
                     "the token is in the keyring now, but its old file stays: {e}"
                 ));
             }
-        } else if self.uses_keyring()
-            && let Err(e) = self.keyring.delete(KEYRING_NAME).await
-        {
-            notes.push(format!(
-                "the token is in the file now, but its keyring entry stays (run `config set token_storage file` again to remove it): {e}"
-            ));
+        } else {
+            // From the keyring, or a leftover of an earlier switch: running
+            // `config set token_storage file` again comes here as well.
+            let gone = if self.uses_keyring() {
+                self.remove_entry().await
+            } else {
+                to.remove_leftover().await
+            };
+            if let Err(e) = gone {
+                notes.push(format!(
+                    "the token is in the file now, but its keyring entry stays (run `config set token_storage file` or `unpair` again to remove it): {e}"
+                ));
+            }
         }
         Ok(notes)
     }
@@ -389,6 +424,29 @@ mod tests {
             "{notes:?}"
         );
         assert_eq!(file.load().await.unwrap(), T1);
+        // What the note says to run removes the entry once the keyring lets it.
+        *ks.fail.lock().unwrap() = None;
+        assert!(in_keyring(&ks).is_some());
+        let notes = file.switch(&file, || Ok(())).await.unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(in_keyring(&ks), None);
+        assert_eq!(file.load().await.unwrap(), T1);
+    }
+
+    /// A token file next to a keyring the owner chose is never used, so a
+    /// switch away moves the keyring's token, not that file's.
+    #[tokio::test]
+    async fn a_switch_moves_the_token_in_use_not_a_stale_file() {
+        let t = tempfile::tempdir().unwrap();
+        let ks = Arc::new(FakeStore::default());
+        let file = store(t.path(), Some(TokenStorage::File), &ks, false);
+        let keyring = store(t.path(), Some(TokenStorage::Keyring), &ks, false);
+        keyring.save(T1).await.unwrap();
+        save_token(&t.path().join("token"), T2).unwrap();
+        assert_eq!(keyring.load().await.unwrap(), T1);
+        keyring.switch(&file, || Ok(())).await.unwrap();
+        assert_eq!(file.load().await.unwrap(), T1);
+        assert_eq!(in_keyring(&ks), None);
     }
 
     #[tokio::test]
@@ -399,21 +457,24 @@ mod tests {
         s.save(T1).await.unwrap();
         s.delete().await.unwrap();
         assert_eq!(in_keyring(&ks), None);
-        // A file store leaves a keyring it does not use alone.
+        // A file store removes an entry an earlier setting left.
         ks.entries
             .lock()
             .unwrap()
             .insert(KEYRING_NAME.into(), Secret::new(T2.into()));
         store(t.path(), None, &ks, false).delete().await.unwrap();
-        assert_eq!(in_keyring(&ks).as_deref(), Some(T2));
-        // A keyring that fails: an error where the owner chose it, nothing to
-        // remove where it is only the default (the token went to the file).
+        assert_eq!(in_keyring(&ks), None);
+        // A keyring that cannot answer: no error for a file store, which has
+        // nothing there it knows of; an error for the keyring, the Windows
+        // default too, since it may still hold the token.
         *ks.fail.lock().unwrap() = Some("no service".into());
-        let e = store(t.path(), Some(TokenStorage::Keyring), &ks, false)
-            .delete()
-            .await
-            .unwrap_err();
-        assert!(e.contains("no service"), "{e}");
-        store(t.path(), None, &ks, true).delete().await.unwrap();
+        store(t.path(), None, &ks, false).delete().await.unwrap();
+        for (choice, windows) in [(Some(TokenStorage::Keyring), false), (None, true)] {
+            let e = store(t.path(), choice, &ks, windows)
+                .delete()
+                .await
+                .unwrap_err();
+            assert!(e.contains("no service"), "{e}");
+        }
     }
 }

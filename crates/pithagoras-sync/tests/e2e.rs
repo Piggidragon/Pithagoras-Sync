@@ -2613,19 +2613,27 @@ async fn the_link_outlasts_a_late_or_locked_keyring() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    {
+    // A policy change reloads the client; it does not read the token again,
+    // so a locked keyring shows no prompt for it and the link stays.
+    let prompts = {
         let mut s = state.lock().unwrap();
         s.locked = true;
         s.answer = Some(false);
-    }
-    env.ok(&["mode", "ask"]).await;
+        s.prompts
+    };
     let log = env.root.join("daemon.log");
-    eventually("the reload could not read the token", || {
+    let reloads = || {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
-            .contains("the token could not be read again")
-    })
-    .await;
+            .matches("config reloaded")
+            .count()
+    };
+    let before = reloads();
+    env.ok(&["mode", "ask"]).await;
+    env.ok(&["mode", "full"]).await;
+    eventually("the client reloaded twice", || reloads() >= before + 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(state.lock().unwrap().prompts, prompts, "no unlock prompt");
     assert_eq!(detail().await.0, "connected");
     stop(daemon).await;
 }

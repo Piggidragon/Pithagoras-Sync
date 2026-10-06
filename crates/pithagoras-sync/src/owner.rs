@@ -48,15 +48,62 @@ const PASSWORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Checks the user's password with `su` as `confirm` does, for the windows:
 /// `su` runs on a pseudo-terminal of its own, and the password typed into the
 /// dialog is written to it once `su` switched echo off for its prompt. It is
-/// never in an argument or the environment. `Ok(false)`: `su` refused it.
+/// never in an argument or the environment. `Ok(false)`: `su` said the
+/// password is wrong; any other failure is an error that says what `su` said.
 #[cfg(target_os = "linux")]
 pub async fn check_password(pw: &Secret) -> Result<bool, String> {
     let user = account()?;
     let cmd = su_check(&user)?;
     let pw = pw.clone();
-    tokio::task::spawn_blocking(move || pty::answer(cmd, &pw, PASSWORD_WAIT))
+    tokio::task::spawn_blocking(move || check_with(cmd, &pw, PASSWORD_WAIT))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Runs the check `cmd` (`su`) and reads its answer. Only a program that asked
+/// for the password and exited 0 says yes: one that exits 0 without asking
+/// (root, `pam_rootok`, a PAM stack that trusts this user) has checked
+/// nothing, and that fails closed.
+#[cfg(target_os = "linux")]
+fn check_with(
+    cmd: std::process::Command,
+    pw: &Secret,
+    wait: std::time::Duration,
+) -> Result<bool, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let a = pty::answer(cmd, pw, wait)?;
+    // Its last line, as plain text; never anything that holds the password.
+    let said = String::from_utf8_lossy(&a.said)
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let said = if !pw.expose().is_empty() && said.contains(pw.expose()) {
+        String::new()
+    } else {
+        said
+    };
+    match (a.asked, a.success) {
+        (true, true) => Ok(true),
+        (false, true) => Err(format!(
+            "{program} let this account through without asking for its password, so the password cannot be checked here"
+        )),
+        // util-linux and shadow su, busybox su, BSD su (LC_ALL=C).
+        (true, false)
+            if ["Authentication failure", "incorrect password", "Sorry"]
+                .iter()
+                .any(|w| said.contains(w)) =>
+        {
+            Ok(false)
+        }
+        (_, false) if said.is_empty() => Err(format!(
+            "{program} could not check the password and did not say why"
+        )),
+        (_, false) => Err(format!("{program} could not check the password: {said}")),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -134,10 +181,24 @@ mod pty {
         Ok(())
     }
 
+    /// How a program on the terminal ended.
+    pub struct Answer {
+        /// Whether it switched echo off and got the password.
+        pub asked: bool,
+        /// Whether it exited 0.
+        pub success: bool,
+        /// The end of what it wrote to the terminal (echo was off for the
+        /// password).
+        pub said: Vec<u8>,
+    }
+
+    /// The most of its output `Answer::said` keeps: the end, where the reason is.
+    const SAID_MAX: usize = 4096;
+
     /// Runs `cmd` with the terminal as its controlling one, types `pw` and a
-    /// newline once it switched echo off, and returns whether it exited 0.
-    /// Killed after `wait`.
-    pub fn answer(mut cmd: Command, pw: &Secret, wait: Duration) -> Result<bool, String> {
+    /// newline once it switched echo off, and says how it ended. Killed after
+    /// `wait`.
+    pub fn answer(mut cmd: Command, pw: &Secret, wait: Duration) -> Result<Answer, String> {
         // The line discipline would act on these (erase, kill, end of file)
         // instead of passing them on.
         if pw.expose().chars().any(char::is_control) {
@@ -184,19 +245,35 @@ mod pty {
         drop(cmd);
         let deadline = Instant::now() + wait;
         let mut typed = false;
-        let mut buf = [0u8; 256];
+        let mut said = Vec::new();
+        // What it says is read as it comes, so it never blocks on a full
+        // terminal; only the end is kept.
+        let read = |said: &mut Vec<u8>| {
+            let mut buf = [0u8; 256];
+            loop {
+                // SAFETY: the buffer is valid for its length; the master does
+                // not block.
+                let n =
+                    unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                said.extend_from_slice(&buf[..n as usize]);
+                if said.len() > SAID_MAX {
+                    said.drain(..said.len() - SAID_MAX);
+                }
+            }
+        };
         let result = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Ok(status.success()),
+                Ok(Some(status)) => {
+                    read(&mut said);
+                    break Ok(status.success());
+                }
                 Ok(None) => {}
                 Err(e) => break Err(e.to_string()),
             }
-            // What it says (its prompt) is read and dropped, so it never blocks
-            // on a full terminal.
-            // SAFETY: the buffer is valid for its length; the master does not block.
-            while unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
-            {
-            }
+            read(&mut said);
             if !typed && echo_off(&master) {
                 if let Err(e) = write_all(&master, pw.expose().as_bytes())
                     .and_then(|()| write_all(&master, b"\n"))
@@ -217,12 +294,15 @@ mod pty {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        buf.fill(0);
         if result.is_err() {
             let _ = child.kill();
         }
         let _ = child.wait();
-        result
+        result.map(|success| Answer {
+            asked: typed,
+            success,
+            said,
+        })
     }
 }
 
@@ -319,29 +399,48 @@ mod tests {
         std::fs::write(
             &su,
             format!(
-                "#!/bin/bash\n{{ echo \"$*\"; env; tty; }} > '{seen}'\nprintf 'Password: '\nsleep 0.3\nread -t 0 && echo early >> '{seen}'\nstty -echo\nIFS= read -r p\nstty echo\necho\n[ \"$p\" = 'right one' ]\n",
+                "#!/bin/bash\n{{ echo \"$*\"; env; tty; }} > '{seen}'\nprintf 'Password: '\nsleep 0.3\nread -t 0 && echo early >> '{seen}'\nstty -echo\nIFS= read -r p\nstty echo\necho\ncase \"$p\" in\n'right one') exit 0 ;;\n'expired one') echo 'su: Authentication token is no longer valid; new one required'; exit 1 ;;\n*) echo 'su: Authentication failure'; exit 1 ;;\nesac\n",
                 seen = seen.display()
             ),
         )
         .unwrap();
         let quiet = dir.path().join("quiet");
         std::fs::write(&quiet, "#!/bin/sh\nsleep 30\n").unwrap();
-        for p in [&su, &quiet] {
+        // `su` as root, or with `pam_rootok`: in without a prompt.
+        let trusting = dir.path().join("trusting");
+        std::fs::write(&trusting, "#!/bin/sh\nexit 0\n").unwrap();
+        // A PAM stack that fails before it asks.
+        let broken = dir.path().join("broken");
+        std::fs::write(
+            &broken,
+            "#!/bin/sh\necho 'su: Authentication service cannot retrieve authentication info'\nexit 1\n",
+        )
+        .unwrap();
+        for p in [&su, &quiet, &trusting, &broken] {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let wait = Duration::from_secs(10);
-        let run = |pw: &str| pty::answer(Command::new(&su), &Secret::new(pw.into()), wait);
+        let run = |pw: &str| check_with(Command::new(&su), &Secret::new(pw.into()), wait);
         assert_eq!(run("right one"), Ok(true));
         let s = std::fs::read_to_string(&seen).unwrap();
         assert!(!s.contains("right one"), "{s}");
         assert!(!s.contains("early"), "typed before echo was off: {s}");
         assert!(s.contains("/dev/pts/"), "on a terminal of its own: {s}");
         assert_eq!(run("wrong one"), Ok(false));
+        // A failure that is not the password says what su said.
+        let e = run("expired one").unwrap_err();
+        assert!(e.contains("no longer valid"), "{e}");
+        // Through without being asked: nothing was checked, so no.
+        let any = Secret::new("anything".into());
+        let e = check_with(Command::new(&trusting), &any, wait).unwrap_err();
+        assert!(e.contains("without asking"), "{e}");
+        let e = check_with(Command::new(&broken), &any, wait).unwrap_err();
+        assert!(e.contains("cannot retrieve authentication info"), "{e}");
         // The line discipline would act on these.
         assert!(run("right\u{15}one").unwrap_err().contains("control"));
         // A program that never asks: an error after the wait, and it is ended.
         let start = Instant::now();
-        let e = pty::answer(
+        let e = check_with(
             Command::new(&quiet),
             &Secret::new("x".into()),
             Duration::from_millis(500),

@@ -310,7 +310,7 @@ pub fn installed_copy(me: &Path) -> Option<PathBuf> {
     let p = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
         .join(r"Programs\pithagoras-sync\pithagoras-sync.exe");
     #[cfg(not(windows))]
-    let p = PathBuf::from(std::env::var_os("HOME")?).join(".local/bin/pithagoras-sync");
+    let p = crate::install::user_program(Path::new(&std::env::var_os("HOME")?));
     (p.is_file() && !same_program(&p, me)).then_some(p)
 }
 

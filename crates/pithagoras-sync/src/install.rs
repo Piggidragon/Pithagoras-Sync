@@ -15,6 +15,9 @@ use crate::actions::{Action, argv};
 pub const UNIT_NAME: &str = "pithagoras-sync.service";
 pub const TASK_NAME: &str = "Pithagoras Sync";
 pub const SYSTEM_BIN: &str = "/usr/local/bin/pithagoras-sync";
+/// Where `install` puts the program for one user on Linux, below the home
+/// directory: the user unit, the desktop entry and the windows all name it.
+pub const USER_PROGRAM: &str = ".local/bin/pithagoras-sync";
 /// The URI scheme of the pairing link.
 pub const SCHEME: &str = "pithagoras-sync";
 /// The desktop entry, in `<data home>/applications`.
@@ -36,7 +39,12 @@ KillMode=control-group
 UMask=0077
 ";
 
-/// The user unit. The program lives in `~/.local/bin`.
+/// The program `install` puts in `home` (`USER_PROGRAM`).
+pub fn user_program(home: &Path) -> PathBuf {
+    home.join(USER_PROGRAM)
+}
+
+/// The user unit. The program lives in `~/.local/bin` (`USER_PROGRAM`).
 pub fn user_unit() -> String {
     format!(
         "[Unit]
@@ -44,7 +52,7 @@ Description={DESCRIPTION}
 Documentation={DOCS}
 
 [Service]
-ExecStart=%h/.local/bin/pithagoras-sync run
+ExecStart=%h/{USER_PROGRAM} run
 {SERVICE_BODY}
 [Install]
 WantedBy=default.target
@@ -99,7 +107,7 @@ pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Actio
     let mut v = vec![
         Action::Copy {
             from: exe.to_path_buf(),
-            to: home.join(".local/bin/pithagoras-sync"),
+            to: user_program(home),
             mode: 0o755,
         },
         Action::Write {

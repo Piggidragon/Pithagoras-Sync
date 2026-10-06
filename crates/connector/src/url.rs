@@ -78,15 +78,21 @@ impl PortalUrl {
             None => 80,
         };
         let base = path.trim_end_matches('/').to_string();
-        if base.split('/').any(|c| c == ".." || c == ".") {
-            return Err(bad("no . or .. in the path"));
-        }
         // The URL is shown to the owner before pairing: a path with spaces,
         // quotes or other scripts could read as more text of the question.
         if !plain_path(&base) {
             return Err(bad(
                 "the path may hold only letters, digits, - . _ ~ / and %XX escapes",
             ));
+        }
+        // Checked decoded: a server or proxy that decodes `%2e` or `%2f`
+        // would otherwise resolve the endpoints outside the path shown.
+        let decoded = pct_bytes(&base, false).ok_or_else(|| bad("bad escape in the path"))?;
+        if decoded
+            .split(|c| matches!(c, b'/' | b'\\'))
+            .any(|c| c == b".." || c == b".")
+        {
+            return Err(bad("no . or .. in the path, escaped or not"));
         }
         Ok(PortalUrl {
             tls,
@@ -203,6 +209,11 @@ impl PairUri {
 }
 
 fn pct_decode(s: &str) -> Option<String> {
+    String::from_utf8(pct_bytes(s, true)?).ok()
+}
+
+/// `s` with its `%XX` escapes decoded, and `+` as a space when `plus`.
+fn pct_bytes(s: &str, plus: bool) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -213,7 +224,7 @@ fn pct_decode(s: &str) -> Option<String> {
                 out.push(u8::from_str_radix(h, 16).ok()?);
                 i += 3;
             }
-            b'+' => {
+            b'+' if plus => {
                 out.push(b' ');
                 i += 1;
             }
@@ -223,7 +234,7 @@ fn pct_decode(s: &str) -> Option<String> {
             }
         }
     }
-    String::from_utf8(out).ok()
+    Some(out)
 }
 
 #[cfg(test)]
@@ -258,6 +269,12 @@ mod tests {
             "https://x:99999",
             "https://",
             "https://x/../y",
+            "https://x/a/%2e%2e/b",
+            "https://x/a/%2E./b",
+            "https://x/a/.%2e",
+            "https://x/a/%2e",
+            "https://x/a%2f..%2fb",
+            "https://x/a%5c..",
             "https://[nope]",
             "https://x/a b",
             "https://x/\u{2014}",

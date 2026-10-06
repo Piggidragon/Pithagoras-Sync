@@ -23,11 +23,8 @@ fn main() -> ExitCode {
         },
         None => Cli::parse(),
     };
-    // The short commands die quietly when their output is cut off (`| head`), as
-    // command line tools do; the client itself and the graphical flow keep
-    // ignoring SIGPIPE.
     #[cfg(unix)]
-    if !matches!(cli.cmd, Some(Cmd::Run { .. } | Cmd::Gui { .. })) {
+    if pithagoras_sync::cli::dies_on_sigpipe(cli.cmd.as_ref()) {
         // SAFETY: resets one signal's disposition before any thread starts.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
