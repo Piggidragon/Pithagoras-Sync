@@ -1264,36 +1264,76 @@ impl Env {
     /// Runs the command in a pseudo terminal: waits for each text of `script` in
     /// the output and types its answer. Returns (exit code, everything shown).
     fn in_terminal(&self, args: &[&str], script: &[(&str, &str)]) -> Option<(i32, String)> {
+        let steps: Vec<_> = script.iter().map(|(e, a)| (*e, *a, &[][..])).collect();
+        self.in_terminal_racing(args, &steps)
+    }
+
+    /// Like `in_terminal`, and before each answer runs the client's own program
+    /// with the arguments of the step's third part (from outside the terminal, as
+    /// the owner would in a second shell), while the question waits.
+    ///
+    /// A text that never shows fails the run (exit code -1, "timed out" in what
+    /// was shown) after 15 s, and the child is killed, so a changed prompt makes
+    /// a test fail instead of hang.
+    fn in_terminal_racing(
+        &self,
+        args: &[&str],
+        script: &[(&str, &str, &[&str])],
+    ) -> Option<(i32, String)> {
         const PY: &str = r#"
-import json, os, pty, select, sys, time
+import json, os, pty, select, signal, subprocess, sys, time
 exe, script, args = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3:]
 pid, fd = pty.fork()
 if pid == 0:
     os.execv(exe, [exe] + args)
 buf, pos = b"", 0
 def read(until):
+    # True when `until` showed (or, with None, the output ended), False on a timeout.
     global buf, pos
     end = time.time() + 15
     while until is None or buf.find(until.encode(), pos) < 0:
         left = end - time.time()
         if left <= 0:
-            return
+            return False
         if select.select([fd], [], [], left)[0]:
             try:
                 data = os.read(fd, 4096)
             except OSError:
-                return
+                return until is None
             if not data:
-                return
+                return until is None
             buf += data
-for expect, send in script:
-    read(expect)
+    return True
+def finish(note):
+    # Never leaves the child behind: kills it when it still runs.
+    for _ in range(50):
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        note = note or "timed out: the command did not end"
+    print(buf.decode(errors="replace"))
+    if note:
+        print(note)
+        print("exit=-1")
+    else:
+        print("exit=%d" % os.waitstatus_to_exitcode(status))
+    sys.exit(0)
+for expect, send, outside in script:
+    if not read(expect):
+        os.kill(pid, signal.SIGKILL)
+        finish("timed out waiting for %r" % expect)
     pos = len(buf)
+    if outside:
+        subprocess.run([exe] + outside, stdin=subprocess.DEVNULL, check=True, timeout=30)
     os.write(fd, send.encode())
-read(None)
-_, status = os.waitpid(pid, 0)
-print(buf.decode(errors="replace"))
-print("exit=%d" % os.waitstatus_to_exitcode(status))
+if not read(None):
+    os.kill(pid, signal.SIGKILL)
+    finish("timed out waiting for the command to end")
+finish(None)
 "#;
         let out = std::process::Command::new("python3")
             .args(["-c", PY, BIN, &serde_json::to_string(script).unwrap()])
@@ -1313,6 +1353,20 @@ print("exit=%d" % os.waitstatus_to_exitcode(status))
         let (shown, code) = text.trim_end().rsplit_once("exit=")?;
         Some((code.trim().parse().ok()?, shown.to_string()))
     }
+}
+
+/// Whether the terminal tests can run: they drive the program through a pseudo
+/// terminal with python3. Like the tests that need a cgroup or Landlock, they
+/// skip with a notice where it is missing (CI images have python3).
+fn have_python() -> bool {
+    let ok = std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("  (SKIPPED: no python3 to drive a terminal with)");
+    }
+    ok
 }
 
 /// The audit log's `policy` records, as text.
@@ -1517,11 +1571,7 @@ async fn sudo_asks_in_a_terminal() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let ask = "Do you want to activate sudo access now? [y/N]";
-    if std::process::Command::new("python3")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
+    if !have_python() {
         stop(daemon).await;
         return;
     }
@@ -1585,6 +1635,115 @@ async fn sudo_asks_in_a_terminal() {
     assert_eq!(code, 0, "{shown}");
     assert_eq!(env.elevation().await, "off");
     stop(daemon).await;
+}
+
+/// A change the owner makes in a second shell while a `sudo` question waits stays:
+/// the commands save only the elevation, not the config they read before asking.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_made_while_a_sudo_question_waits_stays() {
+    if !have_python() {
+        return;
+    }
+    let env = Env::new();
+    let proj = env.p("home/proj");
+    env.ok(&["config", "set", "policy.privilege.secret_storage", "file"])
+        .await;
+    let mode = || env.ok(&["config", "get", "policy.mode"]);
+    // `sudo set`: Full is narrowed to Ask while "activate now?" waits.
+    env.ok(&["mode", "full"]).await;
+    let ask = "Do you want to activate sudo access now? [y/N]";
+    let (code, shown) = env
+        .in_terminal_racing(
+            &["sudo", "set"],
+            &[
+                ("not shown", &format!("{PW}\n"), &[]),
+                (ask, "y\n", &["mode", "ask"]),
+            ],
+        )
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(env.elevation().await, "sudo");
+    assert_eq!(mode().await.trim(), "ask", "the narrowing was undone");
+    // `sudo activate`: a folder is granted while the password is typed.
+    env.ok(&["sudo", "deactivate"]).await;
+    env.ok(&["sudo", "clear"]).await;
+    let (code, shown) = env
+        .in_terminal_racing(
+            &["sudo", "activate"],
+            &[
+                ("Do you want to set a password now? [y/N]", "y\n", &[]),
+                (
+                    "not shown",
+                    &format!("{PW}\n"),
+                    &["folder", "add", &proj, "--rw"],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(env.elevation().await, "sudo");
+    let folders = env.ok(&["config", "get", "policy.folders"]).await;
+    assert!(folders.contains(&proj), "the folder was lost: {folders}");
+    // `sudo clear`, which asks no password even on a desktop: Full is narrowed
+    // while "deactivate it too?" waits.
+    env.ok(&["mode", "full"]).await;
+    let q = "Deactivate it too? [y/N]";
+    let (code, shown) = env
+        .in_terminal_racing(&["sudo", "clear"], &[(q, "y\n", &["mode", "ask"])])
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(env.elevation().await, "off");
+    assert_eq!(mode().await.trim(), "ask", "the narrowing was undone");
+}
+
+/// A terminal run that never gets its prompt fails, it does not hang.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_run_without_its_prompt_fails_instead_of_hanging() {
+    if !have_python() {
+        return;
+    }
+    let env = Env::new();
+    let started = std::time::Instant::now();
+    let (code, shown) = env
+        .in_terminal(&["sudo", "status"], &[("never printed", "x\n")])
+        .unwrap();
+    assert_eq!(code, -1, "{shown}");
+    assert!(shown.contains("timed out waiting"), "{shown}");
+    assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+/// A password file left over from file storage is no stored password once the
+/// storage is memory: the client does not load it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leftover_password_file_is_no_password_under_memory_storage() {
+    let env = Env::new();
+    env.ok(&["config", "set", "policy.privilege.secret_storage", "file"])
+        .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let stored = env.home.join(".config/pithagoras-sync/elevation.secret");
+    assert!(stored.exists());
+    env.ok(&["config", "set", "policy.privilege.secret_storage", "memory"])
+        .await;
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Password:    not set"), "{}", r.out);
+    assert!(!r.out.contains("Password:    set"), "{}", r.out);
+    assert!(r.out.contains("old password file is ignored"), "{}", r.out);
+    assert!(
+        r.out.contains("run `pithagoras-sync sudo set`"),
+        "{}",
+        r.out
+    );
+    // A script gets the refusal, not a silent activation.
+    let r = env.run(&["sudo", "activate"]).await;
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(r.err.contains("not activated"), "{}", r.err);
+    assert_eq!(env.elevation().await, "off");
+    // `clear` removes the leftover.
+    env.ok(&["sudo", "clear"]).await;
+    assert!(!stored.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

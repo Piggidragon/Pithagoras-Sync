@@ -800,9 +800,7 @@ impl Engine {
                 let elevated = elevated_command(command).filter(|_| !self.as_root);
                 let elevate = match (policy.privilege.elevation, elevated) {
                     (Elevation::Sudo, Some(rest)) if rest.starts_with('-') || rest.is_empty() => {
-                        return Ok(Verdict::Deny(
-                            "elevated commands are `sudo <command>`, run as root; sudo's own options (-n, -u, -E, -s ...) are not taken: run the command again as `sudo <command>` without them".into(),
-                        ));
+                        return Ok(Verdict::Deny(sudo_options_refusal(rest)));
                     }
                     (Elevation::Sudo, Some(_)) => Some(policy.privilege.sudo_path.clone()),
                     _ => None,
@@ -914,6 +912,23 @@ const NO_LANDLOCK: &str = if cfg!(windows) {
 } else {
     "this system has no Landlock to confine commands, so every command in Folders mode asks"
 };
+
+/// Why `sudo <rest>` with options (or without a command) is refused. Only `-n` and
+/// `-S` are no loss when left out: the device runs `sudo -n` or `-S` itself. Any
+/// other option (`-u`, `-g`, `-D`, ...) changes whom or where the command is for,
+/// so the agent must not be told to drop it: it would end up running as root.
+fn sudo_options_refusal(rest: &str) -> String {
+    let options: Vec<&str> = rest
+        .split_whitespace()
+        .take_while(|w| w.starts_with('-'))
+        .collect();
+    let harmless = ["-n", "-S", "--non-interactive", "--stdin"];
+    if !options.is_empty() && options.iter().all(|o| harmless.contains(o)) {
+        "elevated commands are `sudo <command>`, run as root; the device runs sudo non-interactively itself, so sudo's own options (-n, -S) are not taken: run the command again as `sudo <command>` without them".into()
+    } else {
+        "elevated commands are `sudo <command>`, run as root and nothing else: sudo's own options (-u, -g, -D, -E, -s ...) are not taken, so a command meant for another user, group or folder cannot be elevated. Do not run it again as root unless the user asks for that".into()
+    }
+}
 
 /// The command after a leading `sudo `, which the device runs elevated.
 pub fn elevated_command(command: &str) -> Option<&str> {

@@ -70,20 +70,26 @@ pub enum Cmd {
     /// The mode decides what the portal's agent may do on this computer. Without
     /// an argument this shows the current one.
     ///
-    ///   ask      Every file access and every command asks you; nothing runs on
-    ///            its own. You answer in the portal's Devices tab, or here with
-    ///            `approvals`, `approve` and `deny`. This is the default.
+    ///   ask      Every file access and every command asks you, except the
+    ///            commands on `policy.commands.never_ask`. You answer in the
+    ///            portal's Devices tab, or here with `approvals`, `approve` and
+    ///            `deny`. This is the default.
     ///
     ///   folders  Files only inside the folders you granted with `folder add`
     ///            (read-only unless --rw); commands only in folders granted with
     ///            --exec. On Linux 5.13 or newer commands run under Landlock and
     ///            can write only in read-write folders; without Landlock each
-    ///            command asks. Everything outside the folders is refused.
+    ///            command asks. Everything outside the folders is refused, except
+    ///            the files `policy.allow_globs` names.
     ///
-    ///   full     The agent acts with all your rights and is not asked. What
-    ///            still asks: protected paths (`~/.ssh` and the like) and risky
-    ///            commands (`sudo`, `git push`, `rm -r` outside the working
-    ///            folder), until you switch those prompts off in the settings.
+    ///   full     The agent acts with all your rights and is mostly not asked.
+    ///            What still asks: protected paths (`~/.ssh` and the like) and
+    ///            risky commands (`sudo`, `git push`, `rm -r` outside the working
+    ///            folder), until you switch those prompts off in the settings;
+    ///            calls from a chat that has seen untrusted content
+    ///            (`policy.full.taint_prompts`); the commands on
+    ///            `policy.commands.always_ask`; and every `sudo` command while
+    ///            sudo access is on.
     ///            Full falls back to ask after --expiry-hours (default 8; 0 never).
     ///
     /// Only you change the mode, on this computer. The portal can change it only
@@ -239,14 +245,18 @@ pub enum SudoCmd {
         activate: bool,
     },
     /// Switch sudo access on: the agent may then run `sudo <command>`; each
-    /// such command still asks for your approval.
+    /// such command still asks for your approval, except the ones on
+    /// `policy.commands.never_ask` and when the client runs as root, where
+    /// `sudo` is an ordinary command.
     Activate {
         /// Switch it on without a stored password, for a sudoers rule that asks
         /// none.
         #[arg(long)]
         no_password: bool,
     },
-    /// Switch sudo access off. The stored password stays (`sudo clear` forgets it).
+    /// Switch sudo access off. The stored password stays (`sudo clear` forgets
+    /// it), and a portal that may write settings (`portal_policy = write`) can
+    /// switch sudo access on again.
     Deactivate,
     /// Forget the stored password, in the running client and on disk.
     Clear {
@@ -377,12 +387,12 @@ fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
 }
 
 /// Checks that the owner makes a policy change, from outside the client's own
-/// commands; returns the config to edit.
+/// commands; returns the config to edit. The config is read again after the
+/// confirmation, which can wait for a password: a change made meanwhile stays.
 async fn owner_edit(dirs: &Dirs) -> Result<DeviceConfig, String> {
     owner::not_from_own_command(dirs).await?;
-    let cfg = load_config(dirs)?;
-    owner::confirm(cfg.profile)?;
-    Ok(cfg)
+    owner::confirm(load_config(dirs)?.profile)?;
+    load_config(dirs)
 }
 
 fn canonical_folder(p: &Path) -> Result<PathBuf, String> {
@@ -636,6 +646,9 @@ struct SudoView {
     storage: SecretStorage,
     running: bool,
     root: bool,
+    allow_root: bool,
+    /// A password file is on disk that the client will not load (memory storage).
+    leftover_file: bool,
 }
 
 /// `sudo status` as printed, ending in the step that fits.
@@ -652,22 +665,46 @@ fn sudo_status_text(v: &SudoView) -> String {
         "Password:    {}",
         match (v.password, v.running, v.storage) {
             (true, _, s) => format!("set (kept in {})", s.as_str()),
-            (false, false, SecretStorage::Memory) =>
-                "not set (the client is not running, and keeps the password in memory only)"
-                    .to_string(),
+            // A root client needs no password, so the memory remark is no use.
+            (false, false, SecretStorage::Memory) if !v.root => {
+                let mut t =
+                    "not set (the client is not running, and keeps the password in memory only"
+                        .to_string();
+                if v.leftover_file {
+                    t.push_str("; an old password file is ignored, `pithagoras-sync sudo clear` removes it");
+                }
+                t.push(')');
+                t
+            }
             (false, ..) => "not set".to_string(),
         }
     );
-    if v.root {
-        let _ = writeln!(
-            out,
-            "Client:      runs as root, so a `sudo` command is an ordinary command: there is nothing to elevate"
-        );
-    } else if !v.running {
-        let _ = writeln!(out, "Client:      not running");
+    match (v.root, v.running) {
+        (true, true) => {
+            let _ = writeln!(
+                out,
+                "Client:      runs as root, so a `sudo` command is an ordinary command: there is nothing to elevate"
+            );
+        }
+        (true, false) if !v.allow_root => {
+            let _ = writeln!(
+                out,
+                "Client:      not running; it refuses to run as root until you allow it"
+            );
+        }
+        (_, false) => {
+            let _ = writeln!(out, "Client:      not running");
+        }
+        (false, true) => {}
     }
     let next = match (v.root, v.active, v.password) {
-        (true, ..) => "nothing to do: the agent's commands run as root already.",
+        (true, ..) if v.running => "nothing to do: the agent's commands run as root already.",
+        (true, ..) if !v.allow_root => {
+            "as root the client first needs `pithagoras-sync config set policy.privilege.allow_root true`, then start it; its commands then run as root, so there is no sudo to set up."
+        }
+        (true, ..) => {
+            "start the client; its commands then run as root, so there is no sudo to set up."
+        }
         (_, true, true) => {
             "nothing to do. The agent can run `sudo <command>`; `pithagoras-sync sudo deactivate` switches it off."
         }
@@ -683,8 +720,11 @@ fn sudo_status_text(v: &SudoView) -> String {
 
 /// Switches `policy.privilege.elevation` in the config and tells the running
 /// client, which audits the change with its old and new value as any config
-/// change.
-async fn set_elevation(dirs: &Dirs, mut cfg: DeviceConfig, to: Elevation) -> Result<(), String> {
+/// change. It reads the config itself, right before it saves, and changes nothing
+/// but the elevation: the callers wait for answers, and whatever the owner changed
+/// meanwhile (the mode, a folder) must not be written back.
+async fn set_elevation(dirs: &Dirs, to: Elevation) -> Result<(), String> {
+    let mut cfg = load_config(dirs)?;
     let word = if to == Elevation::Sudo {
         "active"
     } else {
@@ -702,19 +742,21 @@ async fn set_elevation(dirs: &Dirs, mut cfg: DeviceConfig, to: Elevation) -> Res
 }
 
 /// Whether a password is stored: the running client holds one, or (when the
-/// client is not running) the file is there.
-async fn sudo_password_set(dirs: &Dirs) -> Result<bool, String> {
+/// client is not running) the file is there and the client will load it, which it
+/// does only with file storage.
+async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
     Ok(
         match control::send(&dirs.socket(), Request::Status).await? {
             Some(r) => r.status.is_some_and(|s| s.elevation_password),
-            None => crate::secrets::file(dirs).exists(),
+            None => storage == SecretStorage::File && crate::secrets::file(dirs).exists(),
         },
     )
 }
 
 /// Takes the password from the terminal (or stdin) and gives it to the running
-/// client, or to the file for the client's next start.
-async fn store_password(dirs: &Dirs, cfg: &DeviceConfig, stdin: bool) -> Result<(), String> {
+/// client, or to the file for the client's next start. The storage is read after
+/// the prompt, not before.
+async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
     use crate::secrets;
     let value = if stdin {
         secrets::read_from_stdin()?
@@ -735,7 +777,7 @@ async fn store_password(dirs: &Dirs, cfg: &DeviceConfig, stdin: bool) -> Result<
     {
         Some(r) if r.ok => println!("Password stored in the client."),
         Some(r) => return Err(r.error.unwrap_or_default()),
-        None if cfg.policy.privilege.secret_storage == SecretStorage::File => {
+        None if load_config(dirs)?.policy.privilege.secret_storage == SecretStorage::File => {
             secrets::save(&secrets::file(dirs), &value)?;
             println!("Password stored for the client's next start.");
         }
@@ -757,27 +799,31 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
             let running = control::send(&dirs.socket(), Request::Status)
                 .await?
                 .is_some();
+            let storage = cfg.policy.privilege.secret_storage;
             let view = SudoView {
                 active: cfg.policy.privilege.elevation == Elevation::Sudo,
-                password: sudo_password_set(dirs).await?,
-                storage: cfg.policy.privilege.secret_storage,
+                password: sudo_password_set(dirs, storage).await?,
+                storage,
                 running,
                 root: is_root(),
+                allow_root: cfg.policy.privilege.allow_root,
+                leftover_file: storage == SecretStorage::Memory
+                    && crate::secrets::file(dirs).exists(),
             };
             print!("{}", sudo_status_text(&view));
         }
         SudoCmd::Set { stdin, activate } => {
-            let cfg = owner_edit(dirs).await?;
-            store_password(dirs, &cfg, stdin).await?;
-            let active = cfg.policy.privilege.elevation == Elevation::Sudo;
-            if active {
+            owner_edit(dirs).await?;
+            store_password(dirs, stdin).await?;
+            // Read again: the password prompt may have waited a long time.
+            if load_config(dirs)?.policy.privilege.elevation == Elevation::Sudo {
                 println!("Sudo access is active.");
             } else if activate
                 || (!stdin
                     && stdin_is_terminal()
                     && ask("Do you want to activate sudo access now?"))
             {
-                set_elevation(dirs, cfg, Elevation::Sudo).await?;
+                set_elevation(dirs, Elevation::Sudo).await?;
             } else {
                 println!(
                     "Sudo access is not active yet: `pithagoras-sync sudo activate` switches it on."
@@ -788,7 +834,10 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
             let cfg = owner_edit(dirs).await?;
             // As root there is nothing to elevate and no password to ask for; and
             // a sudoers rule that asks none needs none stored.
-            if !no_password && !is_root() && !sudo_password_set(dirs).await? {
+            if !no_password
+                && !is_root()
+                && !sudo_password_set(dirs, cfg.policy.privilege.secret_storage).await?
+            {
                 println!(
                     "No password is stored for sudo, so sudo access would only run what sudoers allows without one."
                 );
@@ -797,14 +846,13 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
                         "not activated: run `pithagoras-sync sudo set` to store a password, or `pithagoras-sync sudo activate --no-password` if a sudoers rule lets you run sudo without one".into(),
                     );
                 }
-                store_password(dirs, &cfg, false).await?;
+                store_password(dirs, false).await?;
             }
-            set_elevation(dirs, cfg, Elevation::Sudo).await?;
+            set_elevation(dirs, Elevation::Sudo).await?;
         }
         SudoCmd::Deactivate => {
             owner::not_from_own_command(dirs).await?;
-            let cfg = load_config(dirs)?;
-            set_elevation(dirs, cfg, Elevation::Off).await?;
+            set_elevation(dirs, Elevation::Off).await?;
         }
         SudoCmd::Clear { deactivate } => {
             owner::not_from_own_command(dirs).await?;
@@ -829,7 +877,7 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
                             "Sudo access is still active, but works only for what sudoers allows without a password. Deactivate it too?",
                         ))
                 {
-                    set_elevation(dirs, cfg, Elevation::Off).await?;
+                    set_elevation(dirs, Elevation::Off).await?;
                 } else {
                     println!(
                         "Sudo access stays active: `pithagoras-sync sudo deactivate` switches it off."
@@ -1761,6 +1809,8 @@ mod tests {
             storage: SecretStorage::Memory,
             running: true,
             root: false,
+            allow_root: false,
+            leftover_file: false,
         }
     }
 
@@ -1791,6 +1841,15 @@ mod tests {
         });
         assert!(t.contains("Client:      not running"), "{t}");
         assert!(t.contains("memory only"), "{t}");
+        assert!(!t.contains("old password file"), "{t}");
+        // A password file the client will not load (memory storage) is named.
+        let t = sudo_status_text(&SudoView {
+            running: false,
+            leftover_file: true,
+            ..view(false, false)
+        });
+        assert!(t.contains("old password file is ignored"), "{t}");
+        assert!(t.contains("sudo clear"), "{t}");
     }
 
     #[test]
@@ -1802,6 +1861,33 @@ mod tests {
         assert!(t.contains("runs as root"), "{t}");
         assert!(t.contains("nothing to elevate"), "{t}");
         assert!(!t.contains("sudo set"), "{t}");
+    }
+
+    #[test]
+    fn sudo_status_does_not_say_a_root_client_runs_when_it_does_not() {
+        // The client refuses to start as root until allow_root is on.
+        let t = sudo_status_text(&SudoView {
+            root: true,
+            running: false,
+            ..view(false, false)
+        });
+        assert!(!t.contains("runs as root"), "{t}");
+        assert!(!t.contains("memory only"), "{t}");
+        assert!(t.contains("Client:      not running"), "{t}");
+        assert!(t.contains("refuses to run as root"), "{t}");
+        assert!(t.contains("policy.privilege.allow_root true"), "{t}");
+        assert!(!t.contains("nothing to do"), "{t}");
+        // Allowed, but not started yet.
+        let t = sudo_status_text(&SudoView {
+            root: true,
+            running: false,
+            allow_root: true,
+            ..view(false, false)
+        });
+        assert!(!t.contains("runs as root"), "{t}");
+        assert!(t.contains("Client:      not running"), "{t}");
+        assert!(!t.contains("refuses"), "{t}");
+        assert!(t.contains("start the client"), "{t}");
     }
 
     #[test]
@@ -1842,6 +1928,11 @@ mod tests {
             "`folder add`",
             "Landlock",
             "without Landlock each",
+            "`policy.allow_globs`",
+            "`policy.commands.never_ask`",
+            "`policy.full.taint_prompts`",
+            "`policy.commands.always_ask`",
+            "every `sudo` command while",
             "--expiry-hours (default 8; 0 never)",
             "shows the current one",
             "`portal_policy` to `write`",
@@ -1879,6 +1970,26 @@ mod tests {
         let help = long_help("sudo");
         for word in ["set", "activate", "deactivate", "clear", "status"] {
             assert!(help.contains(word), "{help}");
+        }
+        // What the help does not hide: never_ask and a root client skip the
+        // question, the password stays after `deactivate`, and the portal may
+        // switch it on again.
+        let sub = |name: &str| {
+            cmd.find_subcommand("sudo")
+                .unwrap()
+                .find_subcommand(name)
+                .unwrap()
+                .clone()
+                .render_long_help()
+                .to_string()
+        };
+        let help = sub("activate");
+        for word in ["`policy.commands.never_ask`", "runs as root"] {
+            assert!(help.contains(word), "{word}: {help}");
+        }
+        let help = sub("deactivate");
+        for word in ["stored password stays", "`portal_policy = write`"] {
+            assert!(help.contains(word), "{word}: {help}");
         }
         assert!(cmd.find_subcommand("secret").is_none());
     }

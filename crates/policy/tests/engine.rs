@@ -1007,8 +1007,23 @@ async fn elevation_is_the_owners_choice_and_root_always_asks() {
         denied(exec(&e, c, &cwd).await);
     }
     // The refusal tells the agent what to do instead: models write `sudo -n` by habit.
-    let m = denied(exec(&e, "sudo -n whoami", &cwd).await);
-    assert!(m.contains("without them"), "{m}");
+    for c in ["sudo -n whoami", "sudo -S whoami", "sudo -n -S whoami"] {
+        let m = denied(exec(&e, c, &cwd).await);
+        assert!(m.contains("without them"), "{c}: {m}");
+    }
+    // But `-u`, `-g` and `-D` are not to be dropped: the command would run as root
+    // instead of the narrower identity or folder it was meant for.
+    for c in [
+        "sudo -u nobody id",
+        "sudo -g adm id",
+        "sudo -D /srv/tmp ls",
+        "sudo -n -u nobody id",
+    ] {
+        let m = denied(exec(&e, c, &cwd).await);
+        assert!(!m.contains("without them"), "{c}: {m}");
+        assert!(!m.contains("again as `sudo <command>`"), "{c}: {m}");
+        assert!(m.contains("unless the user asks"), "{c}: {m}");
+    }
     // Nobody to ask: refused.
     let e = f.engine(on(&f), Profile::Headless, none());
     denied(exec(&e, "sudo apt update", &cwd).await);
