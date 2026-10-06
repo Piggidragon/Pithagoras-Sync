@@ -64,9 +64,34 @@ pub fn usable_addrs(
 /// The uid owning the socket at the other end of a loopback connection from
 /// `local` to `peer`: the server's accepted socket, which carries the uid of the
 /// program that listens. From `/proc/net/tcp` (or `tcp6`).
+///
+/// The server's socket has the family of its listener, not of the client's: a
+/// listener on `[::]` (dual-stack) accepts an IPv4 connection on an IPv6 socket,
+/// listed in `tcp6` under v4-mapped addresses, and a client that names
+/// `[::ffff:127.0.0.1]` reaches an IPv4 listener, listed in `tcp`. So an IPv4
+/// connection, in either form, is looked up in both tables.
 #[cfg(target_os = "linux")]
 pub fn peer_owner(local: SocketAddr, peer: SocketAddr) -> Option<u32> {
-    let file = if peer.is_ipv4() { "tcp" } else { "tcp6" };
+    use std::net::IpAddr;
+    let v4 = |a: SocketAddr| SocketAddr::new(a.ip().to_canonical(), a.port());
+    let mapped = |a: SocketAddr| match a.ip().to_canonical() {
+        IpAddr::V4(ip) => SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), a.port()),
+        ip => SocketAddr::new(ip, a.port()),
+    };
+    let mut tries = Vec::new();
+    if v4(peer).is_ipv4() {
+        tries.push(("tcp", v4(peer), v4(local)));
+    }
+    tries.push(("tcp6", mapped(peer), mapped(local)));
+    tries
+        .into_iter()
+        .find_map(|(file, peer, local)| owner_in(file, peer, local))
+}
+
+/// The uid of the socket in `/proc/net/<file>` whose own address is `peer` and
+/// whose far end is `local`.
+#[cfg(target_os = "linux")]
+fn owner_in(file: &str, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
     let table = std::fs::read_to_string(format!("/proc/net/{file}")).ok()?;
     let (want_local, want_remote) = (proc_addr(peer), proc_addr(local));
     table.lines().skip(1).find_map(|l| {
@@ -236,5 +261,39 @@ mod tests {
             let (local, peer) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
             assert_eq!(peer_owner(local, peer), Some(sync_ops::info::euid()));
         }
+    }
+
+    /// A portal of this user that listens dual-stack on `[::]` (Node's bare
+    /// `listen(port)`, Go's `":port"`) is reached over IPv4, and one on IPv4
+    /// through the v4-mapped form of its address: the owner is found in the
+    /// other table, and plain http goes through.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plain_http_reaches_this_users_portal_in_either_address_family() {
+        let open_ok = |url: String| async move {
+            let url = PortalUrl::parse(&url).unwrap();
+            open(&url, None).await.map(|_| ())
+        };
+        if let Ok(dual) = tokio::net::TcpListener::bind("[::]:0").await {
+            let port = dual.local_addr().unwrap().port();
+            // Dual-stack unless the system set `net.ipv6.bindv6only`.
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                assert_eq!(open_ok(format!("http://127.0.0.1:{port}")).await, Ok(()));
+                assert_eq!(open_ok(format!("http://localhost:{port}")).await, Ok(()));
+                assert_eq!(
+                    open_ok(format!("http://[::ffff:127.0.0.1]:{port}")).await,
+                    Ok(())
+                );
+            } else {
+                eprintln!("  (IPv6 sockets are IPv6 only here; no dual-stack listener)");
+            }
+        }
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = v4.local_addr().unwrap().port();
+        assert_eq!(
+            open_ok(format!("http://[::ffff:127.0.0.1]:{port}")).await,
+            Ok(())
+        );
+        assert_eq!(open_ok(format!("http://127.0.0.1:{port}")).await, Ok(()));
     }
 }
