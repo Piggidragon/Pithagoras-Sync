@@ -372,6 +372,8 @@ pub struct Node {
 pub trait Fs {
     /// `None` when nothing is at `path`.
     fn lstat(&self, path: &Path) -> std::io::Result<Option<Node>>;
+    fn user_name(&self, uid: u32) -> Option<String>;
+    fn group_name(&self, gid: u32) -> Option<String>;
 }
 
 /// The real file system.
@@ -402,6 +404,46 @@ impl Fs for RealFs {
     #[cfg(not(unix))]
     fn lstat(&self, _path: &Path) -> std::io::Result<Option<Node>> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(unix)]
+    fn user_name(&self, uid: u32) -> Option<String> {
+        let mut buf = vec![0 as libc::c_char; 4096];
+        // SAFETY: zeroed passwd struct; getpwuid_r writes into `pw` and `buf`.
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+        if r != 0 || out.is_null() {
+            return None;
+        }
+        // SAFETY: on success pw_name points to a NUL-terminated string in `buf`.
+        let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) };
+        Some(name.to_string_lossy().into_owned())
+    }
+
+    #[cfg(unix)]
+    fn group_name(&self, gid: u32) -> Option<String> {
+        let mut buf = vec![0 as libc::c_char; 4096];
+        // SAFETY: zeroed group struct; getgrgid_r writes into `gr` and `buf`.
+        let mut gr: libc::group = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+        if r != 0 || out.is_null() {
+            return None;
+        }
+        // SAFETY: on success gr_name points to a NUL-terminated string in `buf`.
+        let name = unsafe { std::ffi::CStr::from_ptr(gr.gr_name) };
+        Some(name.to_string_lossy().into_owned())
+    }
+
+    #[cfg(not(unix))]
+    fn user_name(&self, _uid: u32) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(unix))]
+    fn group_name(&self, _gid: u32) -> Option<String> {
+        None
     }
 }
 
@@ -453,19 +495,54 @@ pub fn root_program(given: &Path, fs: &dyn Fs) -> Result<PathBuf, String> {
             })
             .collect()
     };
-    let refuse = |part: &Path, why: &str| {
+    let refuse = |part: &Path, why: &str, cure: &str| {
         format!(
-            "the system unit starts {}, but {} {why}, so another user could change what root runs: root neither runs nor replaces it",
+            "the system unit starts {}, but {} {why}, so another user could change what root runs: root neither runs nor replaces it. To fix it: {cure}",
             given.display(),
             part.display()
         )
     };
+    let named = |name: Option<String>, id: u32| match name {
+        Some(n) => format!("{n} ({id})"),
+        None => id.to_string(),
+    };
     let stat = |p: &Path| fs.lstat(p).map_err(|e| format!("{}: {e}", p.display()));
+    // Each refusal names the cure for the part that failed, never another
+    // place to put the program that may fail the same way.
     let root_only = |p: &Path, n: &Node| -> Result<(), String> {
+        let at = p.display();
         if n.uid != 0 {
-            Err(refuse(p, &format!("belongs to uid {}", n.uid)))
-        } else if n.mode & 0o022 != 0 {
-            Err(refuse(p, "is writable by its group or by others"))
+            Err(refuse(
+                p,
+                &format!(
+                    "belongs to user {}, not root",
+                    named(fs.user_name(n.uid), n.uid)
+                ),
+                &format!(
+                    "sudo chown root {at}, or let the unit start a copy in folders only root can change"
+                ),
+            ))
+        } else if n.mode & 0o002 != 0 && n.mode & 0o1000 != 0 {
+            Err(refuse(
+                p,
+                "is a folder every user can write to",
+                "keep the program out of it",
+            ))
+        } else if n.mode & 0o002 != 0 {
+            Err(refuse(
+                p,
+                "is writable by every user",
+                &format!("sudo chmod o-w {at}"),
+            ))
+        } else if n.mode & 0o020 != 0 {
+            Err(refuse(
+                p,
+                &format!(
+                    "is writable by group {}",
+                    named(fs.group_name(n.gid), n.gid)
+                ),
+                &format!("sudo chmod g-w {at}"),
+            ))
         } else {
             Ok(())
         }
@@ -513,6 +590,15 @@ pub fn root_program(given: &Path, fs: &dyn Fs) -> Result<PathBuf, String> {
         }
     }
     Ok(cur)
+}
+
+/// After `setup` or `install --system`: what `update` will refuse about the
+/// program the system unit starts, so the owner learns it now and not at the
+/// first update.
+pub fn installed_warning(fs: &dyn Fs) -> Option<String> {
+    root_program(Path::new(crate::install::SYSTEM_BIN), fs)
+        .err()
+        .map(|e| format!("warning: {e}; until then, `update` refuses it"))
 }
 
 /// After `update` as root, for the system unit that starts `exe`: restarts it
@@ -837,6 +923,14 @@ mod tests {
                     link: link.map(PathBuf::from),
                 }))
         }
+
+        fn user_name(&self, uid: u32) -> Option<String> {
+            (uid == 1000).then(|| "svc".to_string())
+        }
+
+        fn group_name(&self, gid: u32) -> Option<String> {
+            (gid == 50).then(|| "staff".to_string())
+        }
     }
 
     /// The layout `setup` makes, plus `extra` rows (which come first).
@@ -866,7 +960,7 @@ mod tests {
         for (row, part) in [
             (
                 ("/usr/local/bin/pithagoras-sync", 1000, 0, 0o100755, None),
-                "pithagoras-sync belongs to uid 1000",
+                "pithagoras-sync belongs to user svc (1000)",
             ),
             (
                 ("/usr/local/bin", 0, 50, 0o42775, None),
@@ -887,7 +981,7 @@ mod tests {
             Some("/usr/local/bin/pithagoras-sync"),
         )]);
         let e = root_program(Path::new("/home/svc/bin/pithagoras-sync"), &fs).unwrap_err();
-        assert!(e.contains("/home/svc belongs to uid 1000"), "{e}");
+        assert!(e.contains("/home/svc belongs to user svc (1000)"), "{e}");
         // A link in root's folders is followed, and the file it leads to is
         // what root runs and replaces; relative links and `..` too.
         let fs = layout(&[
@@ -917,7 +1011,7 @@ mod tests {
             ),
         ]);
         let e = root_program(bin, &fs).unwrap_err();
-        assert!(e.contains("/home/svc belongs to uid 1000"), "{e}");
+        assert!(e.contains("/home/svc belongs to user svc (1000)"), "{e}");
         // A loop of links ends.
         let fs = layout(&[(
             "/usr/local/bin/pithagoras-sync",
@@ -931,6 +1025,43 @@ mod tests {
                 .unwrap_err()
                 .contains("too many links")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_names_who_can_write_and_the_cure() {
+        let bin = Path::new("/usr/local/bin/pithagoras-sync");
+        // Debian's old root:staff 2775 /usr/local/bin.
+        let e =
+            root_program(bin, &layout(&[("/usr/local/bin", 0, 50, 0o42775, None)])).unwrap_err();
+        assert!(
+            e.contains("/usr/local/bin is writable by group staff (50)"),
+            "{e}"
+        );
+        assert!(
+            e.ends_with("To fix it: sudo chmod g-w /usr/local/bin"),
+            "{e}"
+        );
+        // It does not send the owner to the folder that failed.
+        assert!(!e.contains("where `setup`"), "{e}");
+        let e = root_program(bin, &layout(&[("/usr/local", 0, 0, 0o40757, None)])).unwrap_err();
+        assert!(e.ends_with("is writable by every user, so another user could change what root runs: root neither runs nor replaces it. To fix it: sudo chmod o-w /usr/local"), "{e}");
+        let e = root_program(
+            bin,
+            &layout(&[("/usr/local/bin/pithagoras-sync", 1000, 1000, 0o100755, None)]),
+        )
+        .unwrap_err();
+        assert!(e.contains("belongs to user svc (1000), not root"), "{e}");
+        assert!(
+            e.contains("sudo chown root /usr/local/bin/pithagoras-sync"),
+            "{e}"
+        );
+        let e = root_program(bin, &layout(&[("/usr/local/bin", 0, 0, 0o41777, None)])).unwrap_err();
+        assert!(e.contains("is a folder every user can write to"), "{e}");
+        // `setup` and `install --system` warn about it right away.
+        assert!(installed_warning(&layout(&[])).is_none());
+        let w = installed_warning(&layout(&[("/usr/local/bin", 0, 50, 0o42775, None)])).unwrap();
+        assert!(w.starts_with("warning: the system unit starts /usr/local/bin/pithagoras-sync, but /usr/local/bin is writable by group staff"), "{w}");
     }
 
     #[cfg(unix)]

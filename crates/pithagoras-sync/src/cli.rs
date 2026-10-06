@@ -1101,6 +1101,10 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             if !print {
                 apply_plan(&plan)?;
                 println!("Installed. `pithagoras-sync status` shows the running client.");
+                if system && let Some(w) = crate::update::installed_warning(&crate::update::RealFs)
+                {
+                    eprintln!("{w}");
+                }
             }
         }
         Cmd::Uninstall { system, print } => {
@@ -1148,6 +1152,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             apply_plan(&plan)?;
             if create_user {
                 print!("{}", setup::next_steps(&name, setup::on_path("setfacl")));
+                if let Some(w) = crate::update::installed_warning(&crate::update::RealFs) {
+                    eprintln!("{w}");
+                }
             } else {
                 println!("Removed.");
             }
