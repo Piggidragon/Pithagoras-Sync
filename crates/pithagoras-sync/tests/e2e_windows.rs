@@ -407,6 +407,20 @@ async fn windows_purge_removes_what_the_client_left_but_the_program() {
             .await;
     }
     let config = env.home.join("AppData/Roaming/pithagoras-sync");
+    if elevated() {
+        // An administrator's ssh session is elevated: the purge refuses it before
+        // it changes anything, and the rest runs from a normal process only.
+        let out = env
+            .cmd(&["uninstall", "--purge", "--yes"])
+            .output()
+            .await
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("not an elevated one"), "{err}");
+        assert!(config.join("token").exists() || config.join("config.toml").exists());
+        return;
+    }
     let state = env.home.join("AppData/Local/pithagoras-sync");
     std::fs::create_dir_all(&state).unwrap();
     for f in ["client.log", "update-released", "logon-task.xml"] {

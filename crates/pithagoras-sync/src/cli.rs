@@ -1264,6 +1264,32 @@ async fn stop_client(dirs: &Dirs) -> Result<(), String> {
     Err("the running client did not stop within 15 s: nothing was removed. Stop it first".into())
 }
 
+/// What an error of `uninstall --purge` after the stop says about the unit or
+/// task: stopped (or switched off) and how to start it again, or already deleted.
+fn stop_note(stopped: bool, deleted: bool, windows: bool, system: bool) -> String {
+    if !stopped {
+        String::new()
+    } else if deleted {
+        "\nThe unit or task is deleted already: `install` sets it up again.".into()
+    } else if windows {
+        // The name has a space.
+        format!(
+            "\nThe logon task was switched off: `schtasks /Change /TN \"{}\" /ENABLE` turns it on again.",
+            install::TASK_NAME
+        )
+    } else {
+        format!(
+            "\nThe unit was stopped: `{} {}` starts it again.",
+            if system {
+                "sudo systemctl start"
+            } else {
+                "systemctl --user start"
+            },
+            install::UNIT_NAME
+        )
+    }
+}
+
 /// How to delete `path` by hand, for the owner to copy.
 fn delete_hint(path: &Path) -> String {
     let p = path.to_string_lossy();
@@ -1474,33 +1500,18 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     apply_plan(&stop)?;
     // From here on an error comes after the unit or task was stopped, and may
     // come after part of it was removed: it says so, and that running this again
-    // goes on.
+    // goes on. Once the unit or task is deleted it says that instead.
+    let deleted = std::cell::Cell::new(false);
     let after_stop = |e: String| {
-        let stopped = if stop.is_empty() {
-            String::new()
-        } else if cfg!(windows) {
-            format!(
-                "\nThe logon task was switched off: `schtasks /Change /TN {} /ENABLE` turns it on again.",
-                install::TASK_NAME
-            )
-        } else {
-            format!(
-                "\nThe unit was stopped: `{} {}` starts it again.",
-                if system {
-                    "sudo systemctl start"
-                } else {
-                    "systemctl --user start"
-                },
-                install::UNIT_NAME
-            )
-        };
-        format!("{e}{stopped}\nRun this again to go on with what is left.")
+        let note = stop_note(!stop.is_empty(), deleted.get(), cfg!(windows), system);
+        format!("{e}{note}\nRun this again to go on with what is left.")
     };
     stop_client(dirs).await.map_err(after_stop)?;
     // What was made while the question waited and the client shut down is the
     // client's too.
     let found = crate::purge::find(dirs).map_err(after_stop)?;
     apply_plan(&uninstall).map_err(after_stop)?;
+    deleted.set(true);
     for p in &olds {
         match std::fs::remove_file(p) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1520,10 +1531,28 @@ use crate::actions::Runner as _;
 
 #[cfg(test)]
 mod tests {
-    use super::{approval_text, root_warning, status_text};
+    use super::{approval_text, root_warning, status_text, stop_note};
     use crate::control::Status;
     use sync_connector::{LinkState, LinkStatus};
     use sync_proto::methods::{Access, ApprovalInfo, Choice, FolderInfo};
+
+    #[test]
+    fn a_purge_error_says_what_the_stop_left() {
+        assert_eq!(stop_note(false, false, true, false), "");
+        // The task's name has a space and is quoted, so the command works as printed.
+        let w = stop_note(true, false, true, false);
+        assert!(w.contains("/TN \"Pithagoras Sync\" /ENABLE"), "{w}");
+        assert!(stop_note(true, false, false, false).contains("systemctl --user start"));
+        assert!(stop_note(true, false, false, true).contains("sudo systemctl start"));
+        // Once the task is deleted there is nothing to switch on.
+        for windows in [true, false] {
+            let d = stop_note(true, true, windows, false);
+            assert!(
+                d.contains("deleted already") && !d.contains("/ENABLE"),
+                "{d}"
+            );
+        }
+    }
 
     #[test]
     fn portal_text_cannot_redraw_the_status() {

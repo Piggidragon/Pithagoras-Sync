@@ -115,6 +115,8 @@ A Windows test VM (Windows 10.0.26300, Windows PowerShell 5.1, no `pwsh`, OpenSS
 scripts/windows-vm-test.sh <user>@<windows host>
 ```
 
+The purge test runs completely only from a normal (not elevated) process: from an administrator's ssh session, which is always elevated, it checks that the purge refuses and changes nothing, then stops. Run it once from a scheduled task of a normal user (or any Medium-integrity process) to cover the rest.
+
 It builds the client and every test program for `x86_64-pc-windows-msvc`, copies them to a fresh folder in the user's home, runs each there and removes the folder. All 19 test programs passed. The Windows-only ones:
 
 - `crates/ops/tests/files_windows.rs`: a junction swapped in under a granted folder fails read, stat, write and list, and the file outside is not truncated; short names and case reach the same file.
