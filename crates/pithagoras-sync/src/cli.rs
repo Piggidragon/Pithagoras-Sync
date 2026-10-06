@@ -328,42 +328,67 @@ fn mode_text(mode: Mode, expires: Option<i64>) -> String {
 }
 
 fn print_status(s: &Status) {
+    print!("{}", status_text(s));
+}
+
+/// `status` as printed. The link detail (the portal's close reason, its error
+/// texts), the device id it chose and folder paths it may set go through
+/// `visible`, so no text from the portal can hide or forge a line of it.
+fn status_text(s: &Status) -> String {
+    use std::fmt::Write;
+    use sync_policy::approve::visible;
+    let mut out = String::new();
     let state = format!("{:?}", s.link.state).to_lowercase();
-    println!(
+    let _ = writeln!(
+        out,
         "pithagoras-sync {}, running as pid {} ({:?})",
         s.version, s.pid, s.profile
     );
     match (&s.portal, &s.name) {
-        (Some(p), Some(n)) => println!(
-            "Portal:    {p} as {n} (device {})",
-            s.device_id.as_deref().unwrap_or("?")
-        ),
-        _ => println!("Portal:    not paired"),
+        (Some(p), Some(n)) => {
+            let _ = writeln!(
+                out,
+                "Portal:    {} as {} (device {})",
+                visible(p),
+                visible(n),
+                visible(s.device_id.as_deref().unwrap_or("?"))
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "Portal:    not paired");
+        }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "Link:      {state}{}",
         s.link
             .detail
             .as_ref()
-            .map(|d| format!(": {d}"))
+            .map(|d| format!(": {}", visible(d)))
             .unwrap_or_default()
     );
     if s.paused {
-        println!("PAUSED:    every call is denied until `pithagoras-sync unlock`");
+        let _ = writeln!(
+            out,
+            "PAUSED:    every call is denied until `pithagoras-sync unlock`"
+        );
     }
-    println!("Mode:      {}", mode_text(s.mode, s.mode_expires_ms));
+    let _ = writeln!(out, "Mode:      {}", mode_text(s.mode, s.mode_expires_ms));
     if s.folders.is_empty() {
-        println!("Folders:   none");
+        let _ = writeln!(out, "Folders:   none");
     }
     for f in &s.folders {
         let x = if f.execute { ", exec" } else { "" };
-        println!("Folder:    {} ({:?}{x})", f.path, f.access);
+        let _ = writeln!(out, "Folder:    {} ({:?}{x})", visible(&f.path), f.access);
     }
-    println!(
+    let _ = writeln!(
+        out,
         "Shell:     {} ({} in Folders mode)",
-        s.shell, s.folders_shell
+        visible(&s.shell),
+        s.folders_shell
     );
-    println!(
+    let _ = writeln!(
+        out,
         "Approvals: {}{}",
         s.approvals,
         if s.approvals_waiting > 0 {
@@ -375,7 +400,8 @@ fn print_status(s: &Status) {
             String::new()
         }
     );
-    println!(
+    let _ = writeln!(
+        out,
         "Portal:    may {} the settings",
         match s.portal_policy.as_str() {
             "write" => "read and change",
@@ -383,15 +409,17 @@ fn print_status(s: &Status) {
             _ => "not see",
         }
     );
-    println!("Elevation: {}", s.elevation);
-    println!(
+    let _ = writeln!(out, "Elevation: {}", s.elevation);
+    let _ = writeln!(
+        out,
         "Commands:  {} running; own cgroup per command: {}; Landlock: {}",
         s.running_commands,
         if s.cgroups { "yes" } else { "no" },
         if s.landlock { "yes" } else { "no" }
     );
-    println!("Config:    {}", s.config_file);
-    println!("Audit log: {}", s.audit_file);
+    let _ = writeln!(out, "Config:    {}", visible(&s.config_file));
+    let _ = writeln!(out, "Audit log: {}", visible(&s.audit_file));
+    out
 }
 
 /// Sends a request to the running client and wants an answer.
@@ -1005,8 +1033,56 @@ use crate::actions::Runner as _;
 
 #[cfg(test)]
 mod tests {
-    use super::{approval_text, root_warning};
-    use sync_proto::methods::{ApprovalInfo, Choice};
+    use super::{approval_text, root_warning, status_text};
+    use crate::control::Status;
+    use sync_connector::{LinkState, LinkStatus};
+    use sync_proto::methods::{Access, ApprovalInfo, Choice, FolderInfo};
+
+    #[test]
+    fn portal_text_cannot_redraw_the_status() {
+        // The portal's close reason conceals what follows, a folder path it set
+        // moves the cursor up and erases the line above, its device id clears the
+        // screen.
+        let s = Status {
+            pid: 1,
+            version: "0.1.0".into(),
+            profile: sync_policy::Profile::Headless,
+            portal: Some("https://portal.example".into()),
+            device_id: Some("dev\x1b[2J".into()),
+            name: Some("box".into()),
+            link: LinkStatus::new(LinkState::Waiting, Some("closed (1000): bye\x1b[8m".into())),
+            paused: true,
+            mode: sync_policy::Mode::Ask,
+            mode_expires_ms: None,
+            folders: vec![FolderInfo {
+                path: "/w/a\x1b[1A\x1b[2K\u{2028}".into(),
+                access: Access::Ro,
+                execute: false,
+            }],
+            folders_shell: "landlock".into(),
+            shell: "bash".into(),
+            approvals: "portal".into(),
+            approvals_waiting: 0,
+            portal_policy: "write".into(),
+            elevation: "off".into(),
+            running_commands: 0,
+            cgroups: false,
+            landlock: true,
+            config_file: "/c".into(),
+            audit_file: "/a".into(),
+        };
+        let text = status_text(&s);
+        assert!(
+            !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' || c == '\u{2028}'),
+            "{text:?}"
+        );
+        assert!(text.contains("bye\\u{1b}[8m"), "{text}");
+        assert!(text.contains("device dev\\u{1b}[2J"), "{text}");
+        assert!(text.contains("\nPAUSED:"), "{text}");
+        assert!(text.contains("\nMode:      ask\n"), "{text}");
+    }
 
     #[test]
     fn an_approval_cannot_redraw_the_list_it_is_shown_in() {

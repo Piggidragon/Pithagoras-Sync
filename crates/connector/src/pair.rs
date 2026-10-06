@@ -72,22 +72,18 @@ pub async fn pair(uri: &str, name: &str) -> Result<Paired, String> {
     let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     let resp = crate::http::post_json(&mut io, &uri.portal, sync_proto::PAIR_PATH, &body).await?;
     if !(200..300).contains(&resp.status) {
-        let text = String::from_utf8_lossy(&resp.body);
-        let msg = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!(
-            "the portal refused pairing ({}): {msg}",
-            resp.status
-        ));
+        return Err(refusal(resp.status, &resp.body));
     }
     let r: PairResponse = serde_json::from_slice(&resp.body)
         .map_err(|e| format!("the portal's pairing answer is not understood: {e}"))?;
     if !valid_token(&r.connector_token) {
         return Err("the portal sent an unusable token".into());
     }
-    if r.device_id.is_empty() || r.device_id.len() > 128 {
+    // Shown by `status`: printable text only.
+    if r.device_id.is_empty()
+        || r.device_id.len() > 128
+        || sync_policy::approve::visible(&r.device_id) != r.device_id
+    {
         return Err("the portal sent an unusable device id".into());
     }
     Ok(Paired {
@@ -127,9 +123,43 @@ pub fn load_token(path: &Path) -> Result<String, String> {
     Ok(t)
 }
 
+/// The portal's refusal as the terminal shows it: its `error` (or the start of
+/// its body), cut and with every control character escaped.
+fn refusal(status: u16, body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let msg = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| text.into_owned());
+    let mut cut: String = msg.chars().take(200).collect();
+    if cut.len() < msg.len() {
+        cut.push('…');
+    }
+    format!(
+        "the portal refused pairing ({status}): {}",
+        sync_policy::approve::visible(&cut)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_cannot_redraw_the_terminal() {
+        let e = refusal(
+            403,
+            br#"{"error": "no\u001b[1A\u001b[2KPaired with portal"}"#,
+        );
+        assert_eq!(
+            e,
+            "the portal refused pairing (403): no\\u{1b}[1A\\u{1b}[2KPaired with portal"
+        );
+        let long = format!("{{\"error\": \"{}\"}}", "x".repeat(5000));
+        assert!(refusal(400, long.as_bytes()).len() < 300);
+        let e = refusal(502, b"<html>\x1b]0;title\x07");
+        assert!(!e.chars().any(char::is_control), "{e:?}");
+    }
 
     #[test]
     fn names() {
