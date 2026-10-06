@@ -544,14 +544,21 @@ impl Dirs {
         self.state.join("audit.jsonl")
     }
 
-    /// The release time of the newest update manifest taken for `program`. One
-    /// record per program file: a user who updates two copies (root's own client
-    /// and the dedicated user's in /usr/local/bin, say) must not have a manifest
-    /// taken for one refuse an older-dated one for the other.
+    /// The release time of the newest update manifest seen for `program`. One
+    /// record per program file: a manifest only looked at for one copy (root's own
+    /// client, say) must not refuse an older-dated one for another (the dedicated
+    /// user's in /usr/local/bin).
     pub fn update_seen_file(&self, program: &Path) -> PathBuf {
         let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
         self.state
             .join(format!("update-released-{:016x}", path_hash(&program)))
+    }
+
+    /// The release time of the newest release this user installed, for any
+    /// program: no program is taken below it, so one updated for the first time
+    /// still refuses an older manifest served again.
+    pub fn update_user_seen_file(&self) -> PathBuf {
+        self.state.join("update-released")
     }
 
     /// Present while the client is paused by `panic`, until `unlock`.

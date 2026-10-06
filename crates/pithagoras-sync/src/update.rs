@@ -11,9 +11,10 @@
 //! config, the policy and the pairing stay as they are.
 //!
 //! The manifest says when it was released (signed with the rest). The client keeps
-//! the newest release time it has taken and refuses a manifest released before it,
-//! so whoever controls the release listing but not the key cannot serve an older
-//! signed manifest again to a client that already saw a newer one.
+//! the newest release time it has seen for each program and the newest one its
+//! user installed, and refuses a manifest released before either, so whoever
+//! controls the release listing but not the key cannot serve an older signed
+//! manifest again to a client that already saw or took a newer one.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -113,14 +114,15 @@ pub struct Plan {
 }
 
 /// Fetches and checks the manifest at `source` (an https URL, or a local path
-/// for tests and offline updates). `seen` is the file with the newest release
-/// time this client took: a manifest released before it is refused, a newer one
-/// is written there.
+/// for tests and offline updates). `records` are the files with the newest
+/// release times taken (the program's own, then this user's): a manifest
+/// released before the highest is refused, and a newer time is written to the
+/// first. `record` raises this user's once a release is installed.
 pub async fn check(
     source: &str,
     key: &str,
     current: &str,
-    seen: Option<&Path>,
+    records: &[&Path],
 ) -> Result<Offer, String> {
     let data = fetch(source, MAX_MANIFEST as u64).await?;
     let sig = fetch(&format!("{source}.minisig"), 4096).await?;
@@ -129,8 +131,8 @@ pub async fn check(
     let new = parse_version(&manifest.version)
         .ok_or_else(|| format!("the manifest's version {:?} is not x.y.z", manifest.version))?;
     let cur = parse_version(current).ok_or("this build's version is not x.y.z")?;
-    if let Some(seen) = seen {
-        let last = read_seen(seen);
+    if let Some(own) = records.first() {
+        let last = records.iter().map(|p| read_seen(p)).max().unwrap_or(0);
         if manifest.released < last {
             return Err(format!(
                 "the manifest (version {}, released {}) is older than one this client already took (released {}): an older release is being served again, so nothing is installed",
@@ -139,8 +141,8 @@ pub async fn check(
                 utc(last)
             ));
         }
-        if manifest.released > last {
-            write_seen(seen, manifest.released)?;
+        if manifest.released > read_seen(own) {
+            write_seen(own, manifest.released)?;
         }
     }
     let released = manifest.released;
@@ -179,6 +181,14 @@ fn read_seen(path: &Path) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// Raises the record at `path` to `released`, if that is newer.
+pub fn record(path: &Path, released: u64) -> Result<(), String> {
+    if released > read_seen(path) {
+        write_seen(path, released)?;
+    }
+    Ok(())
 }
 
 fn write_seen(path: &Path, released: u64) -> Result<(), String> {

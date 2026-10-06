@@ -104,7 +104,7 @@ A server set up with `setup --create-user` or `install --system` has its program
 sudo pithagoras-sync update
 ```
 
-As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file and every folder above it belong to root and are writable by nobody else, since root runs it), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). Each program keeps its own record of the newest release taken, so updating one never makes another refuse a release. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
+As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file and every folder above it belong to root and are writable by nobody else, since root runs it), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). A release is refused if it was made before the newest one seen for that program or the newest one this user installed for any program, so an older release served again is not taken, not even by a program updated for the first time. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 

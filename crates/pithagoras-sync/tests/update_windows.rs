@@ -79,7 +79,7 @@ async fn a_release_in_a_local_folder_replaces_the_running_program() {
     let source = rel.join("manifest.json").to_string_lossy().into_owned();
     let result = async {
         let seen = dir.join(r"state\update-released");
-        let plan = update::check(&source, &key.public_base64(), "0.0.0", Some(&seen))
+        let plan = update::check(&source, &key.public_base64(), "0.0.0", &[&seen])
             .await?
             .plan
             .ok_or_else(|| "nothing newer".to_string())?;

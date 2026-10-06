@@ -999,9 +999,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     (v.to_string(), whose.to_string())
                 }
             };
+            let records = [dirs.update_seen_file(&exe), dirs.update_user_seen_file()];
             let offer =
-                crate::update::check(source, key, &current, Some(&dirs.update_seen_file(&exe)))
-                    .await?;
+                crate::update::check(source, key, &current, &[&records[0], &records[1]]).await?;
             // The date shows a release listing that stopped moving.
             let released = crate::update::utc(offer.released);
             let Some(plan) = offer.plan else {
@@ -1022,6 +1022,10 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             crate::update::install(&plan, &exe).await?;
             println!("Updated {} to {}.", exe.display(), plan.version);
+            // No program of this user is taken below this release from now on.
+            if let Err(e) = crate::update::record(&records[1], offer.released) {
+                eprintln!("pithagoras-sync: {e}");
+            }
             if !crate::update::same_program(&exe, &me) {
                 println!("The one you ran, {}, is unchanged.", me.display());
             }
