@@ -1,19 +1,22 @@
 # A release: on a version tag (v0.0.2) or a pre-release tag (pre-v0.0.2, pre2-v0.0.2),
 # check the workspace, build the static musl Linux binaries (x86_64, aarch64) and
 # the Windows x86_64 program with the release key's public half compiled in, then
-# publish them as a GitHub Release with SHA256SUMS and manifest.json signed by the
-# release key. A version tag is a real release and the latest one, which
+# publish them as a GitHub Release with SHA256SUMS. A version tag is a real release
+# and the latest one: it also gets manifest.json signed by the release key, which
 # `pithagoras-sync update` reads (the stable channel). A pre-release tag is a
-# pre-release for testing: it is never "latest", so the stable channel never offers
-# it. Its binaries report the plain version (0.0.2), so everywhere below the
-# version is what follows the last `v` of the tag.
+# pre-release for testing: it gets the binaries and SHA256SUMS but no manifest, and
+# the release key is not used for it at all, so it can never be offered by
+# `update`, even if its listing is edited to look like the latest release. Its
+# binaries report the plain version (0.0.2), so everywhere below the version is
+# what follows the last `v` of the tag.
 #
 # One-time setup by the repository owner (docs/releasing.md):
 #   - repository variable PITHAGORAS_SYNC_UPDATE_KEY: the public key
 #   - secret PITHAGORAS_SYNC_SIGNING_KEY of the environment `release`: the secret
 #     key file's content; the environment needs the owner's approval
 #
-# Only a tag on a commit of main makes a release: the first step stops any other.
+# Only a tag of one of the three shapes on a commit of main makes a release: the
+# first step of `check` stops any other shape, the third any tag off main.
 # Only the `publish` job runs in the `release` environment, so only it can read
 # the key, and only after the owner approved the run. In it the key reaches one
 # step, which runs the release tool built in its own job: no build script or
@@ -202,7 +205,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The signing steps run for a real release only (a tag that starts with `v`,
+      # which `check` has made sure of); a pre-release has no manifest and never
+      # sees the key.
       - name: The signing key is set up
+        if: ${{ startsWith(github.ref_name, 'v') }}
         env:
           HAS_SECRET: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY != '' }}
         run: |
@@ -220,6 +227,7 @@ jobs:
           name: sync-release
           path: tool
       - name: The manifest
+        if: ${{ startsWith(github.ref_name, 'v') }}
         run: |
           chmod +x tool/sync-release
           cd dist
@@ -231,39 +239,49 @@ jobs:
             pithagoras-sync-x86_64-windows.exe=x86_64-windows
       # The only step that sees the secret key itself.
       - name: Sign the manifest
+        if: ${{ startsWith(github.ref_name, 'v') }}
         env:
           PITHAGORAS_SYNC_SIGNING_KEY: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY }}
         run: tool/sync-release sign --key-env PITHAGORAS_SYNC_SIGNING_KEY dist/manifest.json
-      - name: The signature and the checksums
+      - name: The signature
+        if: ${{ startsWith(github.ref_name, 'v') }}
         env:
           PUBLIC_KEY: ${{ vars.PITHAGORAS_SYNC_UPDATE_KEY }}
         run: |
-          tool=$PWD/tool/sync-release
-          cd dist
           # The secret must belong to the public key in the binaries, or no client
           # could take this release.
-          "$tool" verify --public "$PUBLIC_KEY" manifest.json
-          "$tool" sums --out SHA256SUMS pithagoras-sync-* manifest.json manifest.json.minisig
-          cat manifest.json SHA256SUMS
+          tool/sync-release verify --public "$PUBLIC_KEY" dist/manifest.json
+      - name: The checksums
+        run: |
+          chmod +x tool/sync-release
+          tool=$PWD/tool/sync-release
+          cd dist
+          # A pre-release has the binaries only; a real release the manifest too.
+          files=(pithagoras-sync-*)
+          if [ -e manifest.json ]; then
+            files+=(manifest.json manifest.json.minisig)
+          fi
+          "$tool" sums --out SHA256SUMS "${files[@]}"
+          cat SHA256SUMS
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A pre-release tag (pre-v0.0.2, pre2-v0.0.2) makes a pre-release, which is
-          # not "latest", so the stable update channel never offers it. A version tag
-          # makes a real release and is marked latest explicitly (docs/releasing.md).
-          # The `check` job has refused every other shape.
+          # A version tag (v0.0.2) makes a real release, marked latest explicitly
+          # (docs/releasing.md). Any other tag, which can only be a pre-release tag
+          # (pre-v0.0.2, pre2-v0.0.2) since the `check` job has refused every other
+          # shape, makes a pre-release: no manifest, so no update channel offers it.
           version=${GITHUB_REF_NAME##*v}
-          notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs the latest release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
           case "$GITHUB_REF_NAME" in
-            pre*)
-              flags=(--prerelease)
-              title="Pithagoras Sync $version (pre-release $GITHUB_REF_NAME)"
-              notes="Pre-release for testing. It is not the latest release, so \`pithagoras-sync update\` does not offer it by itself: \`pithagoras-sync update --manifest https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/manifest.json\`. $notes"
-              ;;
-            *)
+            v*)
               flags=(--latest)
               title="Pithagoras Sync $version"
+              notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs the latest release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
+              ;;
+            *)
+              flags=(--prerelease)
+              title="Pithagoras Sync $version (pre-release $GITHUB_REF_NAME)"
+              notes="Pre-release for testing: static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. It has no update manifest, so \`pithagoras-sync update\` never offers it. To install it, download the binary of your platform and run its \`install\` (README); SHA256SUMS lists the checksums. If a client of this same version already runs, restart it afterwards: on Linux \`systemctl --user restart pithagoras-sync\`, on Windows sign out and in, or \`schtasks /End /TN \"Pithagoras Sync\"\` and then \`schtasks /Run /TN \"Pithagoras Sync\"\` (docs/releasing.md)."
               ;;
           esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \

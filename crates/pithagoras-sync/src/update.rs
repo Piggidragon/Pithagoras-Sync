@@ -30,7 +30,8 @@ use crate::install::UNIT_NAME;
 pub const PUBLIC_KEY: Option<&str> = option_env!("PITHAGORAS_SYNC_UPDATE_KEY");
 
 /// The stable release channel: the manifest of the newest GitHub release that is
-/// not a pre-release (`.github/workflows/release.yml` publishes it).
+/// not a pre-release (`.github/workflows/release.yml` publishes it; a pre-release
+/// has no manifest, so it can never be taken from here).
 pub const STABLE_MANIFEST: &str = concat!(
     env!("CARGO_PKG_REPOSITORY"),
     "/releases/latest/download/manifest.json"

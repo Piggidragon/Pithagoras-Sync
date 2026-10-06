@@ -1274,7 +1274,8 @@ impl Env {
     ///
     /// A text that never shows fails the run (exit code -1, "timed out" in what
     /// was shown) after 15 s, and the child is killed, so a changed prompt makes
-    /// a test fail instead of hang.
+    /// a test fail instead of hang (and `timeout` ends the helper itself after
+    /// 60 s, should the helper hang).
     fn in_terminal_racing(
         &self,
         args: &[&str],
@@ -1335,8 +1336,11 @@ if not read(None):
     finish("timed out waiting for the command to end")
 finish(None)
 "#;
-        let out = std::process::Command::new("python3")
-            .args(["-c", PY, BIN, &serde_json::to_string(script).unwrap()])
+        // `timeout` is the helper's own safety net: should it hang, the run fails
+        // after a minute (no `exit=` in its output) instead of blocking the suite.
+        let out = std::process::Command::new("timeout")
+            .args(["-s", "KILL", "60", "python3", "-c", PY])
+            .args([BIN, &serde_json::to_string(script).unwrap()])
             .args(args)
             .env_clear()
             .env("HOME", &self.home)
@@ -1696,7 +1700,31 @@ async fn a_change_made_while_a_sudo_question_waits_stays() {
     assert_eq!(mode().await.trim(), "ask", "the narrowing was undone");
 }
 
-/// A terminal run that never gets its prompt fails, it does not hang.
+/// The processes of the client's program that run with this environment's home.
+fn clients_left(env: &Env) -> Vec<u32> {
+    let home = format!("HOME={}", env.home.display());
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        let runs_it = cmdline.split(|b| *b == 0).next() == Some(BIN.as_bytes());
+        if runs_it && environ.split(|b| *b == 0).any(|v| v == home.as_bytes()) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// A terminal run that never gets its prompt fails, it does not hang, and the
+/// command it ran does not stay behind. `sudo set` blocks at its password prompt,
+/// so only the helper's kill ends it (`sudo status` would end by itself).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_run_without_its_prompt_fails_instead_of_hanging() {
     if !have_python() {
@@ -1705,11 +1733,20 @@ async fn a_terminal_run_without_its_prompt_fails_instead_of_hanging() {
     let env = Env::new();
     let started = std::time::Instant::now();
     let (code, shown) = env
-        .in_terminal(&["sudo", "status"], &[("never printed", "x\n")])
+        .in_terminal(&["sudo", "set"], &[("never printed", "x\n")])
         .unwrap();
     assert_eq!(code, -1, "{shown}");
     assert!(shown.contains("timed out waiting"), "{shown}");
-    assert!(started.elapsed() < Duration::from_secs(60));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        clients_left(&env),
+        Vec::<u32>::new(),
+        "the command was left running"
+    );
 }
 
 /// A password file left over from file storage is no stored password once the

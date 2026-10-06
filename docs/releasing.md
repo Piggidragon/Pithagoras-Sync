@@ -1,15 +1,19 @@
 # Releasing
 
-A release is a tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. There are two kinds of tag:
+A release is a tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries and publishes a GitHub Release; for a real release it also signs the update manifest. There are two kinds of tag:
 
 | Tag | Example | Release |
 |---|---|---|
 | `v<x.y.z>` | `v0.0.2` | A real release, marked latest (`gh release create --latest`). `pithagoras-sync update` reads the manifest of the latest release (`releases/latest/download/manifest.json` of this repository: the stable channel), so it offers this one. |
-| `pre-v<x.y.z>`, `pre<N>-v<x.y.z>` | `pre-v0.0.2`, `pre2-v0.0.2` | A pre-release for the owner's testing, never "latest", so the stable channel never offers it. Its notes say how to take it: `pithagoras-sync update --manifest https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json` (the assets come from the release's own page, not from `releases/latest`). |
+| `pre-v<x.y.z>`, `pre<N>-v<x.y.z>` | `pre-v0.0.2`, `pre2-v0.0.2` | A pre-release for the owner's testing: the three binaries and `SHA256SUMS`, no `manifest.json` and no signature, and the release key is not used for it. `pithagoras-sync update` never offers it (see below). |
 
-`N` is one or more digits (`pre0-v0.0.2` passes too), for a second and third try of the same version. Any other tag shape is refused: the trigger filter lists only these three, and the first step of the `check` job fails on any other tag, so nothing is built. The binaries of a pre-release report the plain version (`0.0.2`): the version is what follows the last `v` of the tag, and the workflow compares that with `Cargo.toml` and with `--version`. The manifest of a pre-release carries that version, with the pre-release's tag in the download URLs.
+`N` is one or more digits (`pre0-v0.0.2` passes too), for a second and third try of the same version. Any other tag shape is refused: the trigger filter lists only these three, and the first step of the `check` job fails on any other tag, so nothing is built. The binaries of a pre-release report the plain version (`0.0.2`): the version is what follows the last `v` of the tag, and the workflow compares that with `Cargo.toml` and with `--version`.
 
-A client takes a manifest only if its version is newer than its own, and a pre-release and the real release of the same version have the same version number. So a client that took `pre-v0.0.2` will not take `v0.0.2` by `update`: install the real release again, from the release page as the README describes.
+**A pre-release has no manifest.** A manifest of a pre-release would be signed like a real one and carry the same version number, so it could not be told from a real release: someone who can edit the release listing (write access is enough) could mark it as the latest release and put a test build on the stable channel, and a client that took it would then report "Up to date" for the real release of that version. A client that only looked at it would also move its replay floor (below) past the stable release. So the workflow skips the manifest, the signature and the key for a pre-release. If one is marked as the latest release by editing the listing, `releases/latest/download/manifest.json` does not exist: `update` fails with the error of the missing file and installs nothing. `update` is tested with a real release, or with the local test keys and a release folder (testing.md), not with a pre-release.
+
+To install a pre-release, download the binary of your platform from its release page and run its `install`, as the README describes for a release. If a client of that same version already runs (an earlier try of it, say), `install` does not restart it: restart it yourself, with `systemctl --user restart pithagoras-sync` on Linux (`sudo systemctl restart pithagoras-sync` for the system unit of a server), and on Windows by signing out and in, or `schtasks /End /TN "Pithagoras Sync"` and then `schtasks /Run /TN "Pithagoras Sync"`. The same goes for the real release of a version that a machine runs as a pre-release: `update` sees the same version number and takes nothing, so install the real release's binary and restart the client. Check the download with `sha256sum -c SHA256SUMS`.
+
+A signed `prerelease` flag in the manifest, so that pre-releases could be offered on purpose, is a possible later step and is not done. It would need the clients to read it first, and a build that knows whether it is a pre-release, so that a real release replaces it.
 
 ## What a release holds
 
@@ -18,11 +22,11 @@ A client takes a manifest only if its version is newer than its own, and a pre-r
 | `pithagoras-sync-x86_64-linux` | Static musl binary, x86_64 |
 | `pithagoras-sync-aarch64-linux` | Static musl binary, aarch64 (built on GitHub's arm64 runner) |
 | `pithagoras-sync-x86_64-windows.exe` | Windows x86_64, with the C runtime linked in |
-| `manifest.json` | The version, when it was released (`released`, Unix seconds) and, per target (`x86_64-linux`, `aarch64-linux`, `x86_64-windows`), each binary's URL, size and sha256 |
-| `manifest.json.minisig` | The manifest's signature by the release key |
-| `SHA256SUMS` | Checksums of everything above, for `sha256sum -c` |
+| `manifest.json` | Real releases only. The version, when it was released (`released`, Unix seconds) and, per target (`x86_64-linux`, `aarch64-linux`, `x86_64-windows`), each binary's URL, size and sha256 |
+| `manifest.json.minisig` | Real releases only. The manifest's signature by the release key |
+| `SHA256SUMS` | Checksums of everything above (of the binaries only, for a pre-release), for `sha256sum -c` |
 
-Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13). It also keeps the release time of the newest manifest it took and refuses one released before it, so a client never goes back to an older signed manifest it already moved past. That protects against a download path that serves stale files (a mirror, a cache, a proxy), not against someone who can change this repository's releases (write access is enough to edit one). A new signature takes more: a commit on `main`, a tag only the owner may create, and the owner's approval of the run (see "Who can sign" below). It does not help a client that never saw the newer manifest either, and a manifest does not expire, so a listing frozen at an old release still verifies; `update --check` shows the release date, which makes a channel that stopped moving visible. Each release must be made later than the one before it, which a release made by the workflow is.
+Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13). It also keeps the release time of the newest manifest it took and refuses one released before it, so a client never goes back to an older signed manifest it already moved past. That protects against a download path that serves stale files (a mirror, a cache, a proxy), not against someone who can change this repository's releases (write access is enough to edit one). A new signature takes more: a commit on `main`, a tag only the owner may create, and the owner's approval of the run (see "Who can sign" below). It does not help a client that never saw the newer manifest either, and a manifest does not expire, so a listing frozen at an old release still verifies; `update --check` shows the release date, which makes a channel that stopped moving visible. Each real release must be made later than the one before it, which a release made by the workflow is. A pre-release has no manifest, so it never sets that time.
 
 ## One-time setup
 
@@ -43,11 +47,11 @@ Keep `release.key` offline (a password manager or an encrypted backup) and delet
 
 Losing the secret key means the clients in the field cannot take another update: they trust only the key compiled into them, and a new key needs a binary installed by hand. A leaked key lets whoever holds it sign updates every client takes: make a new key, publish a release built with it, and tell users to install that one by hand.
 
-The workflow refuses to run without the variable (the `check` job) or the secret (the `publish` job, the only one that can see it), and before it publishes it checks the signature against the variable, so a secret that does not belong to the public key fails the release instead of producing one no client can take.
+The workflow refuses to run without the variable (the `check` job); for a real release it also refuses to run without the secret (the `publish` job, the only one that can see it), and before it publishes it checks the signature against the variable, so a secret that does not belong to the public key fails the release instead of producing one no client can take.
 
 To rotate the key: clients trust only the key compiled into them, so the change takes one release built with the new public key and signed with the old key. The workflow cannot make that one (it checks the signature against the public key it compiles in), so make it by hand from the tagged commit on `main`: build the three binaries with the new public key in `PITHAGORAS_SYNC_UPDATE_KEY`, then `sync-release manifest`, `sign --key <old key file>` and `sums` as the workflow does, and attach the files to the tag's release (reject the workflow's own run for that tag at the approval). Then set the new public key as the variable and the new secret as the environment secret; later releases come from the workflow again. After a leak the old key proves nothing: make a new key and have users install by hand.
 
-The secret reaches one step of the workflow only: the one that runs `sync-release sign`. The tool is built in a job of its own without the secret, and the job that signs checks nothing out and builds nothing, so no build script or proc macro of a dependency runs while the key is readable. The actions are pinned by commit. What remains: the tool's own code, its dependencies included, runs with the key when it signs, so a compromised dependency compiled into `sync-release` could still take it; the lock file and review of dependency updates are the defence there.
+The secret reaches one step of the workflow only: the one that runs `sync-release sign`, which runs for a real release and not for a pre-release. The tool is built in a job of its own without the secret, and the job that signs checks nothing out and builds nothing, so no build script or proc macro of a dependency runs while the key is readable. The actions are pinned by commit. What remains: the tool's own code, its dependencies included, runs with the key when it signs, so a compromised dependency compiled into `sync-release` could still take it; the lock file and review of dependency updates are the defence there.
 
 ### Who can sign
 
@@ -59,7 +63,7 @@ The secret reaches one step of the workflow only: the one that runs `sync-releas
 ## Making a release
 
 1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and merge that to `main`.
-2. Tag the merged commit on `main` and push the tag. `v<version>` is the real release, `pre-v<version>` (or `pre2-v<version>` for another try) a pre-release to test first:
+2. Tag the merged commit on `main` and push the tag. `v<version>` is the real release, `pre-v<version>` (or `pre2-v<version>` for another try) a pre-release, binaries only, to test first:
 
    ```sh
    git switch main && git pull
@@ -68,7 +72,7 @@ The secret reaches one step of the workflow only: the one that runs `sync-releas
    ```
 
 3. In the Actions tab, open the run "Release". When check, builds and tool are done, `publish` waits for review: check that the commit is the one you tagged, then approve the deployment to `release`.
-4. When the run is green, check the release: the three binaries, `manifest.json`, `manifest.json.minisig` and `SHA256SUMS`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and for a real release `pithagoras-sync update --check` from an installed client, which should offer the new version (a pre-release is not offered: take it with `update --manifest <url>`).
+4. When the run is green, check the release: the three binaries and `SHA256SUMS`, and for a real release also `manifest.json` and `manifest.json.minisig`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and for a real release `pithagoras-sync update --check` from an installed client of an older version, which should offer the new version. A client that already runs that version (say, from its pre-release) says "Up to date": test `update` with a real release, or with the local release folder and test keys (testing.md), and install a pre-release by hand (above).
 
 The workflow checks that the version of the tag (what follows its last `v`) is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
 
@@ -95,6 +99,6 @@ The workflow was checked with `actionlint` 1.7.7 (without shellcheck), and its s
 
 The split of the publish job (the tool built in its own job, the key only in the sign step, actions pinned by commit) was checked by parsing the YAML and by running the publish job's steps by hand against the tool built as in its job, after a round trip without the executable bit as artifacts make it (`manifest`, `sign --key-env`, `verify`, `sums`, `sha256sum -c`); actionlint was not run on it again. The same holds for the `main` check and the `release` environment: the YAML was parsed and read, not linted, and neither has run on GitHub yet.
 
-The tag rules (the three shapes, the version after the last `v`, pre-release or latest) were run by hand on the `check` and `publish` steps with a fake `gh`, for good and bad tags; `gh release create --latest` was not run.
+The tag rules (the three shapes, the version after the last `v`, pre-release or latest) were run by hand on the `check` and `publish` steps extracted from the YAML, with a fake `gh` and a fake release tool, for `v0.0.2`, `pre-v0.0.2` and `pre12-v0.0.2` and for bad tags: a real release runs the manifest, sign, verify and checksum steps and gets `--latest`; a pre-release skips the key check, manifest, sign and verify, lists only the binaries in `SHA256SUMS`, and gets `--prerelease`. `gh release create --latest` and `--prerelease` were not run.
 
 Not run: the workflow itself on GitHub (nothing is published until a tag is pushed), the aarch64 build, and `gh release create`.
