@@ -220,6 +220,10 @@ async fn portal_text_cannot_redraw_the_notification() {
     for (target, allow) in [
         ("cat x\x1b[1A\x1b[2K\u{202e}harmless".to_string(), true),
         (format!("echo {}; rm -rf ~", "a".repeat(500)), false),
+        // Line and paragraph separators break a notification's lines: escaped,
+        // and counted as what is shown, so 60 of them make it too long.
+        (format!("ls{}; rm -rf ~", "\u{2028}".repeat(20)), true),
+        (format!("ls{}; rm -rf ~", "\u{2029}".repeat(60)), false),
     ] {
         let (_server, seen) = serve(&bus, Some("allow"), &["actions", "body"]).await;
         let conn = client(&bus).await;
@@ -233,10 +237,8 @@ async fn portal_text_cannot_redraw_the_notification() {
             .unwrap();
         let seen = seen.lock().unwrap();
         assert!(
-            !seen
-                .body
-                .chars()
-                .any(|c| c.is_control() && c != '\n' || c == '\u{202e}'),
+            !seen.body.chars().any(|c| c.is_control() && c != '\n'
+                || matches!(c, '\u{202e}' | '\u{2028}' | '\u{2029}')),
             "{:?}",
             seen.body
         );

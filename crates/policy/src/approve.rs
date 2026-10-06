@@ -8,8 +8,9 @@ use std::pin::Pin;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// `s` as the owner may safely read it before answering: every control character
-/// (C0 with newlines and tabs, DEL, C1) and every bidirectional-text control is
-/// written as a visible escape. Text of an approval comes from the portal, and a
+/// (C0 with newlines and tabs, DEL, C1), every bidirectional-text control and the
+/// line and paragraph separators (U+2028, U+2029, where notification servers
+/// break lines) are written as visible escapes. Text of an approval comes from the portal, and a
 /// terminal or notification would otherwise let it move the cursor, redraw lines
 /// or reorder characters, so the owner would approve something other than what
 /// they read.
@@ -21,7 +22,7 @@ pub fn visible(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || is_bidi_control(c) => {
+            c if c.is_control() || is_bidi_control(c) || matches!(c, '\u{2028}' | '\u{2029}') => {
                 let _ = write!(out, "\\u{{{:x}}}", c as u32);
             }
             c => out.push(c),
@@ -103,5 +104,6 @@ mod tests {
             "a\\u{1b}[2A\\u{1b}[2Kb\\nc\\r\\td\\u{7f}\\u{9b}e\\u{202e}f\\g é"
         );
         assert!(!visible(s).chars().any(|c| c.is_control()));
+        assert_eq!(visible("a\u{2028}b\u{2029}c"), "a\\u{2028}b\\u{2029}c");
     }
 }

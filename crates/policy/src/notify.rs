@@ -104,8 +104,10 @@ const MAX_TARGET: usize = 400;
 /// Longest chat id shown.
 const MAX_CHAT: usize = 64;
 
+/// Counted as shown, escapes included: a target of many separators or control
+/// characters is as long as what the owner would have to read.
 fn fits(target: &str) -> bool {
-    target.chars().count() <= MAX_TARGET
+    visible(target).chars().count() <= MAX_TARGET
 }
 
 fn clip(s: &str, max: usize) -> String {
