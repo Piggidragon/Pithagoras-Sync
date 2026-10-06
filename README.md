@@ -23,23 +23,25 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 ## Linux laptop or desktop
 
-1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); before the first one, build it as described below and use `target/x86_64-unknown-linux-musl/release/pithagoras-sync`.
+1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). 0.0.x are pre-releases published by a version tag ([docs/releasing.md](docs/releasing.md)); to build it yourself, see below.
 
    ```sh
    curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/download/v0.0.1/pithagoras-sync-x86_64-linux
    chmod +x pithagoras-sync-x86_64-linux
    ```
 
-2. In the portal, open Settings, Devices, "Pair a device", and copy the pairing URI. Then pair. Quote the URI, since it contains `&`. On a desktop, this and every later policy change asks for your password in the terminal.
-
-   ```sh
-   ./pithagoras-sync-x86_64-linux pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
-   ```
-
-3. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit.
+2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Until it is paired the client just waits (`status` says "not paired").
 
    ```sh
    ./pithagoras-sync-x86_64-linux install
+   ```
+
+   `~/.local/bin` is on the `PATH` of most distributions once the folder exists and you log in again. Until then, in this terminal: `export PATH="$HOME/.local/bin:$PATH"`.
+
+3. In the portal, open Settings, Devices, "Pair a device", and copy the pairing URI. Then pair. Quote the URI, since it contains `&`. On a desktop, this and every later policy change asks for your password in the terminal. The running client takes the pairing at once.
+
+   ```sh
+   pithagoras-sync pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
    ```
 
 4. Check that it runs. To use Folders mode, grant folders first:
@@ -72,11 +74,11 @@ sudo systemctl start pithagoras-sync
 Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases/tag/v0.0.1), save it as `pithagoras-sync.exe`, then in PowerShell:
 
 ```powershell
-.\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 .\pithagoras-sync.exe install
+.\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 
