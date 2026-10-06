@@ -163,6 +163,10 @@ async fn a_binary_that_does_not_match_stays_out() {
     let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
     let e = update::install(&plan, &exe).await.unwrap_err();
     assert!(e.contains("sha256"), "{e}");
+    assert!(
+        e.ends_with("(nothing was replaced, and no client was restarted)"),
+        "{e}"
+    );
     // A different size than the manifest says, the sha256 right.
     let manifest = r.publish("0.2.0", &program("0.2.0"), None);
     let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();

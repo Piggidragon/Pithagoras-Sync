@@ -492,8 +492,15 @@ pub fn what_runs(pid: u32, exe: &Path) -> Option<Runs> {
 /// Windows, where a running program cannot be replaced, the old one is moved
 /// aside to `<exe>.old` first. A link to the program stays a link: the file it
 /// leads to is replaced, so the program keeps its path, and with it its record
-/// of the releases taken.
+/// of the releases taken. On failure the program is left as it was, and the
+/// error says so: no client is restarted either.
 pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
+    put_in_place(plan, exe)
+        .await
+        .map_err(|e| format!("{e} (nothing was replaced, and no client was restarted)"))
+}
+
+async fn put_in_place(plan: &Plan, exe: &Path) -> Result<(), String> {
     #[cfg(unix)]
     let exe = &std::fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let data = fetch(&plan.source, plan.artifact.size).await?;
