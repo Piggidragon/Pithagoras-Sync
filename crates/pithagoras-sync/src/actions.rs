@@ -14,6 +14,14 @@ pub trait Runner {
     fn try_run(&self, argv: &[String]) -> Result<String, String> {
         self.run(argv)
     }
+
+    /// Sets a string value under `HKEY_CURRENT_USER\<key>` (Windows); `name`
+    /// empty is the key's default value.
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String>;
+
+    /// Removes `HKEY_CURRENT_USER\<key>` and everything under it; a key that is
+    /// not there is no error.
+    fn reg_delete(&self, key: &str) -> Result<(), String>;
 }
 
 /// Runs real programs.
@@ -44,6 +52,26 @@ impl Runner for System {
     fn try_run(&self, argv: &[String]) -> Result<String, String> {
         self.run_with(argv, std::process::Stdio::null())
     }
+
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        return crate::registry::set_string(key, name, value);
+        #[cfg(not(windows))]
+        {
+            let _ = (key, name, value);
+            Err("the registry is Windows only".into())
+        }
+    }
+
+    fn reg_delete(&self, key: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        return crate::registry::delete_tree(key);
+        #[cfg(not(windows))]
+        {
+            let _ = key;
+            Err("the registry is Windows only".into())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +98,17 @@ pub enum Action {
         argv: Vec<String>,
         hint: String,
     },
+    /// A string value under `HKEY_CURRENT_USER\<key>` (Windows; never another
+    /// hive). `name` empty is the key's default value.
+    RegSet {
+        key: String,
+        name: String,
+        value: String,
+    },
+    /// `HKEY_CURRENT_USER\<key>` and everything under it.
+    RegDelete {
+        key: String,
+    },
 }
 
 pub fn argv(parts: &[&str]) -> Vec<String> {
@@ -86,6 +125,11 @@ impl Action {
             Action::Remove { path } => format!("remove {}", path.display()),
             Action::Run { argv } => format!("run: {}", shell_words(argv)),
             Action::Try { argv, .. } => format!("run (may fail): {}", shell_words(argv)),
+            Action::RegSet { key, name, value } => format!(
+                "set HKCU\\{key} {} = {value}",
+                if name.is_empty() { "(default)" } else { name }
+            ),
+            Action::RegDelete { key } => format!("remove HKCU\\{key} and what is in it"),
         }
     }
 }
@@ -160,6 +204,16 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
                     hints.push(format!("{e}: {hint}"));
                 }
             }
+            Action::RegSet { key, name, value } => {
+                runner
+                    .reg_set(key, name, value)
+                    .map_err(|e| format!("HKCU\\{key}: {e}"))?;
+            }
+            Action::RegDelete { key } => {
+                runner
+                    .reg_delete(key)
+                    .map_err(|e| format!("HKCU\\{key}: {e}"))?;
+            }
         }
     }
     Ok(hints)
@@ -219,5 +273,16 @@ impl Runner for Fake {
             .find(|(k, _)| *k == key)
             .map(|(_, a)| a.clone())
             .unwrap_or(Ok(String::new()))
+    }
+
+    /// Recorded as `reg set <key> <name> <value>`.
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String> {
+        self.run(&argv(&["reg", "set", key, name, value]))
+            .map(|_| ())
+    }
+
+    /// Recorded as `reg delete <key>`.
+    fn reg_delete(&self, key: &str) -> Result<(), String> {
+        self.run(&argv(&["reg", "delete", key])).map(|_| ())
     }
 }

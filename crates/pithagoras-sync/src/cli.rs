@@ -1535,7 +1535,23 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn install_plan(
+/// `$XDG_DATA_HOME`, or `~/.local/share`: where desktop entries and icons go.
+pub fn data_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"))
+}
+
+/// Whether `install` left a desktop entry or icon here.
+fn desktop_installed(data: &Path) -> bool {
+    data.join("applications")
+        .join(install::DESKTOP_FILE)
+        .exists()
+        || install::icon_path(data).exists()
+}
+
+pub(crate) fn install_plan(
     system: bool,
     user: Option<&str>,
     linger: bool,
@@ -1576,11 +1592,18 @@ fn install_plan(
         );
     }
     let home = info::home().ok_or("cannot find the home directory")?;
-    let linger = linger && info::session() == "headless";
-    Ok(install::user_plan(&home, exe, &info::user().0, linger))
+    let headless = info::session() == "headless";
+    let linger = linger && headless;
+    let mut plan = install::user_plan(&home, exe, &info::user().0, linger);
+    // In a graphical session: the menu entry and the handler of pairing links.
+    if !headless {
+        let program = home.join(".local/bin/pithagoras-sync");
+        plan.extend(install::desktop_plan(&data_home(&home), &program)?);
+    }
+    Ok(plan)
 }
 
-fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
+pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     if cfg!(windows) {
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
         return Ok(install::windows_uninstall_plan(&local));
@@ -1592,7 +1615,12 @@ fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
         return Ok(install::system_uninstall_plan());
     }
     let home = info::home().ok_or("cannot find the home directory")?;
-    Ok(install::user_uninstall_plan(&home))
+    let mut plan = install::user_uninstall_plan(&home);
+    let data = data_home(&home);
+    if desktop_installed(&data) {
+        plan.extend(install::desktop_uninstall_plan(&data));
+    }
+    Ok(plan)
 }
 
 /// Asks the running client to exit and waits until it has, so it does not write
@@ -1732,7 +1760,21 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
             .is_some_and(|d| d.join(install::UNIT_NAME).exists())
     };
     let (stop, uninstall) = if !installed {
-        (Vec::new(), Vec::new())
+        // A link handler left without the unit or task (removed by hand).
+        let mut links = Vec::new();
+        #[cfg(windows)]
+        if crate::registry::exists(install::WINDOWS_CLASS_KEY) {
+            links = install::windows_link_uninstall_plan();
+        }
+        if let Some(data) = home
+            .as_ref()
+            .filter(|_| linux && !system)
+            .map(|h| data_home(h))
+            && desktop_installed(&data)
+        {
+            links = install::desktop_uninstall_plan(&data);
+        }
+        (Vec::new(), links)
     } else if cfg!(windows) {
         (install::windows_stop_plan(), uninstall_plan(false)?)
     } else if system {

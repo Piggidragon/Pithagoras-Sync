@@ -3,6 +3,10 @@
 //! Linux: a systemd user unit (desktop, or a server user with lingering), or with
 //! `--system` a system unit (`User=` a dedicated user, or root). Windows: a
 //! per-user logon task in Task Scheduler, not a service (session 0 has no desktop).
+//!
+//! On a desktop, `install` also registers the program for `pithagoras-sync://`
+//! links, so the pairing link in the portal opens it: a `.desktop` file and an
+//! icon on Linux, a key under `HKEY_CURRENT_USER\Software\Classes` on Windows.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +15,14 @@ use crate::actions::{Action, argv};
 pub const UNIT_NAME: &str = "pithagoras-sync.service";
 pub const TASK_NAME: &str = "Pithagoras Sync";
 pub const SYSTEM_BIN: &str = "/usr/local/bin/pithagoras-sync";
+/// The URI scheme of the pairing link.
+pub const SCHEME: &str = "pithagoras-sync";
+/// The desktop entry, in `<data home>/applications`.
+pub const DESKTOP_FILE: &str = "pithagoras-sync.desktop";
+/// The icon, built into the program (the release is one file).
+pub const ICON: &[u8] = include_bytes!("../../../assets/pithagoras-sync.svg");
+/// The link handler's key under `HKEY_CURRENT_USER`.
+pub const WINDOWS_CLASS_KEY: &str = r"Software\Classes\pithagoras-sync";
 const DESCRIPTION: &str = "Pithagoras Sync: lets a Pithagoras portal's agent reach this computer";
 const DOCS: &str = "https://github.com/Piggidragon/Pithagoras-Sync";
 
@@ -111,6 +123,123 @@ pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Actio
         });
     }
     v
+}
+
+/// The desktop entry's `Exec=` program, quoted as the Desktop Entry
+/// Specification asks: inside double quotes `"`, `` ` ``, `$` and `\` take a
+/// backslash, then every backslash is doubled for the file's string escapes, and
+/// `%` is doubled since it starts a field code.
+fn desktop_exec_arg(program: &str) -> String {
+    let mut q = String::from("\"");
+    for c in program.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    q.replace('\\', "\\\\").replace('%', "%%")
+}
+
+/// The `.desktop` file: in the menu as "Pithagoras Sync", the handler of
+/// `pithagoras-sync://` links. Both start `gui`, which takes the link when
+/// there is one (`%u`).
+pub fn desktop_entry(program: &Path) -> Result<String, String> {
+    let p = program
+        .to_str()
+        .filter(|p| !p.chars().any(char::is_control))
+        .ok_or_else(|| format!("{}: not a path a desktop entry can name", program.display()))?;
+    Ok(format!(
+        "[Desktop Entry]
+Type=Application
+Name=Pithagoras Sync
+Comment=Lets your Pithagoras portal's agent reach this computer
+Exec={} gui %u
+Icon=pithagoras-sync
+Terminal=false
+Categories=Network;
+MimeType=x-scheme-handler/{SCHEME};
+",
+        desktop_exec_arg(p)
+    ))
+}
+
+/// The icon's path below the data home.
+pub fn icon_path(data_home: &Path) -> PathBuf {
+    data_home.join("icons/hicolor/scalable/apps/pithagoras-sync.svg")
+}
+
+/// The desktop entry, the icon and the link handler for the program `install`
+/// put in place. The two tools are best effort: one that is missing is a note.
+pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, String> {
+    let apps = data_home.join("applications");
+    Ok(vec![
+        Action::Write {
+            path: icon_path(data_home),
+            content: ICON.to_vec(),
+            mode: 0o644,
+        },
+        Action::Write {
+            path: apps.join(DESKTOP_FILE),
+            content: desktop_entry(program)?.into_bytes(),
+            mode: 0o644,
+        },
+        Action::Try {
+            argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
+            hint: "the menu may show Pithagoras Sync only after the next login".into(),
+        },
+        Action::Try {
+            argv: argv(&[
+                "xdg-mime",
+                "default",
+                DESKTOP_FILE,
+                &format!("x-scheme-handler/{SCHEME}"),
+            ]),
+            hint: "pairing links may not open Pithagoras Sync; paste the link into it instead (Pithagoras Sync in the menu)".into(),
+        },
+    ])
+}
+
+/// Undoes `desktop_plan`. The `x-scheme-handler` line `xdg-mime` wrote to
+/// `mimeapps.list` stays: the file is the desktop's, and the line leads nowhere
+/// once the entry is gone.
+pub fn desktop_uninstall_plan(data_home: &Path) -> Vec<Action> {
+    let apps = data_home.join("applications");
+    vec![
+        Action::Remove {
+            path: apps.join(DESKTOP_FILE),
+        },
+        Action::Remove {
+            path: icon_path(data_home),
+        },
+        Action::Try {
+            argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
+            hint: "the menu may show Pithagoras Sync until the next login".into(),
+        },
+    ]
+}
+
+/// The `pithagoras-sync://` handler on Windows, for the program at `exe`:
+/// `HKCU\Software\Classes\pithagoras-sync` with `URL Protocol` and the command
+/// `"<exe>" "%1"`.
+pub fn windows_link_plan(exe: &str) -> Vec<Action> {
+    let set = |key: &str, name: &str, value: &str| Action::RegSet {
+        key: key.to_string(),
+        name: name.to_string(),
+        value: value.to_string(),
+    };
+    let command = format!(r"{WINDOWS_CLASS_KEY}\shell\open\command");
+    vec![
+        set(WINDOWS_CLASS_KEY, "", "URL:Pithagoras Sync pairing link"),
+        set(WINDOWS_CLASS_KEY, "URL Protocol", ""),
+        set(&command, "", &format!("\"{exe}\" \"%1\"")),
+    ]
+}
+
+pub fn windows_link_uninstall_plan() -> Vec<Action> {
+    vec![Action::RegDelete {
+        key: WINDOWS_CLASS_KEY.into(),
+    }]
 }
 
 pub fn user_uninstall_plan(home: &Path) -> Vec<Action> {
@@ -332,7 +461,7 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
     let base = local_app_data.trim_end_matches('\\');
     let target = format!(r"{base}\Programs\pithagoras-sync\pithagoras-sync.exe");
     let xml_path = format!(r"{base}\pithagoras-sync\logon-task.xml");
-    vec![
+    let mut plan = vec![
         // A running client holds its program open, and the copy over it would fail:
         // `install` again (to repair or update by hand) ends the task first.
         Action::Try {
@@ -358,7 +487,9 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
             argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
             hint: "it starts at the next logon".into(),
         },
-    ]
+    ];
+    plan.extend(windows_link_plan(&target));
+    plan
 }
 
 /// `user_stop_plan` for the logon task: switched off first, or its minute
@@ -378,7 +509,7 @@ pub fn windows_stop_plan() -> Vec<Action> {
 
 pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
     let base = local_app_data.trim_end_matches('\\');
-    vec![
+    let mut plan = vec![
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
             hint: "it was not running".into(),
@@ -389,7 +520,9 @@ pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
         Action::Remove {
             path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
         },
-    ]
+    ];
+    plan.extend(windows_link_uninstall_plan());
+    plan
 }
 
 #[cfg(test)]
@@ -574,6 +707,146 @@ mod tests {
         let ran = fake.ran.lock().unwrap().clone();
         assert!(ran.contains(&argv(&["systemctl", "enable", "--now", UNIT_NAME])));
         assert!(ran.contains(&argv(&["systemctl", "disable", "--now", UNIT_NAME])));
+    }
+
+    #[test]
+    fn the_desktop_entry_opens_pairing_links_and_the_menu_with_gui() {
+        let e = desktop_entry(Path::new("/home/someone/.local/bin/pithagoras-sync")).unwrap();
+        assert!(e.contains("\nExec=\"/home/someone/.local/bin/pithagoras-sync\" gui %u\n"));
+        assert!(e.contains("\nMimeType=x-scheme-handler/pithagoras-sync;\n"));
+        assert!(e.contains("\nTerminal=false\n"));
+        assert!(e.contains("\nIcon=pithagoras-sync\n"));
+        assert!(e.contains("\nCategories=Network;\n"));
+        assert!(e.contains("\nName=Pithagoras Sync\n"));
+        // Quoted as the spec says: no space, quote, `$` or `%` in the path can
+        // add an argument, expand a variable or become a field code.
+        let e = desktop_entry(Path::new("/home/a b/$x \"q\" 100%/p\\s")).unwrap();
+        assert!(
+            e.contains(r#"Exec="/home/a b/\\$x \\"q\\" 100%%/p\\\\s" gui %u"#),
+            "{e}"
+        );
+        // A path with a line break could add lines to the file.
+        assert!(desktop_entry(Path::new("/home/a\nExec=evil/p")).is_err());
+        assert!(desktop_plan(Path::new("/d"), Path::new("/x\ry")).is_err());
+    }
+
+    #[test]
+    fn install_and_uninstall_register_and_remove_the_link_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let data = Path::new("/home/someone/.local/share");
+        let program = Path::new("/home/someone/.local/bin/pithagoras-sync");
+        let fake = Fake::default();
+        apply(&desktop_plan(data, program).unwrap(), root.path(), &fake).unwrap();
+        let r = root.path();
+        let entry = r.join("home/someone/.local/share/applications/pithagoras-sync.desktop");
+        let icon =
+            r.join("home/someone/.local/share/icons/hicolor/scalable/apps/pithagoras-sync.svg");
+        assert_eq!(
+            std::fs::read_to_string(&entry).unwrap(),
+            desktop_entry(program).unwrap()
+        );
+        assert_eq!(std::fs::read(&icon).unwrap(), ICON);
+        let ran = fake.ran.lock().unwrap().clone();
+        assert_eq!(
+            ran,
+            [
+                argv(&[
+                    "update-desktop-database",
+                    "/home/someone/.local/share/applications"
+                ]),
+                argv(&[
+                    "xdg-mime",
+                    "default",
+                    "pithagoras-sync.desktop",
+                    "x-scheme-handler/pithagoras-sync"
+                ]),
+            ]
+        );
+        // A missing tool is a note, not a failed install.
+        let missing = Fake {
+            answers: vec![("xdg-mime default".into(), Err("xdg-mime: not found".into()))],
+            ..Fake::default()
+        };
+        let hints = apply(&desktop_plan(data, program).unwrap(), r, &missing).unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("paste the link"), "{hints:?}");
+        apply(&desktop_uninstall_plan(data), r, &Fake::default()).unwrap();
+        assert!(!entry.exists() && !icon.exists());
+        // The plans as `--print` lists them.
+        let listed: Vec<String> = desktop_plan(data, program)
+            .unwrap()
+            .iter()
+            .map(Action::describe)
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.ends_with("applications/pithagoras-sync.desktop"))
+        );
+        assert!(listed.iter().any(|l| l.contains("xdg-mime default")));
+    }
+
+    #[test]
+    fn the_windows_link_handler_is_the_current_users_alone() {
+        let plan = windows_plan(
+            r"C:\Users\ann\AppData\Local",
+            Path::new("pithagoras-sync.exe"),
+            "S-1-5-21-1",
+        );
+        let fake = Fake::default();
+        let root = tempfile::tempdir().unwrap();
+        let regs: Vec<Action> = plan
+            .into_iter()
+            .filter(|a| matches!(a, Action::RegSet { .. }))
+            .collect();
+        apply(&regs, root.path(), &fake).unwrap();
+        let ran = fake.ran.lock().unwrap().clone();
+        let exe = r"C:\Users\ann\AppData\Local\Programs\pithagoras-sync\pithagoras-sync.exe";
+        assert_eq!(
+            ran,
+            [
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync",
+                    "",
+                    "URL:Pithagoras Sync pairing link"
+                ]),
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync",
+                    "URL Protocol",
+                    ""
+                ]),
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync\shell\open\command",
+                    "",
+                    &format!("\"{exe}\" \"%1\"")
+                ]),
+            ]
+        );
+        assert!(
+            regs[0]
+                .describe()
+                .starts_with(r"set HKCU\Software\Classes\pithagoras-sync")
+        );
+        let un = windows_uninstall_plan(r"C:\Users\ann\AppData\Local");
+        assert_eq!(
+            un.last(),
+            Some(&Action::RegDelete {
+                key: r"Software\Classes\pithagoras-sync".into()
+            })
+        );
+        // The real runner refuses the registry off Windows rather than doing
+        // something else.
+        #[cfg(not(windows))]
+        assert!(
+            crate::actions::Runner::reg_set(&crate::actions::System, "Software\\x", "", "")
+                .is_err()
+        );
     }
 
     #[test]

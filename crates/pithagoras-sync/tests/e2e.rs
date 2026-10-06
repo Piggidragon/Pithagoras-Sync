@@ -821,6 +821,129 @@ async fn install_print_and_toggle() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
 }
 
+/// `install` in a graphical session also writes the menu entry, the icon and the
+/// handler of pairing links, and `uninstall` and `uninstall --purge` take them
+/// away. Stand-ins for systemctl, update-desktop-database and xdg-mime log
+/// their arguments: nothing reaches the real systemd or the real `~/.local`.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_in_a_desktop_session_registers_the_pairing_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    let log = env.root.join("systemctl.log");
+    for prog in ["update-desktop-database", "xdg-mime"] {
+        let p = env.root.join("fakebin").join(prog);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\necho \"{prog} $*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let data = env.root.join("data");
+    let run = |args: &[&str], display: bool| {
+        let mut c = env.cmd(args);
+        c.env("PATH", &path).env("XDG_DATA_HOME", &data);
+        if display {
+            c.env("DISPLAY", ":99");
+        }
+        c
+    };
+    let entry = data.join("applications/pithagoras-sync.desktop");
+    let icon = data.join("icons/hicolor/scalable/apps/pithagoras-sync.svg");
+    // Over ssh (no display) nothing of the desktop's.
+    let out = run(&["install", "--print"], false).output().await.unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        !text.contains(".desktop") && !text.contains("xdg-mime"),
+        "{text}"
+    );
+
+    let out = run(&["install", "--print"], true).output().await.unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("write {}", entry.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("write {}", icon.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("xdg-mime default pithagoras-sync.desktop x-scheme-handler/pithagoras-sync"),
+        "{text}"
+    );
+    assert!(!entry.exists());
+
+    let out = run(&["install"], true).output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let program = env.home.join(".local/bin/pithagoras-sync");
+    let desktop = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        desktop.contains(&format!("Exec=\"{}\" gui %u", program.display())),
+        "{desktop}"
+    );
+    assert!(std::fs::read_to_string(&icon).unwrap().starts_with("<svg"));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains(&format!(
+            "update-desktop-database {}",
+            data.join("applications").display()
+        )),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("xdg-mime default pithagoras-sync.desktop x-scheme-handler/pithagoras-sync"),
+        "{calls}"
+    );
+
+    // `uninstall` (no display needed) lists and removes them.
+    let out = run(&["uninstall", "--print"], false)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("remove {}", entry.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("remove {}", icon.display())),
+        "{text}"
+    );
+    assert!(entry.exists());
+    let out = run(&["uninstall"], false).output().await.unwrap();
+    assert!(out.status.success());
+    assert!(!entry.exists() && !icon.exists());
+
+    // Left without the unit, `--purge` still finds them.
+    let out = run(&["install"], true).output().await.unwrap();
+    assert!(out.status.success());
+    std::fs::remove_file(
+        env.home
+            .join(".config/systemd/user/pithagoras-sync.service"),
+    )
+    .unwrap();
+    let out = run(&["uninstall", "--purge", "--yes"], false)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("remove {}", entry.display())),
+        "{text}"
+    );
+    assert!(!entry.exists() && !icon.exists());
+    // The program stays, as `--purge` says.
+    assert!(program.exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn refuses_to_run_without_its_control_socket() {
     // Without the socket, `panic` could not reach the client: it must not start.
