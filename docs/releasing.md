@@ -1,6 +1,6 @@
 # Releasing
 
-A release is a version tag. `.github/workflows/release.yml` then checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. `pithagoras-sync update` reads the manifest of the newest release (`releases/latest/download/manifest.json` of this repository: the stable channel; pre-releases are not "latest", so they never reach it).
+A release is a version tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. `pithagoras-sync update` reads the manifest of the newest release (`releases/latest/download/manifest.json` of this repository: the stable channel; pre-releases are not "latest", so they never reach it).
 
 ## What a release holds
 
@@ -13,44 +13,53 @@ A release is a version tag. `.github/workflows/release.yml` then checks the work
 | `manifest.json.minisig` | The manifest's signature by the release key |
 | `SHA256SUMS` | Checksums of everything above, for `sha256sum -c` |
 
-Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13). It also keeps the release time of the newest manifest it took and refuses one released before it, so a client never goes back to an older signed manifest it already moved past. That protects against a download path that serves stale files (a mirror, a cache, a proxy), not against someone who can change this repository's releases: on GitHub that takes the same write access as pushing a tag, and a pushed tag gets a fresh signature with a fresh release time unless signing waits for an approval (see "Who can sign" below). It does not help a client that never saw the newer manifest either, and a manifest does not expire, so a listing frozen at an old release still verifies; `update --check` shows the release date, which makes a channel that stopped moving visible. Each release must be made later than the one before it, which a release made by the workflow is.
+Every binary has the release key's public half compiled in (`PITHAGORAS_SYNC_UPDATE_KEY`). The client takes a manifest only with a valid signature by that key, a binary only with the size and sha256 the manifest names, and only a newer version (protocol.md, decision 13). It also keeps the release time of the newest manifest it took and refuses one released before it, so a client never goes back to an older signed manifest it already moved past. That protects against a download path that serves stale files (a mirror, a cache, a proxy), not against someone who can change this repository's releases (write access is enough to edit one). A new signature takes more: a commit on `main`, a tag only the owner may create, and the owner's approval of the run (see "Who can sign" below). It does not help a client that never saw the newer manifest either, and a manifest does not expire, so a listing frozen at an old release still verifies; `update --check` shows the release date, which makes a channel that stopped moving visible. Each release must be made later than the one before it, which a release made by the workflow is.
 
 ## One-time setup
 
-The release key is a minisign-compatible Ed25519 key. Its secret half lives only in a GitHub secret; its public half goes into every binary. Make it once, on a machine you trust, from a checkout of this repository:
+The release key is a minisign-compatible Ed25519 key. Its secret half lives only in a secret of the GitHub environment `release`; its public half goes into every binary. Make it once, on a machine you trust, from a checkout of this repository:
 
 ```sh
 cargo run --release -p sync-release -- keygen release.key
 ```
 
-It writes the secret key to `release.key` (readable by you only; it never overwrites a file) and prints the public key, one line of base64 starting with `RW`. Then, in the repository's Settings, Secrets and variables, Actions:
+It writes the secret key to `release.key` (readable by you only; it never overwrites a file) and prints the public key, one line of base64 starting with `RW`. Then, in the repository's Settings:
 
-1. **Variable** `PITHAGORAS_SYNC_UPDATE_KEY`: the public key line. A variable, not a secret: it is public, and every binary carries it.
-2. **Secret** `PITHAGORAS_SYNC_SIGNING_KEY`: the whole content of `release.key`.
+1. **Repository variable** `PITHAGORAS_SYNC_UPDATE_KEY` (Secrets and variables, Actions, Variables): the public key line. A variable, not a secret: it is public, and every binary carries it.
+2. **Environment** `release` (Environments): required reviewer the owner, "Prevent self-review" off (the owner is the only reviewer and pushes the tags), deployment branches and tags limited to the tag pattern `v*`.
+3. **Environment secret** `PITHAGORAS_SYNC_SIGNING_KEY` of `release`: the whole content of `release.key`. Not a repository secret: one of those would be readable by every job of every workflow.
+4. **Tag ruleset** (Rules, Rulesets) on `v*`: only the owner may create such tags (bypass list), nobody may update or delete them, and non-fast-forward is blocked.
 
 Keep `release.key` offline (a password manager or an encrypted backup) and delete the working copy. Never commit it, and never use it in tests: tests make throwaway keys.
 
 Losing the secret key means the clients in the field cannot take another update: they trust only the key compiled into them, and a new key needs a binary installed by hand. A leaked key lets whoever holds it sign updates every client takes: make a new key, publish a release built with it, and tell users to install that one by hand.
 
-The workflow refuses to run without both, and before it publishes it checks the signature against the variable, so a secret that does not belong to the public key fails the release instead of producing one no client can take.
+The workflow refuses to run without the variable (the `check` job) or the secret (the `publish` job, the only one that can see it), and before it publishes it checks the signature against the variable, so a secret that does not belong to the public key fails the release instead of producing one no client can take.
+
+To rotate the key: clients trust only the key compiled into them, so the change takes one release built with the new public key and signed with the old key. The workflow cannot make that one (it checks the signature against the public key it compiles in), so make it by hand from the tagged commit on `main`: build the three binaries with the new public key in `PITHAGORAS_SYNC_UPDATE_KEY`, then `sync-release manifest`, `sign --key <old key file>` and `sums` as the workflow does, and attach the files to the tag's release (reject the workflow's own run for that tag at the approval). Then set the new public key as the variable and the new secret as the environment secret; later releases come from the workflow again. After a leak the old key proves nothing: make a new key and have users install by hand.
 
 The secret reaches one step of the workflow only: the one that runs `sync-release sign`. The tool is built in a job of its own without the secret, and the job that signs checks nothing out and builds nothing, so no build script or proc macro of a dependency runs while the key is readable. The actions are pinned by commit. What remains: the tool's own code, its dependencies included, runs with the key when it signs, so a compromised dependency compiled into `sync-release` could still take it; the lock file and review of dependency updates are the defence there.
 
 ### Who can sign
 
-What the owner should set, in the repository's settings (the workflow does not do it yet): a GitHub environment `release` (Settings, Environments) that holds the secret `PITHAGORAS_SYNC_SIGNING_KEY` instead of the repository, with a required reviewer and deployments limited to tags matching `v*`; `environment: release` on the `publish` job only, so no other job can reach the key (the `check` job's test for the secret then has to move into `publish`, since an environment secret is empty outside it); and a tag ruleset (Settings, Rules) so that only admins can create, move or delete `v*` tags.
-
-Why: a tag can point at any commit, also one on a branch nobody reviewed, and the run takes both the workflow and the signing tool from that commit. With a plain repository secret, any account or token that can push a commit and a tag gets a signed release every client installs, or, by changing the workflow, the key itself, and a key cannot be replaced in the field. With the environment, the run stops before the key is handed out until the reviewer approves it, and the reviewer sees which commit is about to be signed; the ruleset keeps a stolen write token from making a `v*` tag at all. Signing offline, by the key holder, would be stronger still.
+- **Only a commit on `main`.** The first step of the run fails unless the tagged commit is `main` or an ancestor of it ("tag vX is not on main: merge to main first, then tag"). Every other job needs that one, so a tag on another branch builds nothing and never reaches the key. This matters because a run takes the workflow and the signing tool from the tagged commit.
+- **Only with the owner's approval.** `publish` is the only job in the environment `release`. It waits until the owner approves it in the Actions tab, and the run shows the commit about to be signed. No other job can read the secret.
+- **Only tags the owner made.** The tag ruleset keeps everyone else, another account's stolen write token included, from creating a `v*` tag, and nobody can move or delete one, so a published version always names the same commit.
+- **The owner's GitHub account holds all of it.** Whoever controls it can merge to `main`, tag and approve. Keep two-factor authentication on, with a hardware key or an authenticator rather than SMS, and keep personal access tokens few and short-lived. Signing offline, by the key holder, would be stronger still.
 
 ## Making a release
 
-1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and commit.
-2. Tag that commit `v<version>` and push the tag:
+1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and merge that to `main`.
+2. Tag the merged commit on `main` with `v<version>` and push the tag:
 
    ```sh
+   git switch main && git pull
    git tag v0.0.1
    git push origin v0.0.1
    ```
+
+3. In the Actions tab, open the run "Release". When check, builds and tool are done, `publish` waits for review: check that the commit is the one you tagged, then approve the deployment to `release`.
+4. When the run is green, check the release: the three binaries, `manifest.json`, `manifest.json.minisig` and `SHA256SUMS`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and `pithagoras-sync update --check` from an installed client, which should offer the new version.
 
 The workflow checks that the tag is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
 
@@ -75,6 +84,6 @@ The public key and the signatures are in minisign's format (a legacy, not prehas
 
 The workflow was checked with `actionlint` 1.7.7 (without shellcheck), and its steps were run by hand on Linux: the x86_64 musl build (with clang as the C compiler, the workflow uses `musl-gcc`) and the Windows build (with `cargo xwin` instead of the Windows runner), both with a throwaway key compiled in; the static-binary, version and no-`VCRUNTIME140` checks; `manifest`, `sign --key-env`, `verify` (a wrong key refused), `sums` and `sha256sum -c`; and the release client's `update --check` against that manifest (up to date at 0.1.0, 0.1.1 offered, a manifest signed by another key refused). Against GitHub, `update --check` reached the stable channel's URL (HTTP 404: no release yet) and followed GitHub's release download redirects.
 
-The split of the publish job (the tool built in its own job, the key only in the sign step, actions pinned by commit) was checked by parsing the YAML and by running the publish job's steps by hand against the tool built as in its job, after a round trip without the executable bit as artifacts make it (`manifest`, `sign --key-env`, `verify`, `sums`, `sha256sum -c`); actionlint was not run on it again.
+The split of the publish job (the tool built in its own job, the key only in the sign step, actions pinned by commit) was checked by parsing the YAML and by running the publish job's steps by hand against the tool built as in its job, after a round trip without the executable bit as artifacts make it (`manifest`, `sign --key-env`, `verify`, `sums`, `sha256sum -c`); actionlint was not run on it again. The same holds for the `main` check and the `release` environment: the YAML was parsed and read, not linted, and neither has run on GitHub yet.
 
 Not run: the workflow itself on GitHub (nothing is published until a tag is pushed), the aarch64 build, and `gh release create`.

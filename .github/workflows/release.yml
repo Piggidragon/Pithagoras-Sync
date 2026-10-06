@@ -6,11 +6,15 @@
 #
 # One-time setup by the repository owner (docs/releasing.md):
 #   - repository variable PITHAGORAS_SYNC_UPDATE_KEY: the public key
-#   - repository secret PITHAGORAS_SYNC_SIGNING_KEY: the secret key file's content
+#   - secret PITHAGORAS_SYNC_SIGNING_KEY of the environment `release`: the secret
+#     key file's content; the environment needs the owner's approval
 #
-# The secret key reaches one step only, which runs the release tool built in its
-# own job: no build script or proc macro runs while the key is in an environment.
-# The actions are pinned by commit.
+# Only a tag on a commit of main makes a release: the first step stops any other.
+# Only the `publish` job runs in the `release` environment, so only it can read
+# the key, and only after the owner approved the run. In it the key reaches one
+# step, which runs the release tool built in its own job: no build script or
+# proc macro runs while the key is in an environment. The actions are pinned by
+# commit.
 name: Release
 
 on:
@@ -33,7 +37,18 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
+      # Every other job needs this one, so a tag off main stops here, before
+      # anything is built and long before the key.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag $GITHUB_REF_NAME is not on main: merge to main first, then tag" >&2
+            exit 1
+          fi
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
@@ -45,13 +60,14 @@ jobs:
             echo "the tag is $GITHUB_REF_NAME, Cargo.toml says $version" >&2
             exit 1
           fi
-      - name: The release key is set up
+      # The secret key is the `release` environment's, which this job cannot see:
+      # `publish` checks it.
+      - name: The public key is set up
         env:
           PUBLIC_KEY: ${{ vars.PITHAGORAS_SYNC_UPDATE_KEY }}
-          HAS_SECRET: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY != '' }}
         run: |
-          if [ -z "$PUBLIC_KEY" ] || [ "$HAS_SECRET" != true ]; then
-            echo "set the variable PITHAGORAS_SYNC_UPDATE_KEY and the secret PITHAGORAS_SYNC_SIGNING_KEY (docs/releasing.md)" >&2
+          if [ -z "$PUBLIC_KEY" ]; then
+            echo "set the repository variable PITHAGORAS_SYNC_UPDATE_KEY (docs/releasing.md)" >&2
             exit 1
           fi
       # Tests are built without the release key: they sign with throwaway keys.
@@ -160,13 +176,24 @@ jobs:
           path: target/release/sync-release
           if-no-files-found: error
 
-  # No checkout and no build here: only the artifacts of the jobs above.
+  # No checkout and no build here: only the artifacts of the jobs above. The
+  # only job in the `release` environment: it waits for the owner's approval and
+  # is the only one that can read the secret key.
   publish:
     needs: [linux, windows, tool]
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
     steps:
+      - name: The signing key is set up
+        env:
+          HAS_SECRET: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY != '' }}
+        run: |
+          if [ "$HAS_SECRET" != true ]; then
+            echo "the environment release has no secret PITHAGORAS_SYNC_SIGNING_KEY (docs/releasing.md)" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pithagoras-sync-*
@@ -186,7 +213,7 @@ jobs:
             pithagoras-sync-x86_64-linux=x86_64-linux \
             pithagoras-sync-aarch64-linux=aarch64-linux \
             pithagoras-sync-x86_64-windows.exe=x86_64-windows
-      # The only step that sees the secret key.
+      # The only step that sees the secret key itself.
       - name: Sign the manifest
         env:
           PITHAGORAS_SYNC_SIGNING_KEY: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY }}
