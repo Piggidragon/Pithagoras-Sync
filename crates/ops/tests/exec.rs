@@ -42,6 +42,7 @@ fn all() -> Vec<(&'static str, Test)> {
         output_is_capped,
         scrubbed_output_stays_within_the_frame_size,
         landlock_keeps_the_shell_in_its_folders,
+        a_confined_commands_tmpdir_is_its_own,
         commands_get_their_own_cgroup,
         the_shim_dies_with_the_client,
         the_shim_takes_the_secret_only_untraced,
@@ -425,6 +426,61 @@ async fn landlock_keeps_the_shell_in_its_folders() {
     if sync_ops::shim::landlock::abi_version().unwrap_or(0) >= 6 {
         assert!(out.contains("NO_SIGNAL_OUT"), "{out}");
     }
+}
+
+/// A confined command's private TMPDIR is its own: removed when the command is
+/// gone, and never handed to a later command on the same stream number.
+#[cfg(target_os = "linux")]
+async fn a_confined_commands_tmpdir_is_its_own() {
+    if !sync_ops::landlock_available() {
+        panic!("this kernel has no Landlock; the test cannot show confinement");
+    }
+    let f = fx();
+    let proj = f.dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let protected = sync_policy::protected::Protected::new(&f.dir, &[], &Default::default());
+    let grants = vec![sync_policy::FolderGrant {
+        path: proj.clone(),
+        access: sync_policy::Access::Rw,
+        execute: true,
+    }];
+    let p = Permit {
+        path: proj.clone(),
+        root: Some(proj.clone()),
+        confine: Confine::Landlock(sync_policy::engine::landlock_rules(
+            &grants,
+            &protected,
+            &[],
+        )),
+        elevate: None,
+    };
+    let e = Execs::new(config(&f, own_env()));
+    let cmd = "echo secret > \"$TMPDIR/left\" && echo \"dir=$TMPDIR\"; ls -A \"$TMPDIR\"";
+    let dir = |out: &str| {
+        let d = out
+            .lines()
+            .find_map(|l| l.strip_prefix("dir="))
+            .unwrap_or_else(|| panic!("no TMPDIR: {out}"));
+        PathBuf::from(d)
+    };
+    let (out, o) = run(&e, 1, cmd, &p, None).await;
+    assert_eq!(o.code, Some(0), "{out}");
+    let first = dir(&out);
+    assert!(first.starts_with(f.dir.join("exec-tmp")), "{out}");
+    let mut removed = false;
+    for _ in 0..50 {
+        if !first.exists() {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(removed, "{} outlived its command", first.display());
+    // The same stream number again (as after a reconnect): a fresh, empty one.
+    let (out, o) = run(&e, 1, "echo \"dir=$TMPDIR\"; ls -A \"$TMPDIR\"", &p, None).await;
+    assert_eq!(o.code, Some(0), "{out}");
+    assert_ne!(dir(&out), first);
+    assert!(!out.contains("left"), "{out}");
 }
 
 #[cfg(target_os = "linux")]

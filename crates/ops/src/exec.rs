@@ -143,6 +143,8 @@ pub struct Execs {
     cgroups: Option<crate::cgroup::CgroupBase>,
     /// The elevation secret: injected for `sudo` commands, scrubbed from output.
     secrets: std::sync::OnceLock<Arc<SecretSlot>>,
+    /// Numbers the private temporary directories, so no two commands share one.
+    next_tmp: std::sync::atomic::AtomicU64,
 }
 
 impl Execs {
@@ -153,6 +155,7 @@ impl Execs {
             #[cfg(target_os = "linux")]
             cgroups: crate::cgroup::CgroupBase::detect(),
             secrets: std::sync::OnceLock::new(),
+            next_tmp: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -249,7 +252,7 @@ impl Execs {
             t.starting.insert(stream);
             t.epoch
         };
-        let spawned = self.spawn_command(&cfg, stream, command, permit);
+        let spawned = self.spawn_command(&cfg, command, permit);
         let mut t = self.table.lock().unwrap();
         t.starting.remove(&stream);
         let spawned = spawned?;
@@ -272,24 +275,29 @@ impl Execs {
     fn spawn_command(
         &self,
         cfg: &ExecConfig,
-        stream: u32,
         command: &str,
         permit: &Permit,
     ) -> Result<Spawned, RpcError> {
         let mut env = crate::env::scrubbed(&cfg.base_env, &cfg.env_passthrough);
+        let mut tmp = None;
         let landlock = match &permit.confine {
             Confine::None => None,
             Confine::Landlock(rules) => {
                 // A private temporary directory: the confined shell cannot write /tmp.
-                let tmp = cfg
+                // One per command, never reused (stream numbers start again on every
+                // connection), and removed when the command is gone.
+                let n = self
+                    .next_tmp
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dir = cfg
                     .tmp_base
-                    .join(format!("exec-{}-{stream}", std::process::id()));
-                std::fs::create_dir_all(&tmp)
-                    .map_err(|e| RpcError::new(code::IO, format!("temp dir: {e}")))?;
+                    .join(format!("exec-{}-{n}", std::process::id()));
+                fresh_dir(&dir).map_err(|e| RpcError::new(code::IO, format!("temp dir: {e}")))?;
                 env.retain(|(k, _)| k != "TMPDIR");
-                env.push(("TMPDIR".into(), tmp.to_string_lossy().into_owned()));
+                env.push(("TMPDIR".into(), dir.to_string_lossy().into_owned()));
                 let mut write = rules.write.clone();
-                write.push(tmp);
+                write.push(dir.clone());
+                tmp = Some(dir);
                 Some(LandlockSpec {
                     read: rules.read.clone(),
                     write,
@@ -297,6 +305,24 @@ impl Execs {
                 })
             }
         };
+        let spawned = self.spawn_shim(cfg, command, permit, env, landlock, tmp.clone());
+        if spawned.is_err()
+            && let Some(t) = tmp
+        {
+            let _ = std::fs::remove_dir_all(t);
+        }
+        spawned
+    }
+
+    fn spawn_shim(
+        &self,
+        cfg: &ExecConfig,
+        command: &str,
+        permit: &Permit,
+        env: Vec<(String, String)>,
+        landlock: Option<LandlockSpec>,
+        tmp: Option<PathBuf>,
+    ) -> Result<Spawned, RpcError> {
         let shell = self.shell();
         let (program, args, secret) = match &permit.elevate {
             None => (shell.clone(), shell_args(&shell, command), None),
@@ -330,7 +356,7 @@ impl Execs {
         };
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?;
-        let spawned = spawn(cfg, spec_json, &spec, secret);
+        let spawned = spawn(cfg, spec_json, &spec, secret, tmp);
         #[cfg(target_os = "linux")]
         if spawned.is_err()
             && let Some(cg) = &spec.cgroup
@@ -565,6 +591,26 @@ async fn forward_output(
     truncated
 }
 
+/// An empty directory at `dir`; whatever an earlier client process with the same
+/// pid left there goes first.
+fn fresh_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::create_dir(dir)
+}
+
+/// Removes a command's private temporary directory once its shim is gone.
+async fn remove_tmp(tmp: Option<PathBuf>) {
+    if let Some(t) = tmp {
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(t)).await;
+    }
+}
+
 #[cfg(not(windows))]
 fn default_shell() -> PathBuf {
     for p in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
@@ -654,6 +700,7 @@ fn spawn(
     spec_json: String,
     spec: &ShimSpec,
     secret: Option<Secret>,
+    tmp: Option<PathBuf>,
 ) -> Result<Spawned, RpcError> {
     use std::os::fd::{AsRawFd, OwnedFd};
     let io = |e: std::io::Error| RpcError::new(code::IO, format!("cannot start the command: {e}"));
@@ -741,6 +788,7 @@ fn spawn(
             }
             crate::cgroup::remove(cg).await;
         }
+        remove_tmp(tmp).await;
         let _ = tx.send(true);
     });
     let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(OwnedFd::from(out_r)).map_err(io)?;
@@ -786,6 +834,7 @@ fn spawn(
     spec_json: String,
     _spec: &ShimSpec,
     _secret: Option<Secret>,
+    tmp: Option<PathBuf>,
 ) -> Result<Spawned, RpcError> {
     use std::io::Read;
     use tokio::io::AsyncWriteExt;
@@ -832,6 +881,7 @@ fn spawn(
         drop(stdin);
         let st = child.wait().await.ok().and_then(|s| s.code());
         let _ = status_tx.send(st.map(|c| format!("exit {c}")));
+        remove_tmp(tmp).await;
         let _ = tx.send(true);
     });
     let status = tokio::spawn(async move { status_rx.await.ok().flatten() });
