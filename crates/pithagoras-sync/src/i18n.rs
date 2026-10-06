@@ -11,7 +11,7 @@ use sync_connector::LinkState;
 use sync_policy::{Access, Mode};
 
 use crate::cli::Kept;
-use crate::gui::{LogPlace, StatusView, SudoState};
+use crate::gui::{LogPlace, PairMode, StatusView, SudoState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -155,28 +155,120 @@ impl Lang {
         )
     }
 
-    pub fn pair_question(self, portal: &str, name: &str, pinned: bool) -> String {
+    /// What the portal's agent may do right after pairing: the mode this
+    /// computer is in now, which pairing keeps.
+    fn pair_mode(self, p: PairMode) -> String {
+        match (p.mode, self) {
+            (Mode::Ask, Lang::En) => "What it may do is decided on this computer: until you change it, every call asks you first.".into(),
+            (Mode::Ask, Lang::De) => "Was er darf, wird auf diesem Computer entschieden: Bis du es änderst, fragt dich jeder Aufruf zuerst.".into(),
+            (Mode::Folders, _) if p.folders == 0 => self.pick(
+                "What it may do is decided on this computer. This computer is in folders mode with no folder granted yet, so nothing is reachable until you add one.",
+                "Was er darf, wird auf diesem Computer entschieden. Dieser Computer ist im Modus folders, aber noch ohne freigegebenen Ordner, also ist nichts erreichbar, bis du einen hinzufügst.",
+            ).into(),
+            (Mode::Folders, Lang::En) => format!(
+                "What it may do is decided on this computer. This computer is in folders mode: the agent may use files and run commands in the {} granted folder(s) without asking you first.",
+                p.folders
+            ),
+            (Mode::Folders, Lang::De) => format!(
+                "Was er darf, wird auf diesem Computer entschieden. Dieser Computer ist im Modus folders: Der Agent darf in den {} freigegebenen Ordnern Dateien nutzen und Befehle ausführen, ohne dich zuerst zu fragen.",
+                p.folders
+            ),
+            (Mode::Full, _) => {
+                let until = match (p.full_left_ms, self) {
+                    (Some(left), Lang::En) => {
+                        let mins = left.max(0) / 60_000;
+                        format!(" for {}h {:02}m", mins / 60, mins % 60)
+                    }
+                    (Some(left), Lang::De) => {
+                        let mins = left.max(0) / 60_000;
+                        format!(" für {} h {:02} min", mins / 60, mins % 60)
+                    }
+                    (None, _) => self.pick(", with no expiry", ", ohne Ablauf").into(),
+                };
+                match self {
+                    Lang::En => format!(
+                        "This computer is in full mode{until}: the agent acts with your rights right away and is mostly not asked. If that is not what you want, say No and switch to ask first (pithagoras-sync mode ask)."
+                    ),
+                    Lang::De => format!(
+                        "Dieser Computer ist im Modus full{until}: Der Agent handelt sofort mit deinen Rechten und wird meist nicht gefragt. Wenn du das nicht willst, wähle Nein und stelle zuerst auf ask um (pithagoras-sync mode ask)."
+                    ),
+                }
+            }
+        }
+    }
+
+    pub fn pair_question(self, portal: &str, name: &str, pinned: bool, mode: PairMode) -> String {
         let pin = self.pin_note(pinned);
+        let mode = self.pair_mode(mode);
         match self {
             Lang::En => format!(
-                "Pair this computer with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nIts agent can then ask to use this computer's files and shell. What it may do is decided on this computer: until you change it, every call asks you first."
+                "Pair this computer with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nIts agent can then ask to use this computer's files and shell. {mode}"
             ),
             Lang::De => format!(
-                "Diesen Computer mit dem Pithagoras-Portal {portal} als „{name}“ koppeln?{pin}\n\nSein Agent kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. Was er darf, wird auf diesem Computer entschieden: Bis du es änderst, fragt dich jeder Aufruf zuerst."
+                "Diesen Computer mit dem Pithagoras-Portal {portal} als „{name}“ koppeln?{pin}\n\nSein Agent kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. {mode}"
             ),
         }
     }
 
-    pub fn replace_question(self, old: &str, portal: &str, name: &str, pinned: bool) -> String {
+    pub fn replace_question(
+        self,
+        old: &str,
+        portal: &str,
+        name: &str,
+        pinned: bool,
+        mode: PairMode,
+    ) -> String {
         let pin = self.pin_note(pinned);
+        let mode = self.pair_mode(mode);
         match self {
             Lang::En => format!(
-                "This computer is paired with {old}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}"
+                "This computer is paired with {old}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}\n\n{mode}"
             ),
             Lang::De => format!(
-                "Dieser Computer ist mit {old} gekoppelt.\n\nDie Kopplung durch das Portal {portal} als „{name}“ ersetzen?{pin}"
+                "Dieser Computer ist mit {old} gekoppelt.\n\nDie Kopplung durch das Portal {portal} als „{name}“ ersetzen?{pin}\n\n{mode}"
             ),
         }
+    }
+
+    /// On a desktop, pairing asks for the user's password, as `pair` does in
+    /// a terminal.
+    pub fn owner_password_prompt(self, user: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pairing decides which portal's agent may use this computer, so it needs your password ({user}), as `pithagoras-sync pair` does in a terminal.\n\nIt is checked with su and not kept."
+            ),
+            Lang::De => format!(
+                "Die Kopplung legt fest, welcher Agent eines Portals diesen Computer nutzen darf, daher braucht sie dein Passwort ({user}), wie `pithagoras-sync pair` im Terminal.\n\nEs wird mit su geprüft und nicht aufbewahrt."
+            ),
+        }
+    }
+
+    pub fn owner_password_wrong(self) -> &'static str {
+        self.pick(
+            "su did not accept this password. Nothing changed.",
+            "su hat dieses Passwort nicht angenommen. Es wurde nichts geändert.",
+        )
+    }
+
+    pub fn owner_password_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Your password could not be checked: {e}. Nothing changed. In a terminal, `pithagoras-sync pair` with the link checks it as well."
+            ),
+            Lang::De => format!(
+                "Dein Passwort konnte nicht geprüft werden: {e}. Es wurde nichts geändert. Im Terminal prüft es `pithagoras-sync pair` mit dem Link ebenfalls."
+            ),
+        }
+    }
+
+    /// The notes of `install` or `pair` (escaped), one per line.
+    pub fn notes(self, notes: &[String]) -> String {
+        let word = self.pick("Note", "Hinweis");
+        notes
+            .iter()
+            .map(|n| format!("{word}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn pair_failed(self, e: &str) -> String {

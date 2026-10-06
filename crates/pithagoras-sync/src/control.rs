@@ -47,10 +47,28 @@ pub enum Request {
     Restart,
 }
 
+/// How long the CLI waits for the client's answer.
+pub const REPLY_WAIT: Duration = Duration::from_secs(30);
+/// How long it waits on a request that may read or write the keyring: its
+/// unlock prompt waits up to two minutes for the owner, and the calls around it
+/// up to ten seconds each. Shorter, the CLI would report a failure while the
+/// client goes on to store or clear the password.
+pub const KEYRING_REPLY_WAIT: Duration = Duration::from_secs(30 + 120 + 60);
+
 impl Request {
     /// Whether a command the client itself runs (a descendant) may send this.
     pub fn allowed_from_own_commands(&self) -> bool {
         matches!(self, Request::Status | Request::Panic)
+    }
+
+    /// How long the answer may take.
+    pub fn reply_wait(&self) -> Duration {
+        match self {
+            Request::SecretSet { .. } | Request::SecretClear { .. } | Request::Unlock => {
+                KEYRING_REPLY_WAIT
+            }
+            _ => REPLY_WAIT,
+        }
     }
 }
 
@@ -163,6 +181,7 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(mut s: S, reply: &Reply) {
 }
 
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Result<Reply, String> {
+    let wait = req.reply_wait();
     let (r, mut w) = tokio::io::split(s);
     let mut text = serde_json::to_string(&req).unwrap_or_default();
     text.push('\n');
@@ -174,7 +193,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Resu
     let mut line = String::new();
     // Room for the approvals list (`MAX_APPROVAL_LIST`) and its escapes.
     let mut r = BufReader::new(r).take(4 << 20);
-    tokio::time::timeout(Duration::from_secs(30), r.read_line(&mut line))
+    tokio::time::timeout(wait, r.read_line(&mut line))
         .await
         .map_err(|_| "the client did not answer".to_string())?
         .map_err(|e| e.to_string())?;
@@ -273,6 +292,23 @@ mod tests {
         assert!(!descends_from(me, child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn requests_that_may_wait_on_a_keyring_prompt_get_the_time_for_it() {
+        use sync_policy::keyring::secret_service::{CALL, PROMPT};
+        let secret = Request::SecretSet {
+            name: "elevation".into(),
+            value: Secret::new("x".into()),
+        };
+        let clear = Request::SecretClear {
+            name: "elevation".into(),
+        };
+        // A prompt, plus the calls before and after it.
+        for r in [secret, clear, Request::Unlock] {
+            assert!(r.reply_wait() >= PROMPT + CALL * 6, "{r:?}");
+        }
+        assert_eq!(Request::Status.reply_wait(), REPLY_WAIT);
     }
 
     #[test]

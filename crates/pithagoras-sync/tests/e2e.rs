@@ -1043,6 +1043,9 @@ async fn a_pairing_link_pairs_after_the_owner_says_yes() {
     })
     .await;
     looks_installed(&env);
+    // A headless config: pairing asks no password there, as `pair` asks none
+    // (the desktop's password check: `pairing_in_the_window_on_a_desktop_...`).
+    env.ok(&["mode", "ask"]).await;
     let path = fake_dialogs(&env, &["0|", "0|"]);
     let daemon = env.start();
     let link = mock.pair_uri("CODE9999");
@@ -1092,6 +1095,47 @@ async fn a_pairing_link_pairs_after_the_owner_says_yes() {
     let cfg = std::fs::read_to_string(env.config()).unwrap();
     assert!(cfg.contains(&format!("url = \"{portal}\"")), "{cfg}");
     stop(daemon).await;
+}
+
+/// On a desktop, pairing from the window asks for the user's password as
+/// `pair` does in a terminal, and checks it with `su` (which refuses it here:
+/// the test's user has none). Nothing is paired, the code stays unused, and the
+/// password is in no file and no dialog's arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let answer = format!("0|{PW}");
+    let path = fake_dialogs(&env, &["0|", &answer]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 3, "{shown:#?}");
+    assert!(shown[0].contains("--question"), "{shown:#?}");
+    assert!(
+        shown[1].contains("--hide-text") && shown[1].contains("needs your password ("),
+        "{shown:#?}"
+    );
+    assert!(shown[2].contains("--error"), "{shown:#?}");
+    assert!(!env.config().exists());
+    assert!(!env.home.join(".config/pithagoras-sync/token").exists());
+    assert_eq!(
+        files_holding(&env.root, PW.as_bytes()),
+        Vec::<PathBuf>::new()
+    );
+    // The code is still unused.
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
 }
 
 /// No to the question: nothing is paired, the code is not used.
@@ -1273,7 +1317,7 @@ async fn the_sudo_password_can_be_set_in_the_window() {
 }
 
 /// Without a display, or without a dialog program, `gui` shows nothing: it
-/// says so on stderr and in the log file. Neither a start without a command
+/// says so on stderr and in `gui.log`. Neither a start without a command
 /// nor any other command starts the dialogs there.
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_run_without_a_display_or_a_bus() {
@@ -1298,12 +1342,15 @@ async fn commands_run_without_a_display_or_a_bus() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot show its windows"), "{err}");
-    let log =
-        std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/client.log")).unwrap();
+    let state = env.home.join(".local/state/pithagoras-sync");
+    let log = std::fs::read_to_string(state.join("gui.log")).unwrap();
     assert!(
         log.contains("gui: Pithagoras Sync cannot show its windows"),
         "{log}"
     );
+    // Not in client.log: that file there would make the windows open it as the
+    // client's log later instead of the journal.
+    assert!(!state.join("client.log").exists());
     let out = run(&[&mock.pair_uri("CODE1111")]).output().await.unwrap();
     assert_eq!(out.status.code(), Some(1));
     // With a display but no dialog program on PATH: the same.
@@ -2387,6 +2434,136 @@ async fn a_detached_client_writes_its_log_to_a_file() {
     assert!(!log.contains('\x1b'), "{log}");
     let stderr = std::fs::read_to_string(env.root.join("stderr.txt")).unwrap();
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Waits until `f` holds, up to `WAIT`.
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    while !f() {
+        assert!(std::time::Instant::now() < end, "never happened: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The client reads the password from the keyring at start, and the keyring
+/// asks the owner to unlock it first. A `panic` while that prompt waits wins:
+/// what is read after it is not kept, until `unlock` loads it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_while_the_keyring_prompt_waits_keeps_the_password_out() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = None;
+    }
+    let daemon = env.start();
+    eventually("the client asks to unlock the keyring", || {
+        state.lock().unwrap().prompts > 0
+    })
+    .await;
+    env.ok(&["panic"]).await;
+    keyring::answer_waiting(&state, true).await;
+    let log = env.root.join("daemon.log");
+    eventually("the client drops what it read after panic", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("elevation password not loaded: panic")
+    })
+    .await;
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["paused"], true);
+    assert_eq!(status["elevation_password"], false, "{status}");
+    // The stored one is still there for unlock.
+    env.ok(&["unlock"]).await;
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["elevation_password"], true, "{status}");
+    stop(daemon).await;
+}
+
+/// The client started before the keyring service (at login): it tries again
+/// and connects once the service is there, without the owner doing anything.
+/// A reload while the keyring cannot be read (locked, its prompt cancelled)
+/// leaves the running link as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_link_outlasts_a_late_or_locked_keyring() {
+    use sync_testkit::keyring;
+    const NAME: &str = "org.freedesktop.secrets";
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into()],
+    })
+    .await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "late"])
+        .await;
+    service.release_name(NAME).await.unwrap();
+    let daemon = env.start();
+    // Empty until the client answers.
+    let detail = || async {
+        let s: Value =
+            serde_json::from_str(&env.run(&["status", "--json"]).await.out).unwrap_or_default();
+        (
+            s["link"]["state"].as_str().unwrap_or_default().to_string(),
+            s["link"]["detail"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let (state, detail) = detail().await;
+        if state == "stopped" && detail.contains("no keyring service") {
+            assert!(detail.contains("trying again in"), "{detail}");
+            break;
+        }
+        assert!(std::time::Instant::now() < end, "{state}: {detail}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    service.request_name(NAME).await.unwrap();
+    mock.next_device(WAIT)
+        .await
+        .expect("connects once the keyring is there");
+
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+    }
+    env.ok(&["mode", "ask"]).await;
+    let log = env.root.join("daemon.log");
+    eventually("the reload could not read the token", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("the token could not be read again")
+    })
+    .await;
+    assert_eq!(detail().await.0, "connected");
+    stop(daemon).await;
 }
 
 /// The token and the elevation password in the keyring: the fake Secret

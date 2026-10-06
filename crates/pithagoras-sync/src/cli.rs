@@ -310,6 +310,12 @@ pub fn log_file(dirs: &Dirs) -> PathBuf {
     dirs.state.join("client.log")
 }
 
+/// Where `gui` notes what it could not show in a window. Not `client.log`: that
+/// one existing means the client logs to it rather than to the journal.
+pub fn gui_log_file(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("gui.log")
+}
+
 /// The client's exit code when it stops to be restarted (EX_TEMPFAIL).
 pub const RESTART_EXIT: u8 = 75;
 
@@ -1070,7 +1076,9 @@ pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
     let [_, arg] = args else { return None };
     let arg = arg.to_str()?;
     let scheme = format!("{}:", install::SCHEME);
-    (arg.len() >= scheme.len() && arg[..scheme.len()].eq_ignore_ascii_case(&scheme))
+    // `get`: the scheme's length may end inside a character of the argument.
+    arg.get(..scheme.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&scheme))
         .then(|| arg.to_string())
 }
 
@@ -2150,6 +2158,18 @@ mod tests {
     use crate::control::Status;
     use clap::{CommandFactory, Parser};
     use sync_connector::{LinkState, LinkStatus};
+
+    #[test]
+    fn a_lone_argument_is_a_link_only_with_the_scheme() {
+        let a = |s: &str| super::link_argument(&["pithagoras-sync".into(), s.into()]);
+        assert_eq!(
+            a("Pithagoras-Sync://pair?x").as_deref(),
+            Some("Pithagoras-Sync://pair?x")
+        );
+        assert_eq!(a("status"), None);
+        // The scheme's length ends inside a character: no link, and no panic.
+        assert_eq!(a(&format!("{}é", "a".repeat(15))), None);
+    }
     use sync_policy::config::SecretStorage;
     use sync_proto::methods::{Access, ApprovalInfo, Choice, FolderInfo};
 

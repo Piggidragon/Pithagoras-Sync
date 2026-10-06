@@ -1,7 +1,7 @@
 //! A fake Secret Service (`org.freedesktop.secrets`) on a private D-Bus daemon:
 //! the keyring code is tried against it, so no test reads or writes a real
 //! keyring. It keeps items in memory, can be locked, and answers an unlock prompt
-//! the way the test says (unlock, dismiss, or never).
+//! the way the test says (unlock, dismiss, or when the test says so).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,8 +22,11 @@ pub struct State {
     /// (path, attributes, value)
     pub items: Vec<(String, HashMap<String, String>, Vec<u8>)>,
     pub locked: bool,
-    /// What the "owner" does at an unlock prompt: `None` never answers.
+    /// What the "owner" does at an unlock prompt: `None` waits until the test
+    /// calls `answer_waiting`.
     pub answer: Option<bool>,
+    /// The prompts waiting for that.
+    pub waiting: Vec<SignalEmitter<'static>>,
     pub prompts: u32,
     pub next: u32,
     /// The secrets as the service received them, for the checks below.
@@ -179,7 +182,10 @@ impl Prompt {
             s.prompts += 1;
             s.answer
         };
-        let Some(unlock) = answer else { return };
+        let Some(unlock) = answer else {
+            self.0.lock().unwrap().waiting.push(emitter.to_owned());
+            return;
+        };
         let state = self.0.clone();
         let emitter = emitter.to_owned();
         tokio::spawn(async move {
@@ -197,6 +203,20 @@ impl Prompt {
         dismissed: bool,
         result: Value<'_>,
     ) -> zbus::Result<()>;
+}
+
+/// Answers the prompts that wait, as the owner would at last.
+pub async fn answer_waiting(state: &Shared, unlock: bool) {
+    let waiting = {
+        let mut s = state.lock().unwrap();
+        if unlock {
+            s.locked = false;
+        }
+        std::mem::take(&mut s.waiting)
+    };
+    for e in waiting {
+        let _ = Prompt::completed(&e, !unlock, Value::from("")).await;
+    }
 }
 
 pub struct Bus {

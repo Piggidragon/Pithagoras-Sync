@@ -69,6 +69,16 @@ pub struct StatusView {
     pub problem: Option<String>,
 }
 
+/// The mode the portal's agent gets right after pairing: this computer's
+/// now, which pairing keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairMode {
+    pub mode: Mode,
+    /// Full mode: how long until it falls back to ask, `None` for never.
+    pub full_left_ms: Option<i64>,
+    pub folders: usize,
+}
+
 /// Sudo access and its password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SudoState {
@@ -96,10 +106,19 @@ pub trait Host {
     fn device_name(&self) -> String;
     /// Who installs (the user) and where the program goes, when known.
     fn install_target(&self) -> (String, Option<String>);
+    /// The account whose password `su` and sudo check.
+    fn account(&self) -> String;
     /// Where the client's log is.
     fn log_place(&self) -> LogPlace;
+    /// The mode pairing would leave the agent in.
+    fn pair_mode(&self) -> PairMode;
     /// Refuses when the flow runs as a command the client runs for the portal.
     async fn owner_check(&self) -> Result<(), String>;
+    /// Whether pairing asks for the user's password (a Linux desktop), as
+    /// `pair` does in a terminal.
+    fn owner_password_needed(&self) -> bool;
+    /// Checks the user's password with `su`; `Ok(false)` when it refused it.
+    async fn owner_password(&self, pw: &Secret) -> Result<bool, String>;
     /// `install`; returns its notes.
     async fn install(&self) -> Result<Vec<String>, String>;
     /// `pair <link>`; returns its notes.
@@ -181,12 +200,19 @@ pub async fn flow(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<&str>) -
         if !owner_ok(d, h, t).await {
             return Outcome::Failed;
         }
-        if let Err(e) = h.install().await {
-            d.error(&t.install_failed(&shown(&e)));
-            return Outcome::Failed;
+        match h.install().await {
+            Ok(notes) if !notes.is_empty() => {
+                let notes: Vec<String> = notes.iter().map(|n| shown(n)).collect();
+                d.info(&t.notes(&notes));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                d.error(&t.install_failed(&shown(&e)));
+                return Outcome::Failed;
+            }
         }
         if link.is_none() && h.paired().is_some() {
-            return after(d, h, t).await;
+            return after(d, h, t, &[]).await;
         }
     }
     if let Some(u) = link {
@@ -211,14 +237,16 @@ async fn ask_and_pair(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     }
 }
 
-/// Confirms with the parsed values, then pairs as `pair` does.
+/// Confirms with the parsed values and the mode the agent gets, checks the
+/// owner's password where `pair` would, then pairs as `pair` does.
 async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome {
     let portal = shown(&uri.portal.to_string());
     let name = shown(&h.device_name());
     let pinned = uri.spki.is_some();
+    let mode = h.pair_mode();
     let q = match h.paired() {
-        Some(old) => t.replace_question(&shown(&old), &portal, &name, pinned),
-        None => t.pair_question(&portal, &name, pinned),
+        Some(old) => t.replace_question(&shown(&old), &portal, &name, pinned, mode),
+        None => t.pair_question(&portal, &name, pinned, mode),
     };
     if !d.question(&q) {
         return Outcome::Cancelled;
@@ -226,12 +254,42 @@ async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome
     if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
+    if h.owner_password_needed() {
+        match owner_password(d, h, t).await {
+            Outcome::Done => {}
+            other => return other,
+        }
+    }
     // Rebuilt from what was parsed and shown, so only that is acted on.
     let link = link_of(uri);
     match h.pair(&link).await {
-        Ok(_) => after(d, h, t).await,
+        Ok(notes) => after(d, h, t, &notes).await,
         Err(e) => {
             d.error(&t.pair_failed(&shown(&e)));
+            Outcome::Failed
+        }
+    }
+}
+
+/// The user's password, checked with `su`: on a desktop the command line asks
+/// for it in a terminal before `pair`, and a command of the agent that clicks
+/// through the windows does not know it.
+async fn owner_password(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    let Some(pw) = d.password(&t.owner_password_prompt(&shown(&h.account()))) else {
+        return Outcome::Cancelled;
+    };
+    if pw.expose().is_empty() {
+        d.error(t.password_empty());
+        return Outcome::Failed;
+    }
+    match h.owner_password(&pw).await {
+        Ok(true) => Outcome::Done,
+        Ok(false) => {
+            d.error(t.owner_password_wrong());
+            Outcome::Failed
+        }
+        Err(e) => {
+            d.error(&t.owner_password_failed(&shown(&e)));
             Outcome::Failed
         }
     }
@@ -261,16 +319,22 @@ fn link_of(u: &PairUri) -> String {
     l
 }
 
-/// Waits for the link, then says how things stand.
-async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+/// Waits for the link, then says how things stand, with the notes of `pair`
+/// (the token in a file where the keyring did not take it).
+async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang, notes: &[String]) -> Outcome {
     let log = shown(&t.log_place(&h.log_place()));
-    match h.wait_for_link().await {
-        Link::Connected(portal) => d.info(&t.connected(&shown(&portal), &log)),
+    let mut text = match h.wait_for_link().await {
+        Link::Connected(portal) => t.connected(&shown(&portal), &log),
         Link::Down(state, detail) => {
             let why = t.link_state(state, detail.map(|d| shown(&d)).as_deref());
-            d.info(&t.not_connected(&why, &log))
+            t.not_connected(&why, &log)
         }
+    };
+    if !notes.is_empty() {
+        let notes: Vec<String> = notes.iter().map(|n| shown(n)).collect();
+        text = format!("{text}\n\n{}", t.notes(&notes));
     }
+    d.info(&text);
     Outcome::Done
 }
 
@@ -365,8 +429,7 @@ async fn set_password(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
-    let (user, _) = h.install_target();
-    let Some(pw) = d.password(&t.password_prompt(&shown(&user))) else {
+    let Some(pw) = d.password(&t.password_prompt(&shown(&h.account()))) else {
         return Outcome::Cancelled;
     };
     if pw.expose().is_empty() {
@@ -525,6 +588,10 @@ impl Host for RealHost {
         (user, path)
     }
 
+    fn account(&self) -> String {
+        crate::owner::account().unwrap_or_else(|_| sync_ops::info::user().0)
+    }
+
     fn log_place(&self) -> LogPlace {
         let file = crate::cli::log_file(&self.dirs);
         if cfg!(windows) || file.exists() {
@@ -534,8 +601,35 @@ impl Host for RealHost {
         }
     }
 
+    fn pair_mode(&self) -> PairMode {
+        let now = sync_policy::system_clock()();
+        match self.config() {
+            Some(c) => PairMode {
+                mode: c.policy.effective_mode(c.profile, now),
+                full_left_ms: c.policy.full.until_ms.map(|t| t - now),
+                folders: c.policy.folders.len(),
+            },
+            // `pair` fails on a config it cannot read as well.
+            None => PairMode {
+                mode: Mode::Ask,
+                full_left_ms: None,
+                folders: 0,
+            },
+        }
+    }
+
     async fn owner_check(&self) -> Result<(), String> {
         crate::owner::not_from_own_command(&self.dirs).await
+    }
+
+    fn owner_password_needed(&self) -> bool {
+        // A config that cannot be read asks as well, where asking is possible.
+        self.config()
+            .map_or(cfg!(unix), |c| crate::owner::password_needed(c.profile))
+    }
+
+    async fn owner_password(&self, pw: &Secret) -> Result<bool, String> {
+        crate::owner::check_password(pw).await
     }
 
     async fn install(&self) -> Result<Vec<String>, String> {
@@ -737,12 +831,12 @@ impl RealHost {
     }
 }
 
-/// When no dialog can be shown: the message goes to stderr, the client's log
-/// file and, where a session bus is, a desktop notification.
+/// When no dialog can be shown: the message goes to stderr, `gui.log` beside
+/// the client's log and, where a session bus is, a desktop notification.
 pub async fn say_without_dialogs(dirs: &Dirs, text: &str) {
     eprintln!("pithagoras-sync: {text}");
     if let Ok(mut f) =
-        crate::logfile::LogFile::open(crate::cli::log_file(dirs), crate::logfile::MAX_BYTES)
+        crate::logfile::LogFile::open(crate::cli::gui_log_file(dirs), crate::logfile::MAX_BYTES)
     {
         f.write_event(format!("gui: {}\n", sync_policy::approve::visible(text)).as_bytes());
     }
@@ -782,6 +876,11 @@ mod tests {
         /// What sudo says to a password other than "right pw".
         sudo_says: SudoCheck,
         kept: Kept,
+        mode: PairMode,
+        /// A Linux desktop: pairing asks for the password ("my login").
+        desktop: bool,
+        install_notes: Vec<String>,
+        pair_notes: Vec<String>,
         did: Mutex<Vec<String>>,
     }
 
@@ -800,6 +899,14 @@ mod tests {
                 password: Mutex::new(None),
                 sudo_says: SudoCheck::Refused("sudo: 1 incorrect password attempt".into()),
                 kept: Kept::InClient,
+                mode: PairMode {
+                    mode: Mode::Ask,
+                    full_left_ms: None,
+                    folders: 0,
+                },
+                desktop: false,
+                install_notes: Vec::new(),
+                pair_notes: Vec::new(),
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -835,8 +942,21 @@ mod tests {
                 Some("/home/alice/.local/bin/pithagoras-sync".into()),
             )
         }
+        fn account(&self) -> String {
+            "alice".into()
+        }
         fn log_place(&self) -> LogPlace {
             LogPlace::Journal("pithagoras-sync.service")
+        }
+        fn pair_mode(&self) -> PairMode {
+            self.mode
+        }
+        fn owner_password_needed(&self) -> bool {
+            self.desktop
+        }
+        async fn owner_password(&self, pw: &Secret) -> Result<bool, String> {
+            self.step("owner password")?;
+            Ok(pw.expose() == "my login")
         }
         async fn owner_check(&self) -> Result<(), String> {
             let mut n = self.checks.lock().unwrap();
@@ -852,13 +972,13 @@ mod tests {
         async fn install(&self) -> Result<Vec<String>, String> {
             self.step("install")?;
             *self.installed.lock().unwrap() = true;
-            Ok(Vec::new())
+            Ok(self.install_notes.clone())
         }
         async fn pair(&self, link: &str) -> Result<Vec<String>, String> {
             self.step(&format!("pair {link}"))?;
             let u = PairUri::parse(link).unwrap();
             *self.paired.lock().unwrap() = Some(u.portal.to_string());
-            Ok(Vec::new())
+            Ok(self.pair_notes.clone())
         }
         async fn wait_for_link(&self) -> Link {
             if self.link_down {
@@ -1105,23 +1225,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_confirmation_shows_parsed_values_with_control_characters_escaped() {
-        // A base path with an escape sequence and a line break in it.
-        let link = "pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example%2Fa%1b%5B2K%0aPaired&code=AB12";
-        for t in [Lang::En, Lang::De] {
-            let h = installed();
-            let (o, seen) = run_in(t, &h, &["no"], Some(link)).await;
-            assert_eq!(o, Outcome::Cancelled);
-            let q = &seen[0];
-            assert!(
-                q.contains("https://portal.example/a\\u{1b}[2K\\nPaired"),
-                "{q}"
-            );
-            assert!(
-                !q.contains("pithagoras-sync://"),
-                "the raw link is not shown: {q}"
-            );
+    async fn a_portal_path_that_could_read_as_more_of_the_question_is_refused() {
+        for link in [
+            // An escape sequence and a line break.
+            "pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example%2Fa%1b%5B2K%0aPaired&code=AB12",
+            // Spaces and a dash that make the URL read as two.
+            "pithagoras-sync://pair?portal=https%3A%2F%2Fevil.example%2F%20%E2%80%94%20verified%3A%20https%3A%2F%2Fportal.company.example&code=AB12",
+        ] {
+            for t in [Lang::En, Lang::De] {
+                let h = installed();
+                let (o, seen) = run_in(t, &h, &["yes", "yes"], Some(link)).await;
+                assert_eq!(o, Outcome::Failed);
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert!(seen[0].starts_with("error: "), "{seen:?}");
+                assert!(
+                    !seen[0].chars().any(|c| c.is_control() && c != '\n'),
+                    "{seen:?}"
+                );
+                assert!(h.did().is_empty());
+            }
         }
+        // An escaped path is shown escaped: it cannot pass for words.
+        let h = installed();
+        let link = "pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example%2Fa%2520b&code=AB12";
+        let (_, seen) = run(&h, &["no"], Some(link)).await;
+        assert!(
+            seen[0].contains("portal https://portal.example/a%20b as"),
+            "{seen:?}"
+        );
+        assert!(
+            !seen[0].contains("pithagoras-sync://"),
+            "the raw link is not shown"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pairing_question_says_what_the_agent_may_do_at_once() {
+        let ask = |mode, full_left_ms, folders| FakeHost {
+            installed: Mutex::new(true),
+            mode: PairMode {
+                mode,
+                full_left_ms,
+                folders,
+            },
+            ..FakeHost::default()
+        };
+        async fn q(t: Lang, h: &FakeHost) -> String {
+            run_in(t, h, &["no"], Some(LINK)).await.1[0].clone()
+        }
+        let h = ask(Mode::Ask, None, 0);
+        assert!(q(Lang::En, &h).await.contains("every call asks you first"));
+        let h = ask(Mode::Full, None, 0);
+        let en = q(Lang::En, &h).await;
+        assert!(en.contains("full mode, with no expiry"), "{en}");
+        assert!(!en.contains("asks you first"), "{en}");
+        let de = q(Lang::De, &h).await;
+        assert!(de.contains("im Modus full, ohne Ablauf"), "{de}");
+        assert!(!de.contains("fragt dich jeder Aufruf"), "{de}");
+        let h = ask(Mode::Full, Some(90 * 60_000), 0);
+        assert!(q(Lang::En, &h).await.contains("full mode for 1h 30m"));
+        let h = ask(Mode::Folders, None, 2);
+        assert!(
+            q(Lang::En, &h)
+                .await
+                .contains("in the 2 granted folder(s) without asking")
+        );
+        let h = ask(Mode::Folders, None, 0);
+        assert!(q(Lang::En, &h).await.contains("nothing is reachable"));
+        // Replacing a pairing says it as well.
+        let h = FakeHost {
+            paired: Mutex::new(Some("https://old.example".into())),
+            ..ask(Mode::Full, None, 0)
+        };
+        let en = q(Lang::En, &h).await;
+        assert!(
+            en.contains("Replace the pairing") && en.contains("full mode"),
+            "{en}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_on_a_desktop_needs_the_users_password() {
+        let desktop = || FakeHost {
+            installed: Mutex::new(true),
+            desktop: true,
+            ..FakeHost::default()
+        };
+        // A wrong one: nothing is paired.
+        let h = desktop();
+        let (o, seen) = run(&h, &["yes", "pw:guess"], Some(LINK)).await;
+        assert_eq!(o, Outcome::Failed);
+        assert!(seen[1].starts_with("password: Pairing decides"), "{seen:?}");
+        assert!(seen[1].contains("(alice)"), "{seen:?}");
+        assert!(seen[2].starts_with("error: su did not accept"), "{seen:?}");
+        assert_eq!(h.did(), ["owner password"]);
+        assert_eq!(h.paired(), None);
+        // Cancelled, or su could not check it: nothing either.
+        let h = desktop();
+        assert_eq!(
+            run(&h, &["yes", "cancel"], Some(LINK)).await.0,
+            Outcome::Cancelled
+        );
+        assert!(h.did().is_empty());
+        let h = FakeHost {
+            fail: Some("owner password"),
+            ..desktop()
+        };
+        let (o, seen) = run(&h, &["yes", "pw:my login"], Some(LINK)).await;
+        assert_eq!(o, Outcome::Failed);
+        assert!(seen[2].contains("could not be checked"), "{seen:?}");
+        assert_eq!(h.paired(), None);
+        // The right one, asked after the question: paired.
+        let h = desktop();
+        let (o, seen) = run(&h, &["yes", "pw:my login"], Some(LINK)).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(
+            seen[0].starts_with("question: Pair this computer"),
+            "{seen:?}"
+        );
+        assert_eq!(h.did()[0], "owner password");
+        assert!(h.did()[1].starts_with("pair "), "{:?}", h.did());
+        // The menu's "Pair again" asks as well.
+        let h = FakeHost {
+            paired: Mutex::new(Some("https://old.example".into())),
+            ..desktop()
+        };
+        run(
+            &h,
+            &[
+                "pick:pair",
+                &format!("text:{LINK}"),
+                "yes",
+                "pw:guess",
+                "pick:quit",
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(h.paired().as_deref(), Some("https://old.example"));
+        // A headless machine asks none, as `pair` asks none there.
+        let h = installed();
+        let (o, seen) = run(&h, &["yes"], Some(LINK)).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(!seen.iter().any(|s| s.starts_with("password:")), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_notes_of_install_and_pair_are_shown() {
+        let h = FakeHost {
+            install_notes: vec!["pairing links may not open Pithagoras Sync\x1b[2K".into()],
+            pair_notes: vec!["the keyring did not take the token; it is kept in /home/alice/.config/pithagoras-sync/token".into()],
+            ..FakeHost::default()
+        };
+        let (o, seen) = run(&h, &["yes", &format!("text:{LINK}"), "yes"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(
+            seen[1].starts_with("info: Note: pairing links may not open Pithagoras Sync\\u{1b}[2K"),
+            "{seen:?}"
+        );
+        let last = seen.last().unwrap();
+        assert!(last.contains("connected to"), "{seen:?}");
+        assert!(
+            last.contains("Note: the keyring did not take the token; it is kept in"),
+            "{seen:?}"
+        );
+        let h = FakeHost {
+            installed: Mutex::new(true),
+            pair_notes: vec!["kept in a file".into()],
+            ..FakeHost::default()
+        };
+        let (_, seen) = run_in(Lang::De, &h, &["yes"], Some(LINK)).await;
+        assert!(
+            seen.last().unwrap().contains("Hinweis: kept in a file"),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -1522,8 +1799,9 @@ mod tests {
         let u = PairUri::parse(&format!("{LINK}&spki={}", "A".repeat(43))).unwrap();
         let again = PairUri::parse(&link_of(&u)).unwrap();
         assert_eq!(again, u);
-        let u = PairUri::parse("pithagoras-sync://pair?portal=http://127.0.0.1:3000/a%20b&code=x1")
-            .unwrap();
+        let u =
+            PairUri::parse("pithagoras-sync://pair?portal=http://127.0.0.1:3000/a%2520b&code=x1")
+                .unwrap();
         assert_eq!(PairUri::parse(&link_of(&u)).unwrap(), u);
     }
 }

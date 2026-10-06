@@ -82,7 +82,7 @@ fn own(kind: Kind, name: &OsStr) -> bool {
             || written(name, |n| {
                 matches!(
                     n,
-                    "audit.jsonl" | "audit.jsonl.1" | "client.log" | "client.log.1" | "journal.log" | "paused" | "logon-task.xml"
+                    "audit.jsonl" | "audit.jsonl.1" | "client.log" | "client.log.1" | "gui.log" | "gui.log.1" | "journal.log" | "paused" | "logon-task.xml"
                 ) || update_record(n)
             })
         }
@@ -366,6 +366,7 @@ mod tests {
             "audit.jsonl.1",
             "client.log",
             "client.log.1",
+            "gui.log",
             "journal.log",
             "paused",
             "update-released",
@@ -398,7 +399,7 @@ mod tests {
         );
         assert!(found.entries.contains(&dirs.state.join("tmp")));
         assert!(!found.entries.contains(&dirs.runtime), "{found:?}");
-        assert_eq!(found.entries.len(), 4 + 10 + 1 + 1, "{found:?}");
+        assert_eq!(found.entries.len(), 4 + 11 + 1 + 1, "{found:?}");
         assert!(remove(&found).unwrap().is_empty());
         assert!(!dirs.config.exists() && !dirs.state.exists());
         assert_eq!(

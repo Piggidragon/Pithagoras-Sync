@@ -43,8 +43,10 @@ pub fn user() -> (String, u32) {
     }
 }
 
+/// The account name of `uid` in the user database, never from the environment:
+/// what a password check asks about.
 #[cfg(unix)]
-fn passwd_name(uid: u32) -> Option<String> {
+pub fn passwd_name(uid: u32) -> Option<String> {
     let mut buf = vec![0 as libc::c_char; 4096];
     // SAFETY: zeroed passwd struct; getpwuid_r writes into `pw` and `buf`.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };

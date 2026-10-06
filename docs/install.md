@@ -36,9 +36,13 @@ Either way, a window then shows the portal it would pair with and the name your 
 
 > Pair this computer with the Pithagoras portal https://portal.example as "my-laptop"?
 
-Check that this is your portal. **Yes** pairs; **No** changes nothing. A link that is not a valid pairing link, or that names a portal on another machine over plain `http`, is refused before anything happens.
+Below it says what the agent may do right after pairing: this computer's mode, which pairing keeps. Normally that is "every call asks you first"; if you switched this computer to `folders` or `full` earlier, the window says so, and for `full` that the agent then acts with your rights right away.
 
-After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is.
+Check that this is your portal. **Yes** pairs; **No** changes nothing. A link that is not a valid pairing link, that names a portal on another machine over plain `http`, or whose portal address has spaces or other characters a real address does not need (it could make the question read differently) is refused before anything happens.
+
+On a Linux desktop it then asks for your password (the one you log in with), as `pithagoras-sync pair` does in a terminal: pairing decides whose agent may use this computer, and a program of the agent that clicks through the windows does not know it. It is checked with `su` and not kept. A wrong one, or a cancel, changes nothing. If it cannot be checked (some login setups ask for a fingerprint or a security key instead), pair in a terminal: `pithagoras-sync pair '<link>'`. Windows asks no password here; the Windows login is the check there ([windows.md](windows.md)).
+
+After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is. Notes come with it, for example that the keyring did not take the pairing's token and it is kept in a file instead. Notes of the install (for example that pairing links may not open the program, so paste them) are shown right after installing.
 
 From now on the portal's agent can ask to use this computer. Until you change it, every file access and command asks you first; you answer in the portal's Devices tab. What else you can allow (folders, a mode without questions) is in [permissions.md](permissions.md).
 
@@ -81,4 +85,4 @@ Either way the client stops, no longer starts at login, the menu entry goes and 
 
 - They never pair, install or uninstall without your Yes.
 - They never show or send your passwords. The sudo password is typed into a field that hides it, checked with `sudo` on this computer and kept only here; it never goes to the portal, into a log or onto a command line.
-- On Linux, a command that the portal's agent runs on this computer cannot use them to pair or uninstall: they refuse before they show anything, as the command line does. Windows has no such check yet ([windows.md](windows.md)).
+- On Linux, a command that the portal's agent runs on this computer cannot use them to pair or uninstall: they refuse before they show anything, as the command line does. On a desktop, pairing also needs your password. Windows has no such check yet ([windows.md](windows.md)).

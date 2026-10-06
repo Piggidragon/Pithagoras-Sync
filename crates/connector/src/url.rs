@@ -81,6 +81,13 @@ impl PortalUrl {
         if base.split('/').any(|c| c == ".." || c == ".") {
             return Err(bad("no . or .. in the path"));
         }
+        // The URL is shown to the owner before pairing: a path with spaces,
+        // quotes or other scripts could read as more text of the question.
+        if !plain_path(&base) {
+            return Err(bad(
+                "the path may hold only letters, digits, - . _ ~ / and %XX escapes",
+            ));
+        }
         Ok(PortalUrl {
             tls,
             host,
@@ -118,11 +125,32 @@ impl fmt::Display for PortalUrl {
     }
 }
 
+/// ASCII letters, digits, `-._~/` and `%` with two hex digits.
+fn plain_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if b
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                i += 3
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'/') => {
+                i += 1
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // `get`: the prefix's length may end inside a character of `s`.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),
+        _ => None,
     }
 }
 
@@ -214,6 +242,8 @@ mod tests {
         let u = PortalUrl::parse("http://127.0.0.1:3000/pitha/").unwrap();
         assert_eq!(u.base, "/pitha");
         assert_eq!(u.to_string(), "http://127.0.0.1:3000/pitha");
+        let u = PortalUrl::parse("https://x/p%20q/r-s_t.u~v").unwrap();
+        assert_eq!(u.base, "/p%20q/r-s_t.u~v");
         let u = PortalUrl::parse("https://[::1]:8443").unwrap();
         assert_eq!((u.host.as_str(), u.port), ("::1", 8443));
         assert_eq!(u.authority(), "[::1]:8443");
@@ -227,6 +257,11 @@ mod tests {
             "https://",
             "https://x/../y",
             "https://[nope]",
+            "https://x/a b",
+            "https://x/\u{2014}",
+            "https://x/a\"b",
+            "https://x/a%2",
+            "https://x/a%zz",
         ] {
             assert!(PortalUrl::parse(bad).is_err(), "{bad}");
         }
@@ -245,6 +280,17 @@ mod tests {
         let p =
             PairUri::parse("pithagoras-sync://pair?portal=http://127.0.0.1:3000&code=x1").unwrap();
         assert!(p.spki.is_none());
+        // A path that would make the question read differently.
+        let fake = "pithagoras-sync://pair?portal=https%3A%2F%2Fevil.example%2F%20%E2%80%94%20verified%3A%20https%3A%2F%2Fportal.company.example&code=AB";
+        assert!(
+            PairUri::parse(fake)
+                .unwrap_err()
+                .contains("the path may hold only")
+        );
+        // Cut inside a character where the prefix ends: refused, not a panic.
+        assert!(PairUri::parse(&format!("{}é", "a".repeat(22))).is_err());
+        assert_eq!(strip_prefix_ci("aé", "ab"), None);
+        assert_eq!(strip_prefix_ci("HTTPS://x", "https://"), Some("x"));
         for bad in [
             "https://portal.example",
             "pithagoras-sync://pair?code=AB",

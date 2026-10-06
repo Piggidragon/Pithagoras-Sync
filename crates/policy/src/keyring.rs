@@ -33,6 +33,23 @@ pub trait SecretStore: Send + Sync {
     fn delete<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>>;
 }
 
+/// What a call says when the keyring service is not on the session bus.
+pub const NO_SERVICE: &str = "no keyring service (org.freedesktop.secrets) on the session bus";
+/// What a call says when there is no session bus to reach a keyring on.
+pub const NO_BUS: &str = "no session bus for the keyring";
+/// What a call says when the service did not answer in time.
+pub const NO_ANSWER: &str = "the keyring did not answer";
+
+/// Whether a keyring error means the service is not (yet) there, as at login
+/// before the keyring started, so trying again later may work. A locked keyring,
+/// a cancelled prompt or a missing entry is not: trying again would only put
+/// the prompt in front of the owner again.
+pub fn may_come_later(e: &str) -> bool {
+    [NO_SERVICE, NO_BUS, NO_ANSWER]
+        .iter()
+        .any(|p| e.contains(p))
+}
+
 /// The keyring of this platform and session.
 pub fn system() -> Arc<dyn SecretStore> {
     if std::env::var_os(NO_KEYRING_ENV).is_some() {
@@ -137,7 +154,7 @@ pub mod secret_service {
     use crate::secret::Secret;
 
     /// How long one call to the service may take.
-    const CALL: Duration = Duration::from_secs(10);
+    pub const CALL: Duration = Duration::from_secs(10);
     /// How long an unlock prompt waits for the owner; unanswered means no.
     pub const PROMPT: Duration = Duration::from_secs(120);
 
@@ -235,7 +252,7 @@ pub mod secret_service {
                 Some(c) => Ok(c.clone()),
                 None => timed(zbus::Connection::session())
                     .await
-                    .map_err(|e| format!("no session bus for the keyring: {e}")),
+                    .map_err(|e| format!("{}: {e}", super::NO_BUS)),
             }
         }
     }
@@ -248,7 +265,7 @@ pub mod secret_service {
     async fn timed<T>(f: impl Future<Output = zbus::Result<T>>) -> Result<T, String> {
         match tokio::time::timeout(CALL, f).await {
             Ok(r) => r.map_err(describe),
-            Err(_) => Err("the keyring did not answer".into()),
+            Err(_) => Err(super::NO_ANSWER.into()),
         }
     }
 
@@ -261,7 +278,7 @@ pub mod secret_service {
                         | "org.freedesktop.DBus.Error.NameHasNoOwner"
                 ) =>
             {
-                "no keyring service (org.freedesktop.secrets) on the session bus".into()
+                super::NO_SERVICE.into()
             }
             _ => format!("keyring: {e}"),
         }
@@ -584,6 +601,23 @@ pub mod credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_service_is_worth_trying_again() {
+        assert!(may_come_later(&format!(
+            "cannot read the token from the keyring: {NO_SERVICE}"
+        )));
+        assert!(may_come_later(&format!("{NO_BUS}: no address")));
+        assert!(may_come_later(NO_ANSWER));
+        // The owner said no, or there is nothing: asking again would not help.
+        assert!(!may_come_later(
+            "the keyring stayed locked: the keyring prompt was cancelled"
+        ));
+        assert!(!may_come_later(
+            "the keyring stayed locked: the keyring prompt was not answered in time"
+        ));
+        assert!(!may_come_later("no token in the keyring: pair again"));
+    }
 
     #[tokio::test]
     async fn the_fake_keeps_and_fails_like_a_keyring() {
