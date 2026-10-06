@@ -255,6 +255,16 @@ pub fn target_exe(running: Option<&Path>, me: &Path) -> PathBuf {
     }
 }
 
+/// The version a release is compared with: that of the program `update`
+/// replaces. The running client's (`running`: its program and version, from its
+/// status) when `target_exe` picks its program, else this one's (`me`).
+pub fn current_version<'a>(running: Option<(&Path, &'a str)>, me: &'a str) -> &'a str {
+    match running {
+        Some((exe, version)) if exe.is_absolute() && parse_version(version).is_some() => version,
+        _ => me,
+    }
+}
+
 /// Whether two paths name the same program file.
 pub fn same_program(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -401,6 +411,30 @@ mod tests {
         assert_eq!(target_exe(None, &me), me);
         // An old client that does not say where it runs from.
         assert_eq!(target_exe(Some(Path::new("")), &me), me);
+    }
+
+    #[test]
+    fn a_release_is_compared_with_the_program_it_replaces() {
+        let home = std::env::temp_dir().join("u");
+        let installed = home.join("bin").join("pithagoras-sync");
+        // A newer download run over an older client: the client's version counts,
+        // so the release is due; an older download over a newer client: the same.
+        assert_eq!(
+            current_version(Some((&installed, "0.0.1")), "0.0.2"),
+            "0.0.1"
+        );
+        assert_eq!(
+            current_version(Some((&installed, "0.0.3")), "0.0.2"),
+            "0.0.3"
+        );
+        // No client, or one that does not say its program or a usable version:
+        // the program run here is replaced, and its version counts.
+        assert_eq!(current_version(None, "0.0.2"), "0.0.2");
+        assert_eq!(
+            current_version(Some((Path::new(""), "0.0.1")), "0.0.2"),
+            "0.0.2"
+        );
+        assert_eq!(current_version(Some((&installed, "dev")), "0.0.2"), "0.0.2");
     }
 
     #[cfg(unix)]

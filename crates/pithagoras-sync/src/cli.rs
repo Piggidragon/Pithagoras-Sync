@@ -902,31 +902,39 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let source = manifest
                 .as_deref()
                 .unwrap_or(crate::update::DEFAULT_MANIFEST);
-            let current = env!("CARGO_PKG_VERSION");
+            let me = std::env::current_exe().map_err(|e| e.to_string())?;
+            // The copy the running client was started from, which its unit or
+            // logon task starts again, not necessarily the one run here (a
+            // download, while the installed copy is not on PATH). Its version,
+            // not this one's, says whether a release is newer.
+            let running = match control::send(&dirs.socket(), Request::Status).await {
+                Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version)),
+                _ => None,
+            };
+            let running = running.as_ref().map(|(p, v)| (p.as_path(), v.as_str()));
+            let exe = crate::update::target_exe(running.map(|(p, _)| p), &me);
+            let mine = env!("CARGO_PKG_VERSION");
+            let current = crate::update::current_version(running, mine);
+            let whose = if running.is_some_and(|(p, v)| p.is_absolute() && v == current) {
+                "the running client is"
+            } else {
+                "this is"
+            };
             let offer =
                 crate::update::check(source, key, current, Some(&dirs.update_seen_file())).await?;
             // The date shows a release listing that stopped moving.
             let released = crate::update::utc(offer.released);
             let Some(plan) = offer.plan else {
-                println!("Up to date ({current}; the newest release was made {released}).");
+                println!("Up to date ({whose} {current}; the newest release was made {released}).");
                 return Ok(ExitCode::SUCCESS);
             };
             if check {
                 println!(
-                    "Version {} is available, released {released} (this is {current}).",
+                    "Version {} is available, released {released} ({whose} {current}).",
                     plan.version
                 );
                 return Ok(ExitCode::SUCCESS);
             }
-            let me = std::env::current_exe().map_err(|e| e.to_string())?;
-            // The copy the running client was started from, which its unit or
-            // logon task starts again, not necessarily the one run here (a
-            // download, while the installed copy is not on PATH).
-            let running = match control::send(&dirs.socket(), Request::Status).await {
-                Ok(Some(r)) => r.status.map(|s| PathBuf::from(s.exe)),
-                _ => None,
-            };
-            let exe = crate::update::target_exe(running.as_deref(), &me);
             crate::update::install(&plan, &exe).await?;
             println!("Updated {} to {}.", exe.display(), plan.version);
             if !crate::update::same_program(&exe, &me) {
