@@ -32,6 +32,18 @@ pub fn shown(s: &str) -> String {
     clip(&visible(s), MAX_SHOWN)
 }
 
+/// `shown` line by line, for a text whose line breaks are the client's own
+/// (an uninstall's error, then what its stop left and how to go on): they
+/// stay, every other control character is escaped, and each line is cut
+/// short on its own, so the last one still shows.
+pub fn shown_lines(s: &str) -> String {
+    let lines: Vec<String> = s.lines().take(MAX_LINES).map(shown).collect();
+    lines.join("\n")
+}
+
+/// How many lines of `shown_lines` are shown.
+const MAX_LINES: usize = 8;
+
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -675,6 +687,18 @@ impl Dialogs for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_lines_stay_lines() {
+        let long = "x".repeat(5000);
+        let s = shown_lines(&format!("{long}\r\n\x1b[2Kdone\u{202e}\nRun again."));
+        let lines: Vec<&str> = s.split('\n').collect();
+        assert_eq!(lines.len(), 3, "{s}");
+        assert_eq!(lines[0].chars().count(), MAX_SHOWN + 1);
+        assert_eq!(lines[1], "\\u{1b}[2Kdone\\u{202e}");
+        assert_eq!(lines[2], "Run again.");
+        assert_eq!(shown_lines(&"a\n".repeat(50)).lines().count(), MAX_LINES);
+    }
 
     #[test]
     fn outside_text_is_escaped_and_cut() {

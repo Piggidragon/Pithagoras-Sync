@@ -26,7 +26,7 @@ use sync_policy::{Dirs, Mode};
 use sync_proto::methods::FolderInfo;
 
 use crate::cli::Kept;
-use crate::dialogs::{Dialogs, MAX_ANSWER, shown};
+use crate::dialogs::{Dialogs, MAX_ANSWER, shown, shown_lines};
 use crate::i18n::Lang;
 use crate::secrets::SudoCheck;
 
@@ -529,7 +529,7 @@ async fn uninstall(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             Outcome::Done
         }
         Err(e) => {
-            d.error(&t.uninstall_failed(&shown(&e)));
+            d.error(&t.uninstall_failed(&shown_lines(&e)));
             Outcome::Failed
         }
     }
@@ -969,7 +969,7 @@ mod tests {
         fn step(&self, s: &str) -> Result<(), String> {
             self.did.lock().unwrap().push(s.to_string());
             match self.fail {
-                Some(f) if s.starts_with(f) => Err(format!("{f} broke\x1b[2K")),
+                Some(f) if s.starts_with(f) => Err(format!("{f} broke\x1b[2K\nRun this again.")),
                 _ => Ok(()),
             }
         }
@@ -1574,9 +1574,9 @@ mod tests {
         let (o, seen) = run(&h, &["yes"], Some(LINK)).await;
         assert_eq!(o, Outcome::Failed);
         let e = seen.last().unwrap();
-        assert!(
-            e.starts_with("error: Pairing failed: pair broke\\u{1b}[2K"),
-            "{e}"
+        assert_eq!(
+            e,
+            "error: Pairing failed: pair broke\\u{1b}[2K\\nRun this again."
         );
         let h = FakeHost {
             fail: Some("install"),
@@ -1586,6 +1586,19 @@ mod tests {
         assert_eq!(o, Outcome::Failed);
         assert!(seen.last().unwrap().starts_with("error: Installing failed"));
         assert!(h.paired().is_none());
+        // The lines of an uninstall's error are its own (what the stop left,
+        // and that running it again goes on): they stay lines.
+        for purge in ["yes", "no"] {
+            let h = FakeHost {
+                fail: Some(if purge == "yes" { "purge" } else { "uninstall" }),
+                ..paired()
+            };
+            let (o, seen) = run(&h, &["pick:uninstall", "yes", purge], None).await;
+            assert_eq!(o, Outcome::Failed);
+            let e = seen.last().unwrap();
+            assert!(e.starts_with("error: Uninstalling failed: "), "{e}");
+            assert!(e.ends_with(" broke\\u{1b}[2K\nRun this again."), "{e}");
+        }
     }
 
     #[tokio::test]
