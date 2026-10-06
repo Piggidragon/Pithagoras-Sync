@@ -191,15 +191,11 @@ pub fn record(path: &Path, released: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Private like the other state files: a new 0600 file replaces the old one,
+/// so one written before with a looser mode is tightened too.
 fn write_seen(path: &Path, released: u64) -> Result<(), String> {
-    let err =
-        |e: std::io::Error| format!("cannot record the release time in {}: {e}", path.display());
-    if let Some(dir) = path.parent() {
-        sync_policy::private::private_dir(dir).map_err(err)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{released}\n")).map_err(err)?;
-    std::fs::rename(&tmp, path).map_err(err)
+    sync_policy::config::write_private(path, format!("{released}\n").as_bytes())
+        .map_err(|e| format!("cannot record the release time in {}: {e}", path.display()))
 }
 
 /// `secs` as `YYYY-MM-DD HH:MM UTC`.
@@ -1538,6 +1534,24 @@ mod tests {
         // A client newer than the file is not restarted onto the older file.
         assert!(!is_older("0.3.0", "0.2.0"));
         assert!(!is_older("dev", "0.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_time_is_recorded_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let new = t.path().join("state/update-released");
+        record(&new, 100).unwrap();
+        assert_eq!(mode(&new), 0o600);
+        // One an older version wrote with the umask's 0664 is tightened.
+        let old = t.path().join("state/update-released-1");
+        std::fs::write(&old, "50\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o664)).unwrap();
+        record(&old, 100).unwrap();
+        assert_eq!(mode(&old), 0o600);
+        assert_eq!(read_seen(&old), 100);
     }
 
     #[cfg(unix)]
