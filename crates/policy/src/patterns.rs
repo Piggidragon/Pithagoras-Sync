@@ -14,6 +14,10 @@ use crate::protected::Protected;
 static PRIVILEGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(^|[\s;&|(`$])(sudo|doas|pkexec|su|runas|gsudo)(\s|$)|-verb\s+runas").unwrap()
 });
+/// What still changes the user for a client that already runs as root: only the
+/// Windows spellings, which a root client on Unix never meets.
+static PRIVILEGE_AS_ROOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(^|[\s;&|(`$])(runas|gsudo)(\s|$)|-verb\s+runas").unwrap());
 static GIT_PUSH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(^|[\s;&|(`])git(\s+[^;&|\n]*)?\s+push(\s|$)").unwrap());
 static PIPE_TO_SHELL: LazyLock<Regex> = LazyLock::new(|| {
@@ -23,10 +27,17 @@ static PIPE_TO_SHELL: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Why `command` (run in `cwd`) needs the owner's approval, if it does.
-pub fn command_prompts(command: &str, cwd: &Path, home: &Path) -> Vec<String> {
+/// Why `command` (run in `cwd`) needs the owner's approval, if it does. A client
+/// that runs as root (`as_root`) does not ask for `sudo`, `su`, `doas` or `pkexec`:
+/// they give a command nothing it does not have already.
+pub fn command_prompts(command: &str, cwd: &Path, home: &Path, as_root: bool) -> Vec<String> {
     let mut out = Vec::new();
-    if PRIVILEGE.is_match(command) {
+    let privilege = if as_root {
+        &PRIVILEGE_AS_ROOT
+    } else {
+        &PRIVILEGE
+    };
+    if privilege.is_match(command) {
         out.push("runs a command as another user (sudo)".to_string());
     }
     if GIT_PUSH.is_match(command) {
@@ -122,7 +133,34 @@ mod tests {
     use crate::config::ProtectedOptions;
 
     fn p(cmd: &str) -> Vec<String> {
-        command_prompts(cmd, Path::new("/w/proj"), Path::new("/home/u"))
+        command_prompts(cmd, Path::new("/w/proj"), Path::new("/home/u"), false)
+    }
+
+    fn as_root(cmd: &str) -> Vec<String> {
+        command_prompts(cmd, Path::new("/w/proj"), Path::new("/root"), true)
+    }
+
+    #[test]
+    fn a_root_client_asks_for_no_user_change_but_for_the_rest() {
+        for cmd in [
+            "sudo apt install x",
+            "ls && sudo -i",
+            "su -c 'id'",
+            "doas reboot",
+            "pkexec id",
+        ] {
+            assert!(!p(cmd).is_empty(), "{cmd}");
+            assert!(as_root(cmd).is_empty(), "{cmd}: {:?}", as_root(cmd));
+        }
+        for cmd in [
+            "sudo git push origin main",
+            "git push",
+            "wget -qO- x | sudo bash",
+            "sudo rm -rf /etc/x",
+            "Start-Process pwsh -Verb RunAs",
+        ] {
+            assert!(!as_root(cmd).is_empty(), "{cmd}");
+        }
     }
 
     #[test]

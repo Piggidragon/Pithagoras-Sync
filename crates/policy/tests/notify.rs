@@ -297,6 +297,7 @@ async fn an_unanswered_notification_is_withdrawn_and_denied() {
             audit: Arc::new(AuditLog::open(&root.join("audit.jsonl")).unwrap()),
             clock: system_clock(),
             landlock: false,
+            as_root: false,
         },
     );
     let path = root.join("home/.ssh/key").to_string_lossy().into_owned();

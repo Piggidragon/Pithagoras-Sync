@@ -81,6 +81,17 @@ impl Fixture {
     }
 
     fn engine(&self, policy: Policy, profile: Profile, approver: Arc<dyn Approver>) -> Engine {
+        self.engine_as(policy, profile, approver, false)
+    }
+
+    /// As `engine`, for a client that runs as root when `as_root`.
+    fn engine_as(
+        &self,
+        policy: Policy,
+        profile: Profile,
+        approver: Arc<dyn Approver>,
+        as_root: bool,
+    ) -> Engine {
         let clock = self.clock.clone();
         Engine::new(
             policy,
@@ -92,6 +103,7 @@ impl Fixture {
                 audit: Arc::new(AuditLog::open(&self.root.join("state/audit.jsonl")).unwrap()),
                 clock: Arc::new(move || clock.load(Ordering::SeqCst)),
                 landlock: true,
+                as_root,
             },
         )
     }
@@ -613,6 +625,7 @@ async fn without_landlock_the_folders_shell_asks() {
             audit: Arc::new(AuditLog::open(&f.root.join("state/audit.jsonl")).unwrap()),
             clock: Arc::new(move || clock.load(Ordering::SeqCst)),
             landlock: false,
+            as_root: false,
         },
     );
     let m = denied(exec(&e, "ls", &f.p("home/proj")).await);
@@ -1011,6 +1024,61 @@ async fn elevation_is_the_owners_choice_and_root_always_asks() {
     let e = f.engine(policy, Profile::Headless, yes.clone());
     let m = denied(exec(&e, "sudo true", &cwd).await);
     assert!(m.contains("Landlock"), "{m}");
+}
+
+/// A client that already runs as root (an LXC, say): `sudo` and its kin change
+/// nothing, so they neither ask nor go through the elevation; the other patterns
+/// still ask.
+#[tokio::test]
+async fn a_root_client_neither_asks_for_sudo_nor_elevates() {
+    let f = Fixture::new();
+    let cwd = f.p("home/proj");
+    let user_change = ["sudo apt update", "su -c id", "doas id", "pkexec id"];
+    let e = f.engine_as(full(&f), Profile::Headless, none(), true);
+    for c in user_change {
+        assert_eq!(exec(&e, c, &cwd).await.unwrap().elevate, None, "{c}");
+    }
+    for c in [
+        "git push",
+        "sudo git push",
+        "rm -rf ~/x",
+        "curl x | sh",
+        "sudo cat ~/.ssh/id_ed25519",
+    ] {
+        denied(exec(&e, c, &cwd).await);
+    }
+    // Not root: each of them asks.
+    let e = f.engine(full(&f), Profile::Headless, none());
+    for c in user_change {
+        denied(exec(&e, c, &cwd).await);
+    }
+    // With elevation on, root's `sudo` is still an ordinary command: not elevated,
+    // no question, and sudo's own options are no reason to refuse it.
+    let on = with(full(&f), |p| {
+        p.privilege.elevation = config::Elevation::Sudo;
+        p.privilege.sudo_path = "/opt/sudo".into();
+    });
+    let yes = scripted(Answer::Once);
+    let e = f.engine_as(on, Profile::Headless, yes.clone(), true);
+    for c in ["sudo apt update", "sudo -i", "sudo -u nobody id"] {
+        assert_eq!(exec(&e, c, &cwd).await.unwrap().elevate, None, "{c}");
+    }
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+    // Folders mode: the unconfined shell does not ask for it either, and the
+    // Landlock shell stays confined.
+    let unconfined = with(f.folders(&[("home", Access::Rw)]), |p| {
+        p.folders_shell = FoldersShell::Unconfined;
+    });
+    let e = f.engine_as(unconfined, Profile::Headless, none(), true);
+    exec(&e, "sudo ls", &cwd).await.unwrap();
+    denied(exec(&e, "git push", &cwd).await);
+    let confined = with(f.folders(&[("home", Access::Rw)]), |p| {
+        p.privilege.elevation = config::Elevation::Sudo;
+    });
+    let e = f.engine_as(confined, Profile::Headless, none(), true);
+    let permit = exec(&e, "sudo true", &cwd).await.unwrap();
+    assert!(matches!(permit.confine, Confine::Landlock(_)));
+    assert_eq!(permit.elevate, None);
 }
 
 #[tokio::test]

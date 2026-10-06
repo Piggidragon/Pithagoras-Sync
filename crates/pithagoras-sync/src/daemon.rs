@@ -145,6 +145,8 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
             audit,
             clock: system_clock(),
             landlock,
+            // Windows has no sudo of its own to skip; an elevated token still asks.
+            as_root: cfg!(unix) && is_root(),
         },
     ));
     if dirs.paused_file().exists() {

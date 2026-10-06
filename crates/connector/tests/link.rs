@@ -122,6 +122,7 @@ impl Fx {
                 audit: Arc::new(AuditLog::open(&self.root.join("state/audit.jsonl")).unwrap()),
                 clock: system_clock(),
                 landlock: false,
+                as_root: false,
             },
         );
         let execs = Execs::new(ExecConfig {

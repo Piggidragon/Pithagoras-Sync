@@ -87,7 +87,7 @@ pithagoras-sync config set policy.privilege.elevation sudo
 pithagoras-sync secret set elevation    # typed here, not echoed
 ```
 
-The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. Details in [docs/permissions.md](docs/permissions.md).
+The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
 
 ## Updates
 

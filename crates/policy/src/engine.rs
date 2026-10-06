@@ -221,6 +221,9 @@ pub struct EngineOptions {
     pub clock: Clock,
     /// Whether the kernel enforces Landlock; without it the Folders shell prompts.
     pub landlock: bool,
+    /// Whether the client runs as root (Unix, `geteuid() == 0`): then `sudo` and
+    /// the like change nothing, so they neither ask nor elevate.
+    pub as_root: bool,
 }
 
 pub struct Engine {
@@ -234,6 +237,7 @@ pub struct Engine {
     paused: AtomicBool,
     clock: Clock,
     landlock: bool,
+    as_root: bool,
     secrets: std::sync::OnceLock<Arc<SecretSlot>>,
     /// Files no tool reaches in any mode (the stored elevation secret).
     sealed: std::sync::OnceLock<Vec<PathBuf>>,
@@ -254,6 +258,7 @@ impl Engine {
             paused: AtomicBool::new(false),
             clock: opts.clock,
             landlock: opts.landlock,
+            as_root: opts.as_root,
             secrets: std::sync::OnceLock::new(),
             sealed: std::sync::OnceLock::new(),
         }
@@ -700,7 +705,10 @@ impl Engine {
                     return Ok(Verdict::Deny(why));
                 }
                 let never_ask = rules.never_ask(command);
-                let elevate = match (policy.privilege.elevation, elevated_command(command)) {
+                // A client that runs as root has nothing to elevate to: its `sudo`
+                // is an ordinary command.
+                let elevated = elevated_command(command).filter(|_| !self.as_root);
+                let elevate = match (policy.privilege.elevation, elevated) {
                     (Elevation::Sudo, Some(rest)) if rest.starts_with('-') || rest.is_empty() => {
                         return Ok(Verdict::Deny(
                             "elevated commands are `sudo <command>`, run as root; sudo's own options are not taken".into(),
@@ -749,14 +757,19 @@ impl Engine {
                                 asks.push("Folders mode: every command asks".to_string())
                             }
                             FoldersShell::Unconfined => {
-                                asks.extend(command_prompts(command, &cwd, &self.home));
+                                asks.extend(command_prompts(
+                                    command,
+                                    &cwd,
+                                    &self.home,
+                                    self.as_root,
+                                ));
                                 asks.extend(names_protected(command, &snap.protected, &self.home));
                             }
                         }
                     }
                     Mode::Full => {
                         if policy.full.pattern_prompts {
-                            asks.extend(command_prompts(command, &cwd, &self.home));
+                            asks.extend(command_prompts(command, &cwd, &self.home, self.as_root));
                         }
                         if policy.full.protected_paths {
                             asks.extend(names_protected(command, &snap.protected, &self.home));
