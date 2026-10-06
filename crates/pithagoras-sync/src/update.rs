@@ -293,6 +293,11 @@ pub fn current_version<'a>(running: Option<(&Path, &'a str)>, me: &'a str) -> &'
     }
 }
 
+/// Whether version `a` is older than `b` (both `x.y.z`).
+pub fn is_older(a: &str, b: &str) -> bool {
+    matches!((parse_version(a), parse_version(b)), (Some(a), Some(b)) if a < b)
+}
+
 /// Whether two paths name the same program file.
 pub fn same_program(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -946,6 +951,16 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc(951_782_400 + 3_660), "2000-02-29 01:01 UTC");
         assert_eq!(utc(1_791_244_800), "2026-10-06 00:00 UTC");
+    }
+
+    #[test]
+    fn a_client_is_older_only_by_its_version() {
+        assert!(is_older("0.1.0", "0.2.0"));
+        assert!(is_older("0.9.0", "0.10.0"));
+        assert!(!is_older("0.2.0", "0.2.0"));
+        // A client newer than the file is not restarted onto the older file.
+        assert!(!is_older("0.3.0", "0.2.0"));
+        assert!(!is_older("dev", "0.2.0"));
     }
 
     #[test]

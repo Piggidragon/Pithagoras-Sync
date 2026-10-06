@@ -998,7 +998,33 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             // The date shows a release listing that stopped moving.
             let released = crate::update::utc(offer.released);
             let Some(plan) = offer.plan else {
-                println!("Up to date ({whose} {current}; the newest release was made {released}).");
+                // The file is current, but this user's client may still run the
+                // one it replaced (`install` run again from a newer download).
+                match client.filter(|(_, v)| crate::update::is_older(v, &current)) {
+                    None => println!(
+                        "Up to date ({whose} {current}; the newest release was made {released})."
+                    ),
+                    Some((_, v)) => {
+                        println!(
+                            "{} is up to date ({current}; the newest release was made {released}), but the running client is still {v}.",
+                            exe.display()
+                        );
+                        if check {
+                            println!("`pithagoras-sync update` restarts it.");
+                        } else if matches!(
+                            control::send(&dirs.socket(), Request::Restart).await,
+                            Ok(Some(r)) if r.ok
+                        ) {
+                            println!(
+                                "It restarts with the current program (its unit or logon task starts it again)."
+                            );
+                        } else {
+                            println!(
+                                "It did not take the request to restart: restart its unit or logon task."
+                            );
+                        }
+                    }
+                }
                 // The file is current, but the unit may still run the one it
                 // replaced (an update whose restart failed, or a copy by hand).
                 if unit_runs_exe && !check {
