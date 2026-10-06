@@ -40,6 +40,7 @@ fn all() -> Vec<(&'static str, Test)> {
         sigint_reaches_the_command,
         sigkill_from_the_portal_ends_it,
         output_is_capped,
+        scrubbed_output_stays_within_the_frame_size,
         landlock_keeps_the_shell_in_its_folders,
         commands_get_their_own_cgroup,
         the_shim_dies_with_the_client,
@@ -309,6 +310,40 @@ async fn output_is_capped() {
     assert_eq!(out.len(), 1000);
     assert!(o.truncated);
     assert_eq!(o.code, Some(0));
+}
+
+/// With an elevation password set, the scrubbed output can be longer than it was
+/// read; it still goes out in frames the portal takes (at most `MAX_CHUNK`).
+#[cfg(target_os = "linux")]
+async fn scrubbed_output_stays_within_the_frame_size() {
+    use sync_proto::binary::MAX_CHUNK;
+    let f = fx();
+    let mut cfg = config(&f, own_env());
+    cfg.output_cap = 8 << 20;
+    let e = Execs::new(cfg);
+    let slot = Arc::new(sync_policy::secret::SecretSlot::default());
+    slot.set(sync_policy::secret::Secret::new("pa55word".into()));
+    e.use_secrets(slot);
+    // Every short secret becomes the longer `[redacted]`, and a held-back `p`
+    // goes in front of the next full chunk.
+    let cmd = "yes pa55word | head -c 1000000; \
+               head -c 65535 /dev/zero | tr '\\0' x; printf p; head -c 300000 /dev/zero | tr '\\0' x";
+    let (tx, mut rx) = mpsc::channel(4);
+    let started = e.start(1, cmd, &permit(&f.dir), None, tx).unwrap();
+    let (mut largest, mut total) = (0, 0);
+    let mut text = Vec::new();
+    while let Some(c) = rx.recv().await {
+        largest = largest.max(c.len());
+        total += c.len();
+        text.extend(c);
+    }
+    let o = started.outcome.await.unwrap();
+    assert_eq!(o.code, Some(0), "{o:?}");
+    assert!(largest <= MAX_CHUNK, "a frame of {largest} bytes");
+    let text = String::from_utf8_lossy(&text);
+    assert!(!text.contains("pa55word"));
+    assert_eq!(text.matches("[redacted]").count(), 1_000_000 / 9);
+    assert!(total > 1_000_000 + 365_536, "{total}");
 }
 
 #[cfg(target_os = "linux")]

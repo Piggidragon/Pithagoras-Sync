@@ -548,8 +548,18 @@ async fn forward_output(
             chunk
         };
         sent += chunk.len() as u64;
-        if out.send(chunk).await.is_err() {
-            break;
+        // Scrubbing can make a chunk longer than it was read (the held-back tail
+        // goes in front, and `[redacted]` is longer than a short secret), and a
+        // frame over `MAX_CHUNK` is dropped by the portal: one frame per piece.
+        let frames = if chunk.len() > MAX_CHUNK {
+            chunk.chunks(MAX_CHUNK).map(<[u8]>::to_vec).collect()
+        } else {
+            vec![chunk]
+        };
+        for f in frames {
+            if out.send(f).await.is_err() {
+                return truncated;
+            }
         }
     }
     truncated
