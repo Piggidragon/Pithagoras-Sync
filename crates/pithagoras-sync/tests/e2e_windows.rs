@@ -473,3 +473,20 @@ async fn windows_purge_removes_what_the_client_left_but_the_program() {
     assert!(out.starts_with("Nothing to remove."), "{out}");
     drop(daemon);
 }
+
+/// Windows has no sudo: the `sudo` commands say so and fail, and change nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn sudo_is_linux_only() {
+    let env = Env::new();
+    for args in [
+        &["sudo", "status"][..],
+        &["sudo", "activate", "--no-password"],
+        &["sudo", "set", "--stdin"],
+    ] {
+        let out = env.cmd(args).output().await.unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("sudo access is Linux only"), "{args:?}: {err}");
+    }
+    assert!(!env.config().exists(), "nothing was written");
+}

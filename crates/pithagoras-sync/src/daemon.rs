@@ -383,6 +383,7 @@ impl Daemon {
             approvals_waiting: self.queue.list().len(),
             portal_policy: cfg.portal_policy.as_str().into(),
             elevation: self.elevation_status(&cfg),
+            elevation_password: self.device.secrets.is_set(),
             running_commands: self.device.execs.running(),
             cgroups: self.device.execs.uses_cgroups(),
             landlock: self.device.engine.landlock_available(),

@@ -1,7 +1,7 @@
-//! The elevation secret on the device: typed in a terminal (`secret set
-//! elevation`), handed to the running client over the control channel, and kept
-//! either in the client's memory only (the default; panic and restarts forget it)
-//! or in a file only this user can read. It never goes to the portal, into a
+//! The elevation secret on the device: typed in a terminal (`sudo
+//! set`), handed to the running client over the control channel, and kept either
+//! in the client's memory only (the default; panic and restarts forget it) or in
+//! a file only this user can read. It never goes to the portal, into a
 //! command's argv or environment, the audit log or the client's own log.
 //!
 //! The OS keyring is not used: a keyring unlocked for this user gives the secret to

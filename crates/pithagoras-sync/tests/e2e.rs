@@ -727,15 +727,27 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "approvals",
         "approve 1",
         "deny 1",
-        "secret set elevation --stdin",
-        "secret clear elevation",
+        "sudo set --stdin",
+        "sudo set --stdin --activate",
+        "sudo activate",
+        "sudo activate --no-password",
+        "sudo deactivate",
+        "sudo clear",
+        "sudo clear --deactivate",
         "update --manifest /nowhere/manifest.json",
         "uninstall --purge --yes",
     ]
     .iter()
     .enumerate()
     {
-        let (out, _) = exec(&dl, 10 + i as u32, &me(args), &env.p("home/proj")).await;
+        // The word `sudo` makes the command ask; the owner's check is what is tested,
+        // so it is approved.
+        let (n, cmd, cwd) = (10 + i as u32, me(args), env.p("home/proj"));
+        let (out, _) = if args.starts_with("sudo") {
+            exec_approved(&dl, n, &cmd, &cwd).await
+        } else {
+            exec(&dl, n, &cmd, &cwd).await
+        };
         assert!(out.contains("exit=1"), "{args}: {out}");
         if *args != "config set policy.mode full" {
             assert!(out.contains("cannot come from commands"), "{args}: {out}");
@@ -957,8 +969,9 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
     let sudo = fake_sudo(&env);
     env.ok(&["folder", "add", &env.p("home/proj"), "--rw", "--exec"])
         .await;
-    env.ok(&["config", "set", "policy.privilege.elevation", "sudo"])
-        .await;
+    // Not running yet and no password: the sudo group takes the explicit word that
+    // a sudoers rule is meant to do without one.
+    env.ok(&["sudo", "activate", "--no-password"]).await;
     env.ok(&[
         "config",
         "set",
@@ -997,7 +1010,7 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
     );
 
     // Not on a command line: `--stdin` (or the terminal) only.
-    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    let mut set = env.cmd(&["sudo", "set", "--stdin"]);
     set.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1106,7 +1119,7 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
     assert_eq!(out.trim(), PW.len().to_string());
 
     // A wrong password: sudo refuses, the command does not run.
-    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    let mut set = env.cmd(&["sudo", "set", "--stdin"]);
     set.stdin(Stdio::piped());
     let mut child = set.spawn().unwrap();
     {
@@ -1136,7 +1149,7 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
     // Kept in a file: 0600, and no tool reaches it, whatever the mode.
     env.ok(&["config", "set", "policy.privilege.secret_storage", "file"])
         .await;
-    let mut set = env.cmd(&["secret", "set", "elevation", "--stdin"]);
+    let mut set = env.cmd(&["sudo", "set", "--stdin"]);
     set.stdin(Stdio::piped());
     let mut child = set.spawn().unwrap();
     {
@@ -1171,7 +1184,7 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
     let dl = mock.next_device(WAIT).await.unwrap();
     let (out, exit) = exec_approved(&dl, 10, "sudo echo back-$FAKE_ROOT", &proj).await;
     assert_eq!((out.as_str(), &exit["code"]), ("back-1\n", &json!(0)));
-    env.ok(&["secret", "clear", "elevation"]).await;
+    env.ok(&["sudo", "clear"]).await;
     assert!(!stored.exists());
     drop(dl);
     stop(daemon).await;
@@ -1201,6 +1214,377 @@ async fn the_elevation_password_reaches_sudo_and_nothing_else() {
         String::from_utf8_lossy(&transcript).contains("approval.requested"),
         "the transcript has the traffic"
     );
+}
+
+/// What a finished command printed: (exit code, stdout, stderr).
+struct Ran {
+    code: i32,
+    out: String,
+    err: String,
+}
+
+impl Env {
+    /// Runs a command with `input` on stdin.
+    async fn run_with(&self, args: &[&str], input: &str) -> Ran {
+        use tokio::io::AsyncWriteExt;
+        let mut c = self.cmd(args);
+        c.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        {
+            let mut i = child.stdin.take().unwrap();
+            i.write_all(input.as_bytes()).await.unwrap();
+        }
+        let o = child.wait_with_output().await.unwrap();
+        Ran {
+            code: o.status.code().unwrap_or(-1),
+            out: String::from_utf8_lossy(&o.stdout).into_owned(),
+            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    }
+
+    /// Runs a command with nothing on stdin, as a script does.
+    async fn run(&self, args: &[&str]) -> Ran {
+        let o = self.cmd(args).output().await.unwrap();
+        Ran {
+            code: o.status.code().unwrap_or(-1),
+            out: String::from_utf8_lossy(&o.stdout).into_owned(),
+            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+        }
+    }
+
+    async fn elevation(&self) -> String {
+        self.ok(&["config", "get", "policy.privilege.elevation"])
+            .await
+            .trim()
+            .to_string()
+    }
+
+    /// Runs the command in a pseudo terminal: waits for each text of `script` in
+    /// the output and types its answer. Returns (exit code, everything shown).
+    fn in_terminal(&self, args: &[&str], script: &[(&str, &str)]) -> Option<(i32, String)> {
+        const PY: &str = r#"
+import json, os, pty, select, sys, time
+exe, script, args = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(exe, [exe] + args)
+buf, pos = b"", 0
+def read(until):
+    global buf, pos
+    end = time.time() + 15
+    while until is None or buf.find(until.encode(), pos) < 0:
+        left = end - time.time()
+        if left <= 0:
+            return
+        if select.select([fd], [], [], left)[0]:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                return
+            if not data:
+                return
+            buf += data
+for expect, send in script:
+    read(expect)
+    pos = len(buf)
+    os.write(fd, send.encode())
+read(None)
+_, status = os.waitpid(pid, 0)
+print(buf.decode(errors="replace"))
+print("exit=%d" % os.waitstatus_to_exitcode(status))
+"#;
+        let out = std::process::Command::new("python3")
+            .args(["-c", PY, BIN, &serde_json::to_string(script).unwrap()])
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_STATE_HOME", self.home.join(".local/state"))
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", self.root.join("tmp"))
+            .env("LANG", "C.UTF-8")
+            .env("USER", "tester")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (shown, code) = text.trim_end().rsplit_once("exit=")?;
+        Some((code.trim().parse().ok()?, shown.to_string()))
+    }
+}
+
+/// The audit log's `policy` records, as text.
+fn policy_changes(env: &Env) -> String {
+    std::fs::read_to_string(env.home.join(".local/state/pithagoras-sync/audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("\"tool\":\"policy\"") && l.contains("privilege.elevation"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sudo_set_activate_deactivate_and_clear() {
+    let env = Env::new();
+    // Nothing set up, the client not running.
+    let r = env.run(&["sudo", "status"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("Sudo access: not active"), "{}", r.out);
+    assert!(r.out.contains("Password:    not set"), "{}", r.out);
+    assert!(
+        r.out
+            .contains("Next:        run `pithagoras-sync sudo set`")
+    );
+
+    // Without a password, and nobody to ask: refused, nothing switched on.
+    let r = env.run(&["sudo", "activate"]).await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("not activated"), "{}", r.err);
+    assert!(r.err.contains("sudo set"), "{}", r.err);
+    assert_eq!(env.elevation().await, "off");
+    // A sudoers rule that asks none is said so.
+    env.ok(&["sudo", "activate", "--no-password"]).await;
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Sudo access: active"), "{}", r.out);
+    assert!(r.out.contains("active, but no password"), "{}", r.out);
+    assert!(r.out.contains("Client:      not running"), "{}", r.out);
+    // The password stays when it is switched off, and again is not an error.
+    assert!(env.ok(&["sudo", "deactivate"]).await.contains("now"));
+    assert_eq!(env.elevation().await, "off");
+    assert!(env.ok(&["sudo", "deactivate"]).await.contains("already"));
+
+    // A client that keeps the password in memory has to run first.
+    let r = env.run_with(&["sudo", "set", "--stdin"], "pw\n").await;
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("start it first"), "{}", r.err);
+
+    let daemon = env.start();
+    for _ in 0..100 {
+        if env
+            .cmd(&["status"])
+            .output()
+            .await
+            .unwrap()
+            .status
+            .success()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // `--stdin` is a script: no question, a hint, and the policy is as it was.
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("not active yet"), "{}", r.out);
+    assert!(r.out.contains("sudo activate"), "{}", r.out);
+    assert_eq!(env.elevation().await, "off");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Sudo access: not active"), "{}", r.out);
+    assert!(
+        r.out.contains("Password:    set (kept in memory)"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("Next:        run `pithagoras-sync sudo activate`")
+    );
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["elevation_password"], true, "{status}");
+
+    // The password is there, so activating asks nothing.
+    let r = env.run(&["sudo", "activate"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(env.elevation().await, "sudo");
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert!(
+        status["elevation"]
+            .as_str()
+            .unwrap()
+            .starts_with("sudo, password set"),
+        "{status}"
+    );
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Sudo access: active"), "{}", r.out);
+    assert!(r.out.contains("Next:        nothing to do"), "{}", r.out);
+    // The change is audited with its old and new value, as a `config set` is.
+    let audit = policy_changes(&env);
+    assert!(audit.contains("by the device owner"), "{audit}");
+    assert!(audit.contains(r#"\"off\" -> \"sudo\""#), "{audit}");
+
+    // Off again, the password stays.
+    env.ok(&["sudo", "deactivate"]).await;
+    assert_eq!(env.elevation().await, "off");
+    assert!(policy_changes(&env).contains(r#"\"sudo\" -> \"off\""#));
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Password:    set"), "{}", r.out);
+
+    // `clear` on a client where sudo is not active only forgets.
+    let r = env.run(&["sudo", "clear"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("forgotten"), "{}", r.out);
+    assert!(!r.out.contains("stays active"), "{}", r.out);
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Password:    not set"), "{}", r.out);
+
+    // Set and switch on in one go; `clear` in a script leaves it on, and says so.
+    let r = env
+        .run_with(
+            &["sudo", "set", "--stdin", "--activate"],
+            &format!("{PW}\n"),
+        )
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert!(r.out.contains("Sudo access is active."), "{}", r.out);
+    assert!(!r.out.contains("not active yet"), "{}", r.out);
+    let r = env.run(&["sudo", "clear"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(r.out.contains("stays active"), "{}", r.out);
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("active, but no password"), "{}", r.out);
+    // `clear --deactivate` does both.
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    let r = env.run(&["sudo", "clear", "--deactivate"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(env.elevation().await, "off");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Password:    not set"), "{}", r.out);
+
+    stop(daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sudo_keeps_the_password_in_a_file_when_asked() {
+    let env = Env::new();
+    env.ok(&["config", "set", "policy.privilege.secret_storage", "file"])
+        .await;
+    // The client is not running: the file is written for its next start.
+    let r = env
+        .run_with(
+            &["sudo", "set", "--stdin", "--activate"],
+            &format!("{PW}\n"),
+        )
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(!r.out.contains(PW) && !r.err.contains(PW));
+    assert_eq!(env.elevation().await, "sudo");
+    let stored = env.home.join(".config/pithagoras-sync/elevation.secret");
+    assert!(stored.exists());
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(
+        r.out.contains("Password:    set (kept in file)"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("Next:        nothing to do"), "{}", r.out);
+    // Activating needs no question: the stored password counts.
+    env.ok(&["sudo", "deactivate"]).await;
+    env.ok(&["sudo", "activate"]).await;
+    let r = env.run(&["sudo", "clear", "--deactivate"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(!stored.exists());
+    assert_eq!(env.elevation().await, "off");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sudo_asks_in_a_terminal() {
+    let env = Env::new();
+    let daemon = env.start();
+    for _ in 0..100 {
+        if env
+            .cmd(&["status"])
+            .output()
+            .await
+            .unwrap()
+            .status
+            .success()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ask = "Do you want to activate sudo access now? [y/N]";
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        stop(daemon).await;
+        return;
+    }
+    // Password, then the question: yes.
+    let (code, shown) = env
+        .in_terminal(
+            &["sudo", "set"],
+            &[("not shown", &format!("{PW}\n")), (ask, "y\n")],
+        )
+        .expect("the terminal run");
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains(PW), "the password was echoed: {shown}");
+    assert!(shown.contains("now."), "{shown}");
+    assert_eq!(env.elevation().await, "sudo");
+    // Already active: no question.
+    let (code, shown) = env
+        .in_terminal(&["sudo", "set"], &[("not shown", &format!("{PW}\n"))])
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("[y/N]"), "{shown}");
+    // No: it stays off, with the hint.
+    env.ok(&["sudo", "deactivate"]).await;
+    let (code, shown) = env
+        .in_terminal(
+            &["sudo", "set"],
+            &[("not shown", &format!("{PW}\n")), (ask, "n\n")],
+        )
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert!(shown.contains("not active yet"), "{shown}");
+    assert_eq!(env.elevation().await, "off");
+
+    // Clear while active asks whether to deactivate: no keeps it on.
+    env.ok(&["sudo", "activate"]).await;
+    let q = "Deactivate it too? [y/N]";
+    let (code, shown) = env.in_terminal(&["sudo", "clear"], &[(q, "n\n")]).unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert!(shown.contains("stays active"), "{shown}");
+    assert_eq!(env.elevation().await, "sudo");
+    // Activating without a password offers to set one: no refuses, yes sets it.
+    let offer = "Do you want to set a password now? [y/N]";
+    env.ok(&["sudo", "deactivate"]).await;
+    let (code, shown) = env
+        .in_terminal(&["sudo", "activate"], &[(offer, "n\n")])
+        .unwrap();
+    assert_eq!(code, 1, "{shown}");
+    assert!(shown.contains("not activated"), "{shown}");
+    assert_eq!(env.elevation().await, "off");
+    let (code, shown) = env
+        .in_terminal(
+            &["sudo", "activate"],
+            &[(offer, "y\n"), ("not shown", &format!("{PW}\n"))],
+        )
+        .unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("Password:    set"), "{}", r.out);
+    // Clear, answering yes: both gone.
+    let (code, shown) = env.in_terminal(&["sudo", "clear"], &[(q, "y\n")]).unwrap();
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(env.elevation().await, "off");
+    stop(daemon).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

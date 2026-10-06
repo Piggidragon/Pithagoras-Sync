@@ -78,16 +78,20 @@ Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://gi
 .\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 
 On Linux, the agent can run `sudo <command>` if you allow it and type your password on the device, never in the portal:
 
 ```sh
-pithagoras-sync config set policy.privilege.elevation sudo
-pithagoras-sync secret set elevation    # typed here, not echoed
+pithagoras-sync sudo set       # type the password (not echoed), then answer "activate now?"
+pithagoras-sync sudo status    # active or not, password set or not, and the next step
+pithagoras-sync sudo deactivate    # sudo access off again; the password stays
+pithagoras-sync sudo clear     # forget the password
 ```
+
+`sudo activate` switches sudo access on later (it offers to store a password first if there is none). In a script, `sudo set --stdin --activate` reads the password from stdin and switches it on without asking. `pithagoras-sync sudo --help` lists everything.
 
 The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
 

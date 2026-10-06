@@ -17,7 +17,7 @@ Each change takes effect at once in the running client and is written to the aud
 Who may change them on the device:
 
 - Only the device's own user (the account the client runs as). On a Linux desktop (`profile = "desktop"`) every change also asks for that user's password in the terminal, through `su`.
-- On Linux, a change through the CLI from a command the client runs for the portal (a process descending from the client) is refused, whatever the command: `config`, `mode`, `folder`, `secret`, `approve`, `deny`, `unlock`, `update`. Windows has no such check yet (windows.md).
+- On Linux, a change through the CLI from a command the client runs for the portal (a process descending from the client) is refused, whatever the command: `config`, `mode`, `folder`, `sudo`, `approve`, `deny`, `unlock`, `update`. Windows has no such check yet (windows.md).
 - That check is not a wall around the policy. A command that runs unconfined has all of the user's rights: it can edit `config.toml` itself and make the client read it (`SIGHUP` reloads the config, and a client killed by the command is started again by its unit). Unconfined are a command you approved in Ask mode, every command in Full mode, and Folders mode's shell with `folders_shell = "unconfined"` or without Landlock after its approval. Only a command confined by Landlock (Folders mode) cannot reach the config, since the client's own folders are protected. So approving a command means trusting it with your account, the policy included.
 
 ## The settings
@@ -106,9 +106,9 @@ The first answer wins. "Of its kind" means reads or writes from the same chat, a
 | Setting | Values | Default | What it does | CLI | Portal |
 |---|---|---|---|---|---|
 | `policy.privilege.allow_root` | `true`, `false` | `false` | Whether the client may run as root (Linux) or an elevated administrator (Windows). Off, it refuses to start as either. A dedicated user is safer (`setup --create-user`). | `config set policy.privilege.allow_root true` | yes |
-| `policy.privilege.elevation` | `off`, `sudo` | `off` | `sudo`: a command that starts with `sudo ` runs as root, with the password stored on the device (below) or a sudoers rule that asks none. Linux only. Such a command always asks, in every mode, unless it is on `never_ask`; a client that already runs as root elevates nothing and runs `sudo ...` as an ordinary command, without this question; `sudo` with options of its own is refused; under Landlock it is refused (Folders mode needs `folders_shell = "unconfined"`). It needs the systemd unit's own cgroup, so that `panic` can kill root's processes; where a command's cgroup cannot be made or joined, the command does not run. | `config set policy.privilege.elevation sudo` | yes |
+| `policy.privilege.elevation` | `off`, `sudo` | `off` | `sudo`: a command that starts with `sudo ` runs as root, with the password stored on the device (below) or a sudoers rule that asks none. Linux only. Such a command always asks, in every mode, unless it is on `never_ask`; a client that already runs as root elevates nothing and runs `sudo ...` as an ordinary command, without this question; `sudo` with options of its own is refused; under Landlock it is refused (Folders mode needs `folders_shell = "unconfined"`). It needs the systemd unit's own cgroup, so that `panic` can kill root's processes; where a command's cgroup cannot be made or joined, the command does not run. | `sudo activate` / `sudo deactivate` (or `config set policy.privilege.elevation sudo`) | yes |
 | `policy.privilege.sudo_path` | absolute path | `/usr/bin/sudo` | The sudo the client runs. | `config set policy.privilege.sudo_path /usr/local/bin/sudo` | no |
-| `policy.privilege.secret_storage` | `memory`, `file` | `memory` | Where the elevation password is kept. `memory`: only in the running client, which makes itself undumpable; set it again after each start, and `panic` forgets it. `file`: a 0600 file, `~/.config/pithagoras-sync/elevation.secret`, which survives restarts. | `config set policy.privilege.secret_storage file` | no |
+| `policy.privilege.secret_storage` | `memory`, `file` | `memory` | Where the elevation password is kept. `memory`: only in the running client, which makes itself undumpable; set it again after each start, and `panic` forgets it. `file`: a 0600 file, `~/.config/pithagoras-sync/elevation.secret`, which survives restarts (`sudo set` then also works while the client is not running). | `config set policy.privilege.secret_storage file` | no |
 
 `exec.shell`, `sudo_path` and `secret_storage` are device-only because a portal that could change them could point the device at a program of its choosing and have the password handed to it.
 
@@ -122,18 +122,26 @@ The first answer wins. "Of its kind" means reads or writes from the same chat, a
 | `exec.max_timeout_secs` | above 0 | `14400` (4 h) | The longest a command may run, whatever the portal asks for. | `config set` | yes |
 | `exec.output_cap_bytes` | above 0 | `16777216` (16 MiB) | Output beyond this per command is dropped. | `config set` | yes |
 
-## The elevation password
+## Sudo access and the elevation password
 
-The password sudo needs is never a setting and never goes through the portal or a command line:
+Two things make `sudo <command>` work for the agent: the setting `policy.privilege.elevation = sudo` ("sudo access is active") and the password sudo asks for. The `sudo` command group sets both. The password is never a setting and never goes through the portal or a command line:
 
 ```sh
-pithagoras-sync secret set elevation           # typed in this terminal, not echoed
-pithagoras-sync secret set elevation --stdin   # one line from stdin, for a script
-pithagoras-sync secret status
-pithagoras-sync secret clear                   # forget it, in the client and on disk
+pithagoras-sync sudo set                # type the password (not echoed), then asks "Do you want to activate sudo access now? [y/N]"
+pithagoras-sync sudo set --stdin        # one line from stdin, for a script; asks nothing
+pithagoras-sync sudo set --stdin --activate   # ... and switches sudo access on
+pithagoras-sync sudo activate           # switch sudo access on
+pithagoras-sync sudo activate --no-password   # without a stored password: a sudoers rule that asks none
+pithagoras-sync sudo deactivate         # switch it off; the stored password stays
+pithagoras-sync sudo clear              # forget the password, in the client and on disk
+pithagoras-sync sudo clear --deactivate #   ... and switch sudo access off
+pithagoras-sync sudo status             # active or not, password set or not (and where), what to do next
 ```
 
-- `set` refuses while a debugger traces the client. It does not try the password: a wrong one shows when the next `sudo` command fails with sudo's own message.
+- Questions are asked only in a terminal. `set` asks about activating unless sudo access is active already; with `--stdin` (stdin is the password, so there is nobody to ask) or without a terminal it asks nothing, leaves sudo access as it is and prints the hint, unless `--activate` is given. `activate` without a stored password offers to type one now (y/N); in a script it refuses and says what to run, unless `--no-password` is given. A client that runs as root has nothing to elevate and needs no password, so `activate` does not ask there. `clear` asks whether to switch sudo access off too while it is active; without a terminal it keeps it active (sudo then runs only what sudoers allows without a password) and says so, unless `--deactivate` is given.
+- Switching sudo access on or off changes `policy.privilege.elevation` like `config set` does: the running client takes it at once and audits it with the old and new value, and the CLI refuses it from a command the client runs for the portal. `config set policy.privilege.elevation sudo` (or `off`) stays valid as the generic way and does the same; `sudo status` reads the same setting. `sudo set`, `sudo activate` and (on a desktop) the password check apply as for any policy change; `deactivate` and `clear` only take rights away and ask for no password.
+- On Windows the group exists but says "sudo access is Linux only" and fails: Windows has no sudo, so there is nothing to rename or replace there.
+- `sudo set` refuses while a debugger traces the client. It does not try the password: a wrong one shows when the next `sudo` command fails with sudo's own message.
 - sudo gets it on stdin through the exec shim, which takes it from a private file descriptor (never argv or the environment) and closes stdin before the command starts, so the command cannot read it.
 - It is replaced by `[redacted]` in command output, in every message to the portal, in the audit log and in the client's own log. A command that prints it re-encoded (base64, say) is not caught.
 - The file tools refuse the stored file in every mode, grep and find skip it, and Landlock leaves it out. An unconfined command of the same user (Full mode, or `folders_shell = "unconfined"`) can still read it; only the output scrubbing then stands between it and the portal. That is why `memory` is the default.

@@ -153,7 +153,7 @@ pub enum Elevation {
     #[default]
     Off,
     /// `sudo ...` commands run through sudo with the password the owner stored on
-    /// the device (`secret set elevation`), or a sudoers rule of the owner's.
+    /// the device (`pithagoras-sync sudo set`), or a sudoers rule of the owner's.
     Sudo,
 }
 

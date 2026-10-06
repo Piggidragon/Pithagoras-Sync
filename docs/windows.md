@@ -37,7 +37,7 @@ The check that notices a command naming a protected path knows the PowerShell sp
 
 ## Elevation: Linux only
 
-Elevation is `sudo` on Linux and nothing else: Windows has none, and none is planned (no UAC prompt, no stored administrator password, no Credential Manager). On Windows, with `policy.privilege.elevation = "sudo"`, a `sudo ...` command is denied (with it off, `sudo` is just a word of the command), and `secret set elevation` is refused. A command that needs administrator rights fails with Windows' own "access denied"; the owner runs it in an elevated PowerShell of his own.
+Elevation is `sudo` on Linux and nothing else: Windows has none, and none is planned (no UAC prompt, no stored administrator password, no Credential Manager). On Windows, with `policy.privilege.elevation = "sudo"`, a `sudo ...` command is denied (with it off, `sudo` is just a word of the command), and `pithagoras-sync sudo ...` says "sudo access is Linux only" and fails. A command that needs administrator rights fails with Windows' own "access denied"; the owner runs it in an elevated PowerShell of his own.
 
 `policy.privilege.allow_root` (off by default) also covers an elevated administrator: the client refuses to start in an elevated session unless it is on, and warns "running as an elevated administrator" when it is. An administrator's ssh session is always elevated (the High mandatory level), so a client started over ssh needs it; the logon task runs the client unelevated (Medium level, tested).
 
