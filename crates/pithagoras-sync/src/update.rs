@@ -976,8 +976,10 @@ mod tests {
     }
 
     /// A file system given as (path, uid, gid, mode, link) rows.
+    #[cfg(unix)]
     struct FakeFs(Vec<(&'static str, u32, u32, u32, Option<&'static str>)>);
 
+    #[cfg(unix)]
     impl Fs for FakeFs {
         fn lstat(&self, path: &Path) -> std::io::Result<Option<Node>> {
             Ok(self
