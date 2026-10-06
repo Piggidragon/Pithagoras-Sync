@@ -15,7 +15,7 @@ Phase 1 on Windows gives the same remote access as on Linux: the agent's file, s
 
 ## Plain http to a local portal
 
-On Linux the client sends nothing over plain http to a loopback port unless the program that accepted the connection belongs to its user or root (from `/proc/net/tcp`). Windows has no such check yet (it would need `GetExtendedTcpTable` and the owning process's token): any local account that listens on the portal's port while the portal is down gets the pairing code or the token. On a Windows machine shared with other accounts, use https with a pinned certificate.
+On Linux the client sends nothing over plain http to a loopback port unless the connection's socket and the sockets listening on that port belong to its user or root (from `/proc/net/tcp`). Windows has no such check yet (it would need `GetExtendedTcpTable` and the owning process's token): any local account that listens on the portal's port while the portal is down gets the pairing code or the token. On a Windows machine shared with other accounts, use https with a pinned certificate.
 
 ## Process trees: Job Objects
 
