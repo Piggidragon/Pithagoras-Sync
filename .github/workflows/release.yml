@@ -7,6 +7,10 @@
 # One-time setup by the repository owner (docs/releasing.md):
 #   - repository variable PITHAGORAS_SYNC_UPDATE_KEY: the public key
 #   - repository secret PITHAGORAS_SYNC_SIGNING_KEY: the secret key file's content
+#
+# The secret key reaches one step only, which runs the release tool built in its
+# own job: no build script or proc macro runs while the key is in an environment.
+# The actions are pinned by commit.
 name: Release
 
 on:
@@ -29,7 +33,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
@@ -70,7 +74,7 @@ jobs:
       TARGET: ${{ matrix.arch }}-unknown-linux-musl
       BIN: pithagoras-sync-${{ matrix.arch }}-linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
@@ -94,7 +98,7 @@ jobs:
             echo "the binary says $said" >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.BIN }}
           path: dist/${{ env.BIN }}
@@ -107,7 +111,7 @@ jobs:
       TARGET: x86_64-pc-windows-msvc
       BIN: pithagoras-sync-x86_64-windows.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
@@ -132,42 +136,67 @@ jobs:
             echo "the program says $said" >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.BIN }}
           path: dist/${{ env.BIN }}
           if-no-files-found: error
 
-  publish:
-    needs: [linux, windows]
+  # The release tool, built without the secret.
+  tool:
+    needs: check
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - uses: actions/download-artifact@v4
+      - name: Build
+        run: cargo build --release --locked -p sync-release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          name: sync-release
+          path: target/release/sync-release
+          if-no-files-found: error
+
+  # No checkout and no build here: only the artifacts of the jobs above.
+  publish:
+    needs: [linux, windows, tool]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pithagoras-sync-*
           path: dist
           merge-multiple: true
-      - name: The manifest, its signature and the checksums
-        env:
-          PITHAGORAS_SYNC_SIGNING_KEY: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY }}
-          PUBLIC_KEY: ${{ vars.PITHAGORAS_SYNC_UPDATE_KEY }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sync-release
+          path: tool
+      - name: The manifest
         run: |
-          cargo build --release --locked -p sync-release
-          tool=$PWD/target/release/sync-release
+          chmod +x tool/sync-release
           cd dist
-          "$tool" manifest --version "${GITHUB_REF_NAME#v}" \
+          ../tool/sync-release manifest --version "${GITHUB_REF_NAME#v}" \
             --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
             --out manifest.json \
             pithagoras-sync-x86_64-linux=x86_64-linux \
             pithagoras-sync-aarch64-linux=aarch64-linux \
             pithagoras-sync-x86_64-windows.exe=x86_64-windows
-          "$tool" sign --key-env PITHAGORAS_SYNC_SIGNING_KEY manifest.json
+      # The only step that sees the secret key.
+      - name: Sign the manifest
+        env:
+          PITHAGORAS_SYNC_SIGNING_KEY: ${{ secrets.PITHAGORAS_SYNC_SIGNING_KEY }}
+        run: tool/sync-release sign --key-env PITHAGORAS_SYNC_SIGNING_KEY dist/manifest.json
+      - name: The signature and the checksums
+        env:
+          PUBLIC_KEY: ${{ vars.PITHAGORAS_SYNC_UPDATE_KEY }}
+        run: |
+          tool=$PWD/tool/sync-release
+          cd dist
           # The secret must belong to the public key in the binaries, or no client
           # could take this release.
           "$tool" verify --public "$PUBLIC_KEY" manifest.json

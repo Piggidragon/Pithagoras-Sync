@@ -34,6 +34,8 @@ Losing the secret key means the clients in the field cannot take another update:
 
 The workflow refuses to run without both, and before it publishes it checks the signature against the variable, so a secret that does not belong to the public key fails the release instead of producing one no client can take.
 
+The secret reaches one step of the workflow only: the one that runs `sync-release sign`. The tool is built in a job of its own without the secret, and the job that signs checks nothing out and builds nothing, so no build script or proc macro of a dependency runs while the key is readable. The actions are pinned by commit. What remains: the tool's own code, its dependencies included, runs with the key when it signs, so a compromised dependency compiled into `sync-release` could still take it; the lock file and review of dependency updates are the defence there.
+
 ## Making a release
 
 1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and commit.
@@ -48,7 +50,7 @@ The workflow checks that the tag is the version in `Cargo.toml` and that each bi
 
 ## The helper: `sync-release`
 
-The workflow uses `crates/release` (`cargo run -p sync-release -- ...`), which also works by hand:
+The workflow uses `crates/release` (built once, then run as `sync-release ...`), which also works by hand (`cargo run -p sync-release -- ...`):
 
 ```text
 sync-release keygen <key file>                     a new key; prints the public key
@@ -66,5 +68,7 @@ The public key and the signatures are in minisign's format (a legacy, not prehas
 ## What was checked, and what not
 
 The workflow was checked with `actionlint` 1.7.7 (without shellcheck), and its steps were run by hand on Linux: the x86_64 musl build (with clang as the C compiler, the workflow uses `musl-gcc`) and the Windows build (with `cargo xwin` instead of the Windows runner), both with a throwaway key compiled in; the static-binary, version and no-`VCRUNTIME140` checks; `manifest`, `sign --key-env`, `verify` (a wrong key refused), `sums` and `sha256sum -c`; and the release client's `update --check` against that manifest (up to date at 0.1.0, 0.1.1 offered, a manifest signed by another key refused). Against GitHub, `update --check` reached the stable channel's URL (HTTP 404: no release yet) and followed GitHub's release download redirects.
+
+The split of the publish job (the tool built in its own job, the key only in the sign step, actions pinned by commit) was checked by parsing the YAML and by running the publish job's steps by hand against the tool built as in its job, after a round trip without the executable bit as artifacts make it (`manifest`, `sign --key-env`, `verify`, `sums`, `sha256sum -c`); actionlint was not run on it again.
 
 Not run: the workflow itself on GitHub (nothing is published until a tag is pushed), the aarch64 build, and `gh release create`.
