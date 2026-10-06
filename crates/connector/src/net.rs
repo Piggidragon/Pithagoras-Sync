@@ -253,8 +253,45 @@ pub async fn open(url: &PortalUrl, pin: Option<&str>) -> Result<BoxIo, String> {
     )
     .await
     .map_err(|_| format!("TLS handshake with {url} timed out"))?
-    .map_err(|e| format!("TLS with {url}: {e}"))?;
+    .map_err(|e| tls_error(url, pin.is_some(), &e))?;
     Ok(Box::new(tls))
+}
+
+/// A refused certificate in words that say what happened and what to do; rustls
+/// alone says `ApplicationVerificationFailure` or `CaUsedAsEndEntity`.
+fn tls_error(url: &PortalUrl, pinned: bool, e: &std::io::Error) -> String {
+    let refused = e
+        .get_ref()
+        .and_then(|i| i.downcast_ref::<rustls::Error>())
+        .and_then(|r| match r {
+            rustls::Error::InvalidCertificate(c) => Some(c),
+            _ => None,
+        });
+    match refused {
+        Some(_) if pinned => format!(
+            "TLS with {url}: the portal's certificate does not carry the key pinned at pairing. Its key changed (a new certificate), or another server answers there. If the portal got a new certificate, pair again with the URI from its Devices page."
+        ),
+        Some(c) => {
+            use rustls::CertificateError as C;
+            let why = match c {
+                C::Expired | C::ExpiredContext { .. } => "it has expired".to_string(),
+                C::NotValidForName | C::NotValidForNameContext { .. } => {
+                    "it is made out to another name".to_string()
+                }
+                // webpki's reason comes wrapped in `Other`, and this crate does not
+                // depend on webpki to match it.
+                C::UnknownIssuer => "no authority this machine knows signed it".to_string(),
+                C::Other(o) if format!("{o:?}").contains("CaUsedAsEndEntity") => {
+                    "it is self-signed".to_string()
+                }
+                other => other.to_string(),
+            };
+            format!(
+                "TLS with {url}: the portal's certificate is not one this machine trusts ({why}), and the pairing carries no pin for it. For a self-signed certificate, open the portal over https once and pair with the URI its Devices page shows then, which carries the pin."
+            )
+        }
+        None => format!("TLS with {url}: {e}"),
+    }
 }
 
 #[cfg(test)]

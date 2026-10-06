@@ -271,12 +271,21 @@ async fn a_certificate_that_does_not_match_the_pin_is_refused() {
         .pair_uri("AB12CD34")
         .replace(mock.spki.as_deref().unwrap(), &wrong);
     let e = pair::pair(&uri, "laptop").await.err().unwrap();
-    assert!(e.contains("TLS"), "{e}");
+    assert!(
+        e.contains("does not carry the key pinned at pairing"),
+        "{e}"
+    );
+    assert!(e.contains("pair again"), "{e}");
+    assert!(!e.contains("ApplicationVerificationFailure"), "{e}");
     // Without a pin, a self-signed certificate fails against the system's roots.
     let no_pin = mock.pair_uri("AB12CD34");
     let no_pin = &no_pin[..no_pin.find("&spki=").unwrap()];
     let e = pair::pair(no_pin, "laptop").await.err().unwrap();
-    assert!(e.contains("TLS") || e.contains("root certificates"), "{e}");
+    assert!(
+        e.contains("open the portal over https once") || e.contains("root certificates"),
+        "{e}"
+    );
+    assert!(!e.contains("invalid peer certificate"), "{e}");
     // Neither attempt reached the pairing endpoint.
     assert!(mock.pairs().is_empty());
 }
