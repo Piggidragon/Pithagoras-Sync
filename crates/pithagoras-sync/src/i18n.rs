@@ -311,6 +311,12 @@ impl Lang {
             (LogPlace::Journal(unit), Lang::De) => {
                 format!("das Journal (journalctl --user -u {unit})")
             }
+            (LogPlace::SystemJournal(unit), Lang::En) => format!(
+                "the system journal (journalctl -u {unit}; root and the groups systemd-journal and adm can read it)"
+            ),
+            (LogPlace::SystemJournal(unit), Lang::De) => format!(
+                "das Systemjournal (journalctl -u {unit}; lesen können es root und die Gruppen systemd-journal und adm)"
+            ),
         }
     }
 

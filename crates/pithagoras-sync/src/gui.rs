@@ -48,6 +48,23 @@ pub enum LogPlace {
     File(String),
     /// The journal of this systemd user unit.
     Journal(&'static str),
+    /// The system journal of this system unit (`install --system`, `setup`),
+    /// which only root and the journal's groups can read.
+    SystemJournal(&'static str),
+}
+
+/// The arguments of `journalctl` for the client's lines in `place`.
+fn journal_args(place: &LogPlace) -> Option<Vec<&'static str>> {
+    let (user, unit) = match place {
+        LogPlace::File(_) => return None,
+        LogPlace::Journal(unit) => (true, *unit),
+        LogPlace::SystemJournal(unit) => (false, *unit),
+    };
+    let mut args = vec!["-u", unit, "-n", "500", "--no-pager"];
+    if user {
+        args.insert(0, "--user");
+    }
+    Some(args)
 }
 
 /// What the menu's Status shows. Text in it is escaped (`shown`).
@@ -128,6 +145,9 @@ pub trait Host {
     /// What `status` reports.
     async fn status(&self) -> StatusView;
     fn open_log(&self) -> Result<(), String>;
+    /// Why `uninstall` cannot be done from here, known before it asks
+    /// anything: the system unit runs the client, which only root removes.
+    fn uninstall_refused(&self) -> Option<String>;
     /// `uninstall`, or `uninstall --purge`; returns the program, which stays,
     /// and the notes of its steps.
     async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String>;
@@ -515,6 +535,11 @@ async fn forget_password(d: &dyn Dialogs, h: &impl Host, t: Lang, st: SudoState)
 }
 
 async fn uninstall(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    // Said before the two questions, whose answers would not count.
+    if let Some(e) = h.uninstall_refused() {
+        d.error(&t.uninstall_failed(&shown(&e)));
+        return Outcome::Failed;
+    }
     if !d.question(t.uninstall_question()) {
         return Outcome::Cancelled;
     }
@@ -579,6 +604,14 @@ impl RealHost {
     fn config(&self) -> Option<sync_policy::DeviceConfig> {
         crate::cli::load_config(&self.dirs).ok()
     }
+
+    fn linux_install(&self) -> LinuxInstall {
+        linux_install(
+            sync_ops::info::home().as_deref(),
+            &crate::update::system_unit_file(),
+            &sync_ops::info::user().0,
+        )
+    }
 }
 
 impl Host for RealHost {
@@ -633,6 +666,8 @@ impl Host for RealHost {
         let file = crate::cli::log_file(&self.dirs);
         if cfg!(windows) || file.exists() {
             LogPlace::File(file.display().to_string())
+        } else if self.linux_install() == LinuxInstall::System {
+            LogPlace::SystemJournal(crate::install::UNIT_NAME)
         } else {
             LogPlace::Journal(crate::install::UNIT_NAME)
         }
@@ -782,18 +817,18 @@ impl Host for RealHost {
             .map_err(|e| format!("{prog}: {e}"))
     }
 
-    async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String> {
-        if cfg!(target_os = "linux")
-            && linux_install(
-                sync_ops::info::home().as_deref(),
-                &crate::update::system_unit_file(),
-                &sync_ops::info::user().0,
-            ) == LinuxInstall::System
-        {
-            return Err(format!(
+    fn uninstall_refused(&self) -> Option<String> {
+        (cfg!(target_os = "linux") && self.linux_install() == LinuxInstall::System).then(|| {
+            format!(
                 "the client runs from the system unit {} (installed with `install --system` or `setup`), which only root can remove: sudo pithagoras-sync uninstall --system",
                 crate::update::system_unit_file().display()
-            ));
+            )
+        })
+    }
+
+    async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String> {
+        if let Some(e) = self.uninstall_refused() {
+            return Err(e);
         }
         let program = std::env::current_exe()
             .map(|p| p.display().to_string())
@@ -858,23 +893,21 @@ impl RealHost {
     /// or a client started with `run --detach`), else the unit's journal saved
     /// to `journal.log` beside it, since a text editor cannot open the journal.
     fn log_to_open(&self) -> Result<PathBuf, String> {
-        let file = crate::cli::log_file(&self.dirs);
-        if cfg!(windows) || file.exists() {
-            return Ok(file);
-        }
+        let place = self.log_place();
+        let Some(args) = journal_args(&place) else {
+            return Ok(crate::cli::log_file(&self.dirs));
+        };
         let out = std::process::Command::new("journalctl")
-            .args([
-                "--user",
-                "-u",
-                crate::install::UNIT_NAME,
-                "-n",
-                "500",
-                "--no-pager",
-            ])
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
             .map_err(|e| format!("journalctl: {e}"))?;
+        // Another user's lines in the system journal: journalctl shows none
+        // of them to a user outside its groups, and says so only on stderr.
+        if matches!(place, LogPlace::SystemJournal(_)) && out.stdout.trim_ascii().is_empty() {
+            return Err("journalctl shows no lines of it to this user".into());
+        }
         let saved = self.dirs.state.join("journal.log");
         sync_policy::config::write_private(&saved, &out.stdout)
             .map_err(|e| format!("{}: {e}", saved.display()))?;
@@ -933,6 +966,10 @@ mod tests {
         install_notes: Vec<String>,
         pair_notes: Vec<String>,
         uninstall_notes: Vec<String>,
+        /// The system unit runs the client: uninstall is root's.
+        system_unit: bool,
+        /// Where the log is.
+        log: LogPlace,
         did: Mutex<Vec<String>>,
     }
 
@@ -960,6 +997,8 @@ mod tests {
                 install_notes: Vec::new(),
                 pair_notes: Vec::new(),
                 uninstall_notes: Vec::new(),
+                system_unit: false,
+                log: LogPlace::Journal("pithagoras-sync.service"),
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -999,7 +1038,7 @@ mod tests {
             "alice".into()
         }
         fn log_place(&self) -> LogPlace {
-            LogPlace::Journal("pithagoras-sync.service")
+            self.log.clone()
         }
         fn pair_mode(&self) -> PairMode {
             self.mode
@@ -1055,6 +1094,10 @@ mod tests {
         }
         fn open_log(&self) -> Result<(), String> {
             self.step("log")
+        }
+        fn uninstall_refused(&self) -> Option<String> {
+            self.system_unit
+                .then(|| "only root can remove the system unit".into())
         }
         async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String> {
             self.step(if purge { "purge" } else { "uninstall" })?;
@@ -1499,6 +1542,45 @@ mod tests {
             seen.last().unwrap().contains("Hinweis: kept in a file"),
             "{seen:?}"
         );
+    }
+
+    /// A client the system unit runs (`install --system`, `setup`): its log
+    /// is the system journal, read without `--user`, and uninstalling it is
+    /// root's, which the window says before it asks anything.
+    #[tokio::test]
+    async fn a_system_unit_has_the_system_journal_and_is_roots_to_uninstall() {
+        assert_eq!(
+            journal_args(&LogPlace::Journal("u.service")).unwrap(),
+            ["--user", "-u", "u.service", "-n", "500", "--no-pager"]
+        );
+        assert_eq!(
+            journal_args(&LogPlace::SystemJournal("u.service")).unwrap(),
+            ["-u", "u.service", "-n", "500", "--no-pager"]
+        );
+        assert_eq!(journal_args(&LogPlace::File("client.log".into())), None);
+        for t in [Lang::En, Lang::De] {
+            let h = FakeHost {
+                system_unit: true,
+                log: LogPlace::SystemJournal("pithagoras-sync.service"),
+                ..installed()
+            };
+            let (_, seen) = run_in(t, &h, &["yes"], Some(LINK)).await;
+            let info = seen.last().unwrap();
+            assert!(
+                info.contains("journalctl -u pithagoras-sync.service;"),
+                "{info}"
+            );
+            assert!(!info.contains("--user"), "{info}");
+            let (o, seen) = run_in(t, &h, &["pick:uninstall", "yes", "yes"], None).await;
+            assert_eq!(o, Outcome::Failed);
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(seen[1].starts_with("error: "), "{seen:?}");
+            assert!(
+                seen[1].contains("only root can remove the system unit"),
+                "{seen:?}"
+            );
+            assert_eq!(h.did(), [format!("pair {LINK}")]);
+        }
     }
 
     #[tokio::test]

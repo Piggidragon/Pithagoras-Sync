@@ -53,7 +53,7 @@ Open Pithagoras Sync again (from the menu on Linux, or by double clicking the pr
 - **Status:** whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on.
 - **Pair again:** pair with another portal, or again with the same one (it asks before it replaces the pairing).
 - **Sudo access** (Linux only): see below.
-- **Open log:** the client's log in a text editor.
+- **Open log:** the client's log in a text editor. On Linux, without a log file, that is the client's lines from the journal; for a client the system unit runs (`install --system`, `setup`) the system journal, which only root and the groups `systemd-journal` and `adm` can read.
 - **Uninstall:** see below.
 - **Quit:** closes the window; the client keeps running in the background.
 
@@ -74,12 +74,14 @@ By default the client keeps the password in its memory only, so after a restart 
 
 ## 6. Uninstall
 
-Choose **Uninstall** in the menu. It asks twice:
+Choose **Uninstall** in the menu. Where the system unit runs the client (`install --system`, `setup`) only root can remove it: the window says so right away, with the command (`sudo pithagoras-sync uninstall --system`). Otherwise it asks twice:
 
 1. "Uninstall Pithagoras Sync?" **No** changes nothing.
 2. "Also remove the pairing and all settings?" **Yes** removes everything the client keeps: the pairing, the settings with their folders, the logs, a password or token in the keyring. **No** keeps them, so a later install picks up where you left off.
 
-Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login). Remove the device in the portal as well (Settings, Devices).
+Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login, or a folder that stays because something in it is not the client's). Remove the device in the portal as well (Settings, Devices).
+
+If removing fails halfway, the window says what failed and that uninstalling again goes on with what is left. Where the client was stopped for it and is still installed, it is started again first, so the computer does not stay offline.
 
 ## What the windows never do
 
