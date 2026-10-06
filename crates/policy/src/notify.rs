@@ -104,6 +104,40 @@ impl NotifyApprover {
     }
 }
 
+/// Shows a message as a plain notification (no actions), for a program that has
+/// no other way to reach the owner (`gui` without a dialog program). The text
+/// goes through `visible`, and is escaped for servers that read markup.
+pub async fn show(summary: &str, body: &str) -> Result<(), String> {
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| format!("no session bus: {e}"))?;
+    let proxy = NotificationsProxy::new(&conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    let caps = proxy.get_capabilities().await.map_err(|e| e.to_string())?;
+    let mut body = clip(&visible(body), 2 * MAX_TARGET);
+    if caps.iter().any(|c| c == "body-markup") {
+        body = body
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+    }
+    proxy
+        .notify(
+            "Pithagoras Sync",
+            0,
+            "pithagoras-sync",
+            &visible(summary),
+            &body,
+            &[],
+            HashMap::new(),
+            -1,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Longest target a notification shows whole; a longer one offers no Allow, since
 /// the owner could not read what they allow.
 const MAX_TARGET: usize = 400;
