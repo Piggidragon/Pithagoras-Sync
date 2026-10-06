@@ -73,7 +73,7 @@ Run on 2026-10-06 in a cloud container (Ubuntu 24.04, no desktop, no systemd use
 - **zenity 4 under Xvfb**, answered with `xdotool`: the pairing question (screenshot: the parsed portal URL and device name, No and Yes), the info after pairing ("Installed, not connected yet: the client is not running", since no client ran in that test), the entry for a pasted link, the menu of a paired device with all five items, and the status text. Each answer did what the flow says; the pasted link paired.
 - **German, and the sudo password's field** (zenity 4.0.1 under Xvfb, `LANG=de_DE.UTF-8`, a locale this machine does not have): before the locale fix zenity refused every text with an umlaut ("This option is not available") and showed nothing, so a German question would have read as No; `LANG=C` did the same to any non-ASCII text, English ones too. With it, `pithagoras-sync gui` showed the German menu (Status, Neu koppeln, Sudo-Zugriff, Protokoll öffnen, Deinstallieren, Schließen) and the German status ("Client: läuft nicht", "Modus: ask: Jeder Dateizugriff …", "Sudo-Zugriff: ausgeschaltet"). `zenity --entry --hide-text` with the German prompt showed eight dots for `geheim 1` and printed `geheim 1` and a newline on stdout. The whole sudo flow through the windows was not driven under Xvfb (the list did not take synthetic clicks reliably); `tests/e2e.rs` runs it with stand-in dialogs and a stand-in sudo against the real client. A real `sudo` checking a real password was not tried: the container allowed no throwaway user with a sudoers entry.
 - **The link handler**: `install` with `DISPLAY` set wrote the desktop entry and the icon and ran the real `update-desktop-database` and `xdg-mime`; `xdg-mime query default x-scheme-handler/pithagoras-sync` said `pithagoras-sync.desktop`, the `mimeinfo.cache` had the line, `desktop-file-validate` found the entry valid, and `gio open` on a pairing link started `~/.local/bin/pithagoras-sync gui <link>`, which asked before pairing. `uninstall` removed the entry and the icon.
-- **Windows**: cross-built and linted for `x86_64-pc-windows-gnu` only (`cargo clippy --workspace --target x86_64-pc-windows-gnu --all-targets -- -D warnings`), since `cargo xwin` could not fetch the MSVC SDK there. Nothing ran on Windows.
+- **Windows**: cross-built and linted for `x86_64-pc-windows-gnu` only (`cargo clippy --workspace --target x86_64-pc-windows-gnu --all-targets -- -D warnings`), since `cargo xwin` could not fetch the MSVC SDK there. Nothing ran on Windows there; see [Windows](#windows) for the later runs on the test VM.
 - `connector::net::tests::plain_http_reaches_this_users_portal_in_either_address_family` fails on that machine, before these changes too: it has no IPv6.
 
 ## The test machine
@@ -198,6 +198,16 @@ Run on 2026-10-05 after the log file, the known folders and the release tooling 
 By hand, from the elevated ssh session: `run --detach` with a fresh config refused the elevated session (exit 1), and that refusal was the line in `%LOCALAPPDATA%\pithagoras-sync\client.log` (here under `PITHAGORAS_SYNC_CONFIG_DIR`), plain text. The test folder was removed afterwards.
 
 Not done in this run: a second local account for the control pipe's ACL, and a command sandbox (restricted token or AppContainer) with a check of processes started through WMI, scheduled tasks or COM; see windows.md.
+
+### Third run: the graphical install
+
+Run on 2026-10-07 with the release build, as a standard user logged on at the console (Medium integrity), driven through UI Automation with real mouse double clicks in Explorer, against the mock portal on loopback. A watcher logged every window shown in the session.
+
+- 44 installs and uninstalls from the window in German (30 with Windows Terminal as default terminal, 14 with the classic console) and 32 in English, each one: double click the download, install, paste the link, pair, "connected", then double click the installed program, menu, uninstall, with and without removing the settings. None failed. Before the fix, 6 of 18 installs and 5 of 8 uninstalls had failed ("The request is not supported", from stale console handles).
+- A pairing link opened from Edge (after its "Open" prompt) and with `Start-Process` reached the installed program as `pithagoras-sync://pair/?…` and asked the replace question; Yes paired again, No changed nothing.
+- No text, an image or 5000 characters in the clipboard at the paste box each gave a box and then the paste box again; the last menu box says "No or Cancel: close"; a purge that could not remove a locked `config.toml` showed its lines as lines; `uninstall` twice exited 0 both times.
+- Console windows: none from the programs the window starts; the program's own console at each double click, link or start by the task showed for a median 0.21 s as a Windows Terminal window, or 23 ms as a classic console (issue #6).
+- Not tried: Windows 10, Chrome, Firefox, a real download from GitHub (SmartScreen was shown with a `Zone.Identifier` copy), a real portal.
 
 ### Cleanup
 
