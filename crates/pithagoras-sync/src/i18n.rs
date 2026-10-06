@@ -246,10 +246,10 @@ impl Lang {
         let mode = self.pair_mode(mode);
         match self {
             Lang::En => format!(
-                "This computer is paired with {old}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}\n\n{mode}"
+                "This computer is paired with {old}.\n\nReplace the pairing with the portal {portal} as \"{name}\"?{pin}\n\nIts agent can then ask to use this computer's files and shell. {mode}"
             ),
             Lang::De => format!(
-                "Dieser Computer ist mit {old} gekoppelt.\n\nDie Kopplung durch das Portal {portal} als „{name}“ ersetzen?{pin}\n\n{mode}"
+                "Dieser Computer ist mit {old} gekoppelt.\n\nDie Kopplung durch das Portal {portal} als „{name}“ ersetzen?{pin}\n\nSein Agent kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. {mode}"
             ),
         }
     }
@@ -743,15 +743,20 @@ impl Lang {
         )
     }
 
-    /// Windows: one item of a menu, as a Yes/No/Cancel question.
-    pub fn menu_step(self, text: &str, label: &str) -> String {
-        match self {
-            Lang::En => {
+    /// Windows: one item of a menu, as a Yes/No/Cancel question. After the
+    /// `last` one there is no next choice: No closes as well.
+    pub fn menu_step(self, text: &str, label: &str, last: bool) -> String {
+        match (self, last) {
+            (Lang::En, false) => {
                 format!("{text}\n\n{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
             }
-            Lang::De => format!(
+            (Lang::En, true) => format!("{text}\n\n{label}?\n\nYes: {label}. No or Cancel: close."),
+            (Lang::De, false) => format!(
                 "{text}\n\n{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen."
             ),
+            (Lang::De, true) => {
+                format!("{text}\n\n{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
+            }
         }
     }
 }
@@ -766,6 +771,27 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k| m.get(k).cloned()
+    }
+
+    /// The last box of the Windows menu offers no next choice.
+    #[test]
+    fn the_last_menu_step_offers_no_next_choice() {
+        for t in [Lang::En, Lang::De] {
+            let next = t.menu_step("Menu", "Status", false);
+            let last = t.menu_step("Menu", "Close", true);
+            assert!(
+                next.contains(t.pick("the next choice", "die nächste Auswahl")),
+                "{next}"
+            );
+            assert!(
+                !last.contains(t.pick("the next choice", "die nächste Auswahl")),
+                "{last}"
+            );
+            assert!(
+                last.ends_with(t.pick("No or Cancel: close.", "Nein oder Abbrechen: schließen.")),
+                "{last}"
+            );
+        }
     }
 
     #[test]

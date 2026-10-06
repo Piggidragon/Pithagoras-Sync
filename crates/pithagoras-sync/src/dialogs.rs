@@ -607,8 +607,8 @@ mod win {
         }
 
         fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
-            for (key, label) in items {
-                let t = self.0.menu_step(text, label);
+            for (i, (key, label)) in items.iter().enumerate() {
+                let t = self.0.menu_step(text, label, i + 1 == items.len());
                 match message(&t, MB_YESNOCANCEL | MB_ICONQUESTION) {
                     IDYES => return Some(key),
                     IDNO => continue,

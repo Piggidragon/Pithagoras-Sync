@@ -1511,7 +1511,20 @@ mod tests {
             "{seen:?}"
         );
         assert!(seen[0].contains("Replace the pairing with the portal https://portal.example"));
+        // Whose request "what it may do" is about.
+        assert!(
+            seen[0].contains(
+                "Its agent can then ask to use this computer's files and shell. What it may do"
+            ),
+            "{seen:?}"
+        );
         assert_eq!(h.paired().as_deref(), Some("https://portal.example"));
+        let h = paired();
+        let (_, seen) = run_in(Lang::De, &h, &["no"], Some(LINK)).await;
+        assert!(
+            seen[0].contains("Sein Agent kann dann darum bitten"),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test]
