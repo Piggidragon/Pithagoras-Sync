@@ -1196,6 +1196,43 @@ mod tests {
         );
     }
 
+    /// What the LXC retest did: the unit starts a link in a user's folder, and
+    /// the user flips it by an atomic rename between a root-owned program and a
+    /// script of their own. Whichever way it points, root neither runs it nor
+    /// writes there.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_its_user_flips_is_refused_either_way() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let script = t.path().join("evil");
+        write_script(&script, "exit 1");
+        let prog = t.path().join("prog");
+        let flip = |to: &Path| {
+            let tmp = t.path().join("prog.new");
+            std::os::unix::fs::symlink(to, &tmp).unwrap();
+            std::fs::rename(&tmp, &prog).unwrap();
+        };
+        let me = Path::new("/nowhere/pithagoras-sync");
+        for to in [Path::new("/bin/sh"), script.as_path()] {
+            flip(to);
+            let e = choose_target(None, Some(&prog), me, &RealFs).unwrap_err();
+            assert!(e.contains("root neither runs nor replaces it"), "{e}");
+            assert!(root_program(&prog, &RealFs).is_err());
+        }
+        // The same in the fake layout, where the link's folder belongs to uid 1000.
+        for to in ["/usr/local/bin/pithagoras-sync", "/home/svc/bin/evil"] {
+            let fs = layout(&[
+                ("/home/svc/bin/evil", 1000, 1000, 0o100755, None),
+                ("/home/svc/prog", 1000, 1000, 0o120777, Some(to)),
+            ]);
+            let e = choose_target(None, Some(Path::new("/home/svc/prog")), me, &fs).unwrap_err();
+            assert!(e.contains("/home/svc belongs to user svc (1000)"), "{e}");
+        }
+    }
+
     #[test]
     fn the_program_of_a_unit_is_what_systemd_starts() {
         let show = |out: &str| crate::actions::Fake {
