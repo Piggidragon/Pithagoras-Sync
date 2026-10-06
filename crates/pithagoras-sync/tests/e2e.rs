@@ -351,7 +351,13 @@ async fn folder_list_shows_control_characters_as_escapes() {
     std::fs::write(env.config(), forged).unwrap();
     let out = env.ok(&["folder", "list"]).await;
     assert!(!out.contains('\x1b'), "{out:?}");
-    assert!(out.contains(&format!("{proj}\\u{{1b}}[1A (Ro)")), "{out:?}");
+    // The access spelled as in the config and `folder add`.
+    assert!(out.contains(&format!("{proj}\\u{{1b}}[1A (ro)")), "{out:?}");
+    let other = env.p("outside");
+    let added = env.ok(&["folder", "add", &other, "--rw", "--exec"]).await;
+    assert!(added.contains("(rw, commands run here)"), "{added:?}");
+    let out = env.ok(&["folder", "list"]).await;
+    assert!(out.contains(&format!("{other} (rw, exec)")), "{out:?}");
 }
 
 /// A deny rule that is slow on a long one-line command takes up to a second per

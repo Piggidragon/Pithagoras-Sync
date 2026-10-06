@@ -351,6 +351,14 @@ fn print_status(s: &Status) {
 /// `status` as printed. The link detail (the portal's close reason, its error
 /// texts), the device id it chose and folder paths it may set go through
 /// `visible`, so no text from the portal can hide or forge a line of it.
+/// Folder access as the config and `folder add` spell it.
+fn access_text(a: Access) -> &'static str {
+    match a {
+        Access::Ro => "ro",
+        Access::Rw => "rw",
+    }
+}
+
 fn status_text(s: &Status) -> String {
     use std::fmt::Write;
     use sync_policy::approve::visible;
@@ -396,7 +404,12 @@ fn status_text(s: &Status) -> String {
     }
     for f in &s.folders {
         let x = if f.execute { ", exec" } else { "" };
-        let _ = writeln!(out, "Folder:    {} ({:?}{x})", visible(&f.path), f.access);
+        let _ = writeln!(
+            out,
+            "Folder:    {} ({}{x})",
+            visible(&f.path),
+            access_text(f.access)
+        );
     }
     let _ = writeln!(
         out,
@@ -813,7 +826,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 for f in &cfg.policy.folders {
                     let x = if f.execute { ", exec" } else { "" };
                     let path = sync_policy::approve::visible(&f.path.display().to_string());
-                    println!("{path} ({:?}{x})", f.access);
+                    println!("{path} ({}{x})", access_text(f.access));
                 }
             }
             FolderCmd::Add { path, rw, exec } => {
@@ -828,8 +841,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 });
                 cfg.save(&dirs.config_file())?;
                 println!(
-                    "Granted {} ({access:?}{}).",
+                    "Granted {} ({}{}).",
                     path.display(),
+                    access_text(access),
                     if exec { ", commands run here" } else { "" }
                 );
                 reload_running(&dirs).await;
