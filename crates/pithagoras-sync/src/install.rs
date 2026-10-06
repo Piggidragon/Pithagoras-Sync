@@ -801,6 +801,9 @@ mod tests {
         assert!(desktop_plan(Path::new("/d"), Path::new("/x\ry")).is_err());
     }
 
+    /// The desktop entry is Linux's: its folders are Unix paths, which a
+    /// `join` on Windows would write with `\`.
+    #[cfg(unix)]
     #[test]
     fn install_and_uninstall_register_and_remove_the_link_handler() {
         let root = tempfile::tempdir().unwrap();
