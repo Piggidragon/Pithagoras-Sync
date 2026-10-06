@@ -813,18 +813,52 @@ async fn windows_no_portal_environment() {
     assert!(!out.contains("PORTAL_"), "{out}");
 }
 
+/// Whether process `pid` runs, as `tasklist` sees it.
+#[cfg(windows)]
+fn win_alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// A process the shell started in the background outlives the shell, as on Linux
+/// (decision 12), and dies with a panic.
 #[cfg(windows)]
 async fn windows_panic_kills_the_job() {
     let f = fx();
     let e = Execs::new(config(&f, own_env()));
-    let flag = f.dir.join("still-running");
+    let pid_file = f.dir.join("bg.pid");
     let cmd = format!(
-        "Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 3; Set-Content \"{}\" x'; Write-Output started",
-        flag.display()
+        "Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-Command','Set-Content -LiteralPath \"{}\" $PID; Start-Sleep 120'; Write-Output started",
+        pid_file.display()
     );
-    let (out, _) = run(&e, 1, &cmd, &permit(&f.dir), None).await;
+    let (out, o) = run(&e, 1, &cmd, &permit(&f.dir), None).await;
     assert!(out.contains("started"), "{out}");
+    assert_eq!(o.code, Some(0), "{out}");
+    let mut pid = None;
+    for _ in 0..150 {
+        if let Some(p) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            pid = Some(p);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pid = pid.expect("the background process did not start");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(win_alive(pid), "the background process died with its shell");
     e.kill_all().await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert!(!flag.exists(), "the detached process outlived the panic");
+    let mut gone = false;
+    for _ in 0..50 {
+        if !win_alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "the background process outlived the panic");
 }

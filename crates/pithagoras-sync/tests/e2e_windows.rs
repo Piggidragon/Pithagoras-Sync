@@ -110,6 +110,27 @@ fn elevated() -> bool {
     String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288")
 }
 
+/// Whether process `pid` runs, as `tasklist` sees it.
+fn alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Polls `f` for up to `WAIT` until it gives something.
+async fn until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
+}
+
 async fn stop(mut child: Child) {
     child.kill().await.unwrap();
 }
@@ -266,6 +287,32 @@ async fn windows_pair_run_exec_panic_unlock() {
     assert!(!out.contains("PORTAL_"), "{out}");
     assert!(!out.contains("must-not-leak"), "{out}");
     assert_eq!(exit["code"], 3);
+
+    // A process the shell leaves in the background outlives the shell (decision
+    // 12), and dies when the connection ends.
+    let pid_file = env.root.join("home/proj/bg.pid");
+    let cmd = format!(
+        "Start-Process -WindowStyle Hidden powershell -ArgumentList '-NoProfile','-Command','Set-Content -LiteralPath \"{}\" $PID; Start-Sleep 120'; Write-Output started",
+        pid_file.display()
+    );
+    let (out, exit) = exec(&dl, 8, &cmd, &env.p("home/proj")).await;
+    assert!(out.contains("started"), "{out}");
+    assert_eq!(exit["code"], 0);
+    let pid = until(|| {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    })
+    .await
+    .expect("the background process did not start");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(alive(pid), "the background process died with its shell");
+    dl.close(1000, "the portal goes away").await;
+    assert!(
+        until(|| (!alive(pid)).then_some(())).await.is_some(),
+        "the background process outlived the connection"
+    );
+    let dl = mock.next_device(WAIT).await.expect("reconnects");
 
     // panic while a detached process runs: the link closes, the job dies with it.
     let flag = env.root.join("home/proj/still-running");

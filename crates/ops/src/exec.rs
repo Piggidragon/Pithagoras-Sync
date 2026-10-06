@@ -3,7 +3,9 @@
 //! panic or disconnect.
 //!
 //! A command whose shell exited may leave background processes; they keep running
-//! (as on the server) until a panic or disconnect, which kills them too.
+//! (as on the server) until a panic or disconnect, which kills them too. That holds
+//! on Windows as well, where the scope's Job Object is kept open while processes
+//! are left in it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -70,6 +72,17 @@ struct Scope {
 impl Scope {
     fn done(&self) -> bool {
         *self.exited.borrow()
+    }
+
+    /// Whether anything of the command still runs. On Linux the shim waits for
+    /// every process it started (it is a subreaper); on Windows it waits only for
+    /// the shell, so the job is asked whether processes are left in it.
+    fn alive(&self) -> bool {
+        #[cfg(windows)]
+        if self.job.active() {
+            return true;
+        }
+        !self.done()
     }
 
     /// Kills everything in the scope: SIGTERM (the shim passes it on, SIGKILL after
@@ -239,7 +252,7 @@ impl Execs {
         let cfg = self.cfg.read().unwrap().clone();
         let epoch = {
             let mut t = self.table.lock().unwrap();
-            t.lingering.retain(|s| !s.done());
+            t.lingering.retain(|s| s.alive());
             if t.paused {
                 return Err(RpcError::denied("the device is paused"));
             }
@@ -404,7 +417,10 @@ impl Execs {
                 {
                     t.running.remove(&stream);
                 }
-                if !scope.done() {
+                // Background processes keep running until a panic, a disconnect or
+                // the owner ends them. On Windows the job (and with it everything in
+                // it) dies when the last handle closes, so it must stay here.
+                if scope.alive() {
                     t.lingering.push(scope.clone());
                 }
             }
@@ -915,8 +931,9 @@ mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
 
     pub struct Job(HANDLE);
@@ -957,6 +974,25 @@ mod win {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        }
+
+        /// Whether processes are left in the job. When the job cannot be asked,
+        /// it counts as busy: it stays among the lingering scopes that a panic or
+        /// disconnect kills, rather than being dropped and closed unasked.
+        pub fn active(&self) -> bool {
+            // SAFETY: zeroed POD accounting structure.
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` matches the information class and outlives the call.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            ok == 0 || info.ActiveProcesses > 0
         }
 
         pub fn terminate(&self) {
