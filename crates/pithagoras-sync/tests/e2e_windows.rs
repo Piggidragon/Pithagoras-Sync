@@ -226,6 +226,14 @@ async fn windows_pair_run_exec_panic_unlock() {
         .await
         .unwrap_err();
     assert_eq!(e.code, sync_proto::code::DENIED, "{e:?}");
+    // Asked because Windows has no Landlock at all, not because of a kernel.
+    let asked = dl
+        .notification("approval.requested", WAIT)
+        .await
+        .expect("the portal hears of the approval");
+    let reasons = asked["reasons"].to_string();
+    assert!(reasons.contains("Windows has no Landlock"), "{reasons}");
+    assert!(!reasons.contains("kernel"), "{reasons}");
     std::fs::write(env.root.join("home/proj/a.txt"), "alpha").unwrap();
     dl.call(
         "fs.read",

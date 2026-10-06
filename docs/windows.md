@@ -23,7 +23,7 @@ Phase 1 on Windows gives the same remote access as on Linux: the agent's file, s
 
 ## Folders mode: file tools only
 
-Windows has no Landlock, and the client uses no restricted token, AppContainer or other confinement for commands: a command runs with all of the user's rights. The default Folders shell setting (`landlock`) therefore falls back to `prompt`: **every command in Folders mode asks for approval** (below). The owner can choose `folders_shell = "unconfined"` in the config: then commands run without asking, and Folders mode confines the file tools only. Tested: an unconfined command read `~\.ssh` and wrote outside the folder (after the approval the client asks for when a command names a protected path). Full mode runs commands as on Linux.
+Windows has no Landlock, and the client uses no restricted token, AppContainer or other confinement for commands: a command runs with all of the user's rights. The default Folders shell setting (`landlock`) therefore falls back to `prompt`: **every command in Folders mode asks for approval** (below; the approval gives the reason "Windows has no Landlock to confine commands, so every command in Folders mode asks"). The owner can choose `folders_shell = "unconfined"` in the config: then commands run without asking, and Folders mode confines the file tools only. Tested: an unconfined command read `~\.ssh` and wrote outside the folder (after the approval the client asks for when a command names a protected path). Full mode runs commands as on Linux.
 
 ## Approvals: through the portal and the CLI
 

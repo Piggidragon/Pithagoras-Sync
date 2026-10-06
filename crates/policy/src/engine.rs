@@ -785,9 +785,7 @@ impl Engine {
                                     &denied,
                                 ));
                             }
-                            FoldersShell::Landlock => asks.push(
-                                "the kernel has no Landlock, so every command asks".to_string(),
-                            ),
+                            FoldersShell::Landlock => asks.push(NO_LANDLOCK.to_string()),
                             FoldersShell::Prompt => {
                                 asks.push("Folders mode: every command asks".to_string())
                             }
@@ -851,6 +849,16 @@ impl Engine {
         })
     }
 }
+
+/// Why every command asks in Folders mode when commands cannot be confined: on
+/// Linux the kernel lacks Landlock; other systems have none at all.
+const NO_LANDLOCK: &str = if cfg!(windows) {
+    "Windows has no Landlock to confine commands, so every command in Folders mode asks"
+} else if cfg!(target_os = "linux") {
+    "the kernel has no Landlock, so every command asks"
+} else {
+    "this system has no Landlock to confine commands, so every command in Folders mode asks"
+};
 
 /// The command after a leading `sudo `, which the device runs elevated.
 pub fn elevated_command(command: &str) -> Option<&str> {
