@@ -34,7 +34,7 @@ The portal shows it as text and as a QR code:
 pithagoras-sync://pair?portal=<pct-encoded base URL>&code=<code>[&spki=<pin>]
 ```
 
-- `portal`: the base URL, percent-encoded: `https://host[:port][/path]` (`http://` only for a portal on the same machine), no user info, query or fragment. The path may hold only ASCII letters, digits, `-._~/` and `%XX` escapes (after the URI's own decoding), no `.` or `..` segment; the owner sees the URL before pairing, and anything else could make it read as more text.
+- `portal`: the base URL, percent-encoded: `https://host[:port][/path]` (`http://` only for a portal on the same machine), no user info, query or fragment. The path may hold only ASCII letters, digits, `-._~/` and `%XX` escapes (after the URI's own decoding), no `.` or `..` segment; the owner sees the URL before pairing, and anything else could make it read as more text. The client holds a saved pairing to the same rule: since 0.0.2 one whose URL breaks it does not connect (the link is rejected) until it is paired again.
 - `code`: the one-time code, 1 to 64 ASCII letters and digits.
 - `spki`: optional pin (section 1). Without it, the system's roots apply.
 - A key given twice, an unknown key or a bad escape makes the URI invalid. A newer portal that adds keys has to bump this page; the client refuses rather than pair with half the meaning.
