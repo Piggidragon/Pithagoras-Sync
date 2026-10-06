@@ -1,6 +1,6 @@
 # Releasing
 
-A release is a version tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. `pithagoras-sync update` reads the manifest of the newest release (`releases/latest/download/manifest.json` of this repository: the stable channel; pre-releases are not "latest", so they never reach it).
+A release is a version tag on a commit of `main`. `.github/workflows/release.yml` then checks that the commit is on `main`, checks the workspace (`cargo fmt --check`, clippy, the tests), builds the binaries, signs the update manifest and publishes a GitHub Release. `pithagoras-sync update` reads the manifest of the newest release (`releases/latest/download/manifest.json` of this repository: the stable channel; pre-releases are not "latest", so they never reach it). The 0.0.x versions are previews and the workflow publishes them as pre-releases (the first stable release is 0.1.0): a client takes one only with `pithagoras-sync update --manifest https://github.com/<owner>/<repo>/releases/download/<tag>/manifest.json`, and the assets are downloaded from the release's own page, not from `releases/latest`.
 
 ## What a release holds
 

@@ -233,7 +233,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+          # 0.0.x are previews: a pre-release is not "latest", so the stable update
+          # channel never offers it (docs/releasing.md).
+          pre=
+          notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs this release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
+          case "${GITHUB_REF_NAME#v}" in
+            0.0.*)
+              pre=--prerelease
+              notes="Preview, not the first stable release (that is 0.1.0). It is a pre-release, so \`pithagoras-sync update\` does not offer it by itself: \`pithagoras-sync update --manifest https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/manifest.json\`. $notes"
+              ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag $pre \
             --title "Pithagoras Sync ${GITHUB_REF_NAME#v}" \
-            --notes "Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs this release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)." \
+            --notes "$notes" \
             dist/*

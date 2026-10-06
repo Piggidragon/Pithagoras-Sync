@@ -2,7 +2,7 @@
 
 Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) portal reach your own computers, the way a file-sync client reaches the cloud: pair once, it starts with the machine, reconnects by itself, and from then on the agent can use that computer's files, shell and git when a chat is granted the device.
 
-**Status: phase 1 in progress, no portal yet.** The portal side (the `/sync/v1` hub, the Devices page, the tool wrapper) is not written, so this client cannot be used yet. It is tested against a mock portal only. Phase 1 is the background client without a GUI; the desktop app with overlay, voice and computer use is phase 2.
+**Status: 0.0.1, a preview.** It is the background client without a GUI (phase 1); the first stable release is 0.1.0, when all of phase 1 is done. The portal side is the Devices add-on of the portal (`thecodacus/pithagoras#87`, not merged yet); until it is, the client can be tried against a mock portal or a portal that runs that branch. The desktop app with overlay, voice and computer use is phase 2.
 
 ## Platforms
 
@@ -26,7 +26,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
 1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); before the first one, build it as described below and use `target/x86_64-unknown-linux-musl/release/pithagoras-sync`.
 
    ```sh
-   curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/latest/download/pithagoras-sync-x86_64-linux
+   curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/download/v0.0.1/pithagoras-sync-x86_64-linux
    chmod +x pithagoras-sync-x86_64-linux
    ```
 
@@ -69,7 +69,7 @@ sudo systemctl start pithagoras-sync
 
 ## Windows
 
-Download `pithagoras-sync-x86_64-windows.exe` from the [latest release](https://github.com/Piggidragon/Pithagoras-Sync/releases/latest), save it as `pithagoras-sync.exe`, then in PowerShell:
+Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases/tag/v0.0.1), save it as `pithagoras-sync.exe`, then in PowerShell:
 
 ```powershell
 .\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
@@ -104,7 +104,7 @@ A server set up with `setup --create-user` or `install --system` has its program
 sudo pithagoras-sync update
 ```
 
-As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file, every folder above it and every folder that holds a link on the way belong to root and are writable by nobody else, since root runs it; `setup` and `install --system` warn at once when that is not so, with the fix), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). A release is refused if it was made before the newest one seen for that program or the newest one this user installed for any program, so an older release served again is not taken, not even by a program updated for the first time. Updates come from the newest GitHub release of this repository; a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
+As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file, every folder above it and every folder that holds a link on the way belong to root and are writable by nobody else, since root runs it; `setup` and `install --system` warn at once when that is not so, with the fix), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). A release is refused if it was made before the newest one seen for that program or the newest one this user installed for any program, so an older release served again is not taken, not even by a program updated for the first time. Updates come from the newest GitHub release of this repository (a pre-release such as 0.0.1 is not "newest": take it with `pithagoras-sync update --manifest https://github.com/Piggidragon/Pithagoras-Sync/releases/download/v0.0.1/manifest.json`); a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 
