@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod install;
 pub mod logfile;
 pub mod owner;
+pub mod purge;
 pub mod secrets;
 pub mod setup;
 pub mod update;

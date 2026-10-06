@@ -67,18 +67,20 @@ WantedBy=multi-user.target
 /// What `pair` says when no client runs yet: start the unit that exists for
 /// `user` (`setup` enables its system unit but leaves it stopped), or install one.
 pub fn start_hint(system_unit: Option<&str>, user: &str, user_unit: bool) -> String {
-    let runs_as = |unit: &str| {
-        unit.lines()
-            .find_map(|l| l.trim().strip_prefix("User="))
-            .map(|u| u.trim().to_string())
-    };
-    if system_unit.and_then(runs_as).as_deref() == Some(user) {
+    if system_unit.and_then(unit_user).as_deref() == Some(user) {
         format!("Start it: sudo systemctl start {UNIT_NAME}")
     } else if user_unit {
         format!("Start it: systemctl --user start {UNIT_NAME}")
     } else {
         "Start it with the machine: pithagoras-sync install".into()
     }
+}
+
+/// The user a system unit runs the client as: its `User=` line.
+pub fn unit_user(unit: &str) -> Option<String> {
+    unit.lines()
+        .find_map(|l| l.trim().strip_prefix("User="))
+        .map(|u| u.trim().to_string())
 }
 
 pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Action> {
@@ -160,6 +162,23 @@ pub fn system_uninstall_plan() -> Vec<Action> {
             argv: argv(&["systemctl", "daemon-reload"]),
         },
     ]
+}
+
+/// For `uninstall --purge`: stops the client the user unit starts, so it does
+/// not write its files again while they are removed. Nothing is removed here.
+pub fn user_stop_plan() -> Vec<Action> {
+    vec![Action::Try {
+        argv: argv(&["systemctl", "--user", "stop", UNIT_NAME]),
+        hint: "it was not running".into(),
+    }]
+}
+
+/// `user_stop_plan` for the system unit.
+pub fn system_stop_plan() -> Vec<Action> {
+    vec![Action::Try {
+        argv: argv(&["systemctl", "stop", UNIT_NAME]),
+        hint: "it was not running".into(),
+    }]
 }
 
 fn xml_escape(s: &str) -> String {
@@ -338,6 +357,21 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
         Action::Try {
             argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
             hint: "it starts at the next logon".into(),
+        },
+    ]
+}
+
+/// `user_stop_plan` for the logon task: switched off first, or its minute
+/// trigger starts the client again before the task is deleted.
+pub fn windows_stop_plan() -> Vec<Action> {
+    vec![
+        Action::Try {
+            argv: argv(&["schtasks", "/Change", "/TN", TASK_NAME, "/DISABLE"]),
+            hint: "the task may start the client again within a minute".into(),
+        },
+        Action::Try {
+            argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
+            hint: "it was not running".into(),
         },
     ]
 }

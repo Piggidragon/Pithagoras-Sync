@@ -90,7 +90,7 @@ impl Action {
     }
 }
 
-fn shell_words(argv: &[String]) -> String {
+pub fn shell_words(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty() || a.contains([' ', '"', '\'', '\\', '$']) {

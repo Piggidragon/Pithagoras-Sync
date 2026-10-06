@@ -378,3 +378,80 @@ async fn windows_install_print() {
             .exists()
     );
 }
+
+/// `uninstall --purge` on Windows: the running client is stopped first, the
+/// files under the profile folders go, the program and what is next to its
+/// folders stay, and the `.old` copy an update left goes. A second run finds
+/// nothing. Skipped where a real logon task exists, which the purge would end
+/// and delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_purge_removes_what_the_client_left_but_the_program() {
+    let task = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Pithagoras Sync"])
+        .output()
+        .unwrap();
+    if task.status.success() {
+        eprintln!("skipped: this machine has a real Pithagoras Sync logon task");
+        return;
+    }
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "winpurge"])
+        .await;
+    if elevated() {
+        env.ok(&["config", "set", "policy.privilege.allow_root", "true"])
+            .await;
+    }
+    let config = env.home.join("AppData/Roaming/pithagoras-sync");
+    let state = env.home.join("AppData/Local/pithagoras-sync");
+    std::fs::create_dir_all(&state).unwrap();
+    for f in ["client.log", "update-released", "logon-task.xml"] {
+        std::fs::write(state.join(f), "1").unwrap();
+    }
+    let programs = env.home.join("AppData/Local/Programs/pithagoras-sync");
+    std::fs::create_dir_all(&programs).unwrap();
+    let program = programs.join("pithagoras-sync.exe");
+    let old = programs.join("pithagoras-sync.exe.old");
+    std::fs::write(&program, "installed").unwrap();
+    std::fs::write(&old, "replaced").unwrap();
+    let other = env.home.join("AppData/Roaming/other.txt");
+    std::fs::write(&other, "keep").unwrap();
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    let pid = daemon.id().unwrap();
+
+    let out = env.ok(&["uninstall", "--purge", "--print"]).await;
+    assert!(
+        out.contains(&format!("stop the running client (pid {pid})")),
+        "{out}"
+    );
+    assert!(out.contains(&format!("remove {}", old.display())), "{out}");
+    assert!(
+        out.contains(&format!("The program itself stays: {}", program.display())),
+        "{out}"
+    );
+    assert!(out.contains("Remove-Item -LiteralPath"), "{out}");
+    assert!(config.join("config.toml").exists() && old.exists() && alive(pid));
+
+    let out = env.ok(&["uninstall", "--purge", "--yes"]).await;
+    assert!(
+        out.ends_with("Removed.\n") || out.ends_with("Removed.\r\n"),
+        "{out}"
+    );
+    assert!(
+        until(|| (!alive(pid)).then_some(())).await.is_some(),
+        "the client was stopped"
+    );
+    assert!(!config.exists() && !state.exists(), "{out}");
+    assert!(!old.exists());
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), "installed");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+
+    let out = env.ok(&["uninstall", "--purge", "--yes"]).await;
+    assert!(out.starts_with("Nothing to remove."), "{out}");
+    drop(daemon);
+}

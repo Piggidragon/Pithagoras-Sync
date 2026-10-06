@@ -124,10 +124,19 @@ pub enum Cmd {
         #[arg(long)]
         print: bool,
     },
-    /// Undo `install` (config, pairing and the program stay).
+    /// Undo `install` (config, pairing and the program stay; with --purge only the
+    /// program stays).
     Uninstall {
         #[arg(long)]
         system: bool,
+        /// Also remove the pairing, the config, the logs and the update records:
+        /// everything the client left but the program itself.
+        #[arg(long)]
+        purge: bool,
+        /// With --purge: do not ask before removing.
+        #[arg(short, long, requires = "purge")]
+        yes: bool,
+        /// Only show what would be done.
         #[arg(long)]
         print: bool,
     },
@@ -1110,7 +1119,13 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 }
             }
         }
-        Cmd::Uninstall { system, print } => {
+        Cmd::Uninstall {
+            system,
+            purge: true,
+            yes,
+            print,
+        } => return purge(&dirs, system, print, yes).await,
+        Cmd::Uninstall { system, print, .. } => {
             let plan = uninstall_plan(system)?;
             println!("Uninstall:");
             show_plan(&plan);
@@ -1224,6 +1239,245 @@ fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     }
     let home = info::home().ok_or("cannot find the home directory")?;
     Ok(install::user_uninstall_plan(&home))
+}
+
+/// Asks the running client to exit and waits until it has, so it does not write
+/// its files again while `uninstall --purge` removes them.
+async fn stop_client(dirs: &Dirs) -> Result<(), String> {
+    let socket = dirs.socket();
+    let Some(r) = control::send(&socket, Request::Restart).await? else {
+        return Ok(());
+    };
+    if !r.ok {
+        return Err(format!(
+            "the running client did not stop ({}): nothing was removed",
+            r.error.unwrap_or_default()
+        ));
+    }
+    for _ in 0..150 {
+        // While it shuts down, a client may take a connection and drop it.
+        if let Ok(None) = control::send(&socket, Request::Status).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("the running client did not stop within 15 s: nothing was removed. Stop it, then run this again".into())
+}
+
+/// How to delete `path` by hand, for the owner to copy.
+fn delete_hint(path: &Path) -> String {
+    let p = path.to_string_lossy();
+    if cfg!(windows) {
+        format!("Remove-Item -LiteralPath '{}'", p.replace('\'', "''"))
+    } else {
+        actions::shell_words(&["rm".to_string(), p.into_owned()])
+    }
+}
+
+/// `uninstall --purge`: stops the client, undoes `install`, and removes what the
+/// client wrote for this user. The program stays: it may be the owner's only
+/// copy, and on Windows the running one cannot be deleted anyway.
+async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<ExitCode, String> {
+    let linux = cfg!(target_os = "linux");
+    if cfg!(windows) && system {
+        return Err(
+            "on Windows the client runs as a logon task of the current user; there is no --system"
+                .into(),
+        );
+    }
+    if system && !is_root() {
+        return Err("--system needs root".into());
+    }
+    owner::not_from_own_command(dirs).await?;
+    let runner = actions::System;
+    let me = info::user().0;
+    let unit_file = crate::update::system_unit_file();
+    let unit_user = linux
+        .then(|| std::fs::read_to_string(&unit_file).ok())
+        .flatten()
+        .and_then(|u| install::unit_user(&u));
+    // The system unit would start this user's client again after it stops, and
+    // only root can stop it.
+    let units_mine = !system && unit_user.as_deref() == Some(me.as_str());
+    if units_mine
+        && runner
+            .try_run(&actions::argv(&[
+                "systemctl",
+                "is-active",
+                "--quiet",
+                install::UNIT_NAME,
+            ]))
+            .is_ok()
+    {
+        return Err(format!(
+            "{} runs the client as {me}, and it would start it again: {}",
+            install::UNIT_NAME,
+            if is_root() {
+                "run `pithagoras-sync uninstall --system --purge` instead".to_string()
+            } else {
+                format!(
+                    "stop it first with `sudo systemctl disable --now {}` (or remove the user with `sudo pithagoras-sync setup --remove --name {me}`)",
+                    install::UNIT_NAME
+                )
+            }
+        ));
+    }
+    let home = info::home();
+    let unit_folder = if system {
+        Some(Path::new("/etc/systemd/system").to_path_buf())
+    } else {
+        home.as_ref().map(|h| h.join(".config/systemd/user"))
+    };
+    let installed = if cfg!(windows) {
+        runner
+            .try_run(&actions::argv(&[
+                "schtasks",
+                "/Query",
+                "/TN",
+                install::TASK_NAME,
+            ]))
+            .is_ok()
+    } else {
+        unit_folder
+            .as_ref()
+            .is_some_and(|d| d.join(install::UNIT_NAME).exists())
+    };
+    let (stop, uninstall) = if !installed {
+        (Vec::new(), Vec::new())
+    } else if cfg!(windows) {
+        (install::windows_stop_plan(), uninstall_plan(false)?)
+    } else if system {
+        (install::system_stop_plan(), uninstall_plan(true)?)
+    } else {
+        (install::user_stop_plan(), uninstall_plan(false)?)
+    };
+    let found = crate::purge::find(dirs)?;
+    let me_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut programs = vec![me_exe.clone()];
+    let copy = if system {
+        Some(PathBuf::from(install::SYSTEM_BIN))
+            .filter(|p| p.is_file() && !crate::update::same_program(p, &me_exe))
+    } else {
+        crate::update::installed_copy(&me_exe)
+    };
+    programs.extend(copy);
+    // Windows leaves the program that `update` or `install` replaced next to it.
+    let olds: Vec<PathBuf> = programs
+        .iter()
+        .map(|p| crate::update::old_path(p))
+        .filter(|p| cfg!(windows) && p.is_file())
+        .collect();
+    let running = control::send(&dirs.socket(), Request::Status)
+        .await?
+        .and_then(|r| r.status);
+    let portal = DeviceConfig::load(&dirs.config_file())
+        .ok()
+        .and_then(|c| c.portal);
+
+    let mut notes = Vec::new();
+    if let Some(p) = &portal {
+        notes.push(format!(
+            "The pairing with {} (device {}) ends here: remove the device in the portal as well (Settings, Devices).",
+            sync_policy::approve::visible(&p.url),
+            sync_policy::approve::visible(&p.device_id)
+        ));
+    }
+    if let Some(d) = unit_folder.map(|d| d.join(format!("{}.d", install::UNIT_NAME)))
+        && d.exists()
+    {
+        notes.push(format!(
+            "The drop-ins in {} stay: they are yours, `install` writes none.",
+            d.display()
+        ));
+    }
+    if units_mine {
+        notes.push(format!(
+            "{} (root's) stays: `sudo pithagoras-sync uninstall --system` removes it.",
+            unit_file.display()
+        ));
+    }
+    if linux && !system && Path::new("/var/lib/systemd/linger").join(&me).exists() {
+        notes.push(format!(
+            "Lingering stays on for {me}: `install` turns it on where there is no desktop, but something else may need it too. If nothing does: sudo loginctl disable-linger {me}"
+        ));
+    }
+    if system && let Some(u) = unit_user.as_deref().filter(|u| *u != "root") {
+        notes.push(format!(
+            "The user {u} and the files of its client stay: `sudo pithagoras-sync setup --remove --name {u}` removes them."
+        ));
+    }
+    for p in &programs {
+        notes.push(format!(
+            "The program itself stays: {}. Delete it with `{}` when you no longer need it.",
+            p.display(),
+            delete_hint(p)
+        ));
+    }
+
+    if running.is_none()
+        && stop.is_empty()
+        && uninstall.is_empty()
+        && found.is_empty()
+        && olds.is_empty()
+    {
+        println!("Nothing to remove.");
+        for n in &notes {
+            println!("{n}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("This removes:");
+    if let Some(s) = &running {
+        println!("  - stop the running client (pid {})", s.pid);
+    }
+    show_plan(&stop);
+    show_plan(&uninstall);
+    for e in &found.entries {
+        println!(
+            "  - remove {}{}",
+            e.display(),
+            if std::fs::symlink_metadata(e).is_ok_and(|m| m.is_dir()) {
+                " and what is in it"
+            } else {
+                ""
+            }
+        );
+    }
+    for p in &olds {
+        println!("  - remove {}", p.display());
+    }
+    for f in &found.folders {
+        println!(
+            "  - remove the folder {} once nothing else is in it",
+            f.display()
+        );
+    }
+    for n in &notes {
+        println!("{n}");
+    }
+    if print {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !yes && !ask("Go ahead?") {
+        println!("Nothing changed.");
+        return Ok(ExitCode::from(1));
+    }
+    apply_plan(&stop)?;
+    stop_client(dirs).await?;
+    apply_plan(&uninstall)?;
+    for p in &olds {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("{}: {e}", p.display()));
+            }
+            _ => {}
+        }
+    }
+    for f in crate::purge::remove(&found)? {
+        println!("Kept {}: something in it is not the client's.", f.display());
+    }
+    println!("Removed.");
+    Ok(ExitCode::SUCCESS)
 }
 
 use crate::actions::Runner as _;

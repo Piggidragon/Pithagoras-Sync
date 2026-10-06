@@ -397,6 +397,192 @@ async fn a_step_that_may_fail_shows_only_the_clients_note() {
     assert!(err.contains("the unit was not enabled"), "{err}");
 }
 
+/// A `systemctl` and `loginctl` on PATH that write their arguments to
+/// `systemctl.log` and succeed, but say no unit is active: nothing reaches the
+/// real systemd. Returns the PATH to run with.
+fn fake_systemd(env: &Env) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = env.root.join("systemctl.log");
+    for prog in ["systemctl", "loginctl"] {
+        let p = bin.join(prog);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho \"{prog} $*\" >> '{}'\ncase \"$1\" in is-active) exit 3;; esac\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// `uninstall --purge` removes everything the client left but the program:
+/// after a look (`--print`) and a refused confirmation nothing is gone; then
+/// the running client is stopped first, and only its own files go, not the
+/// files next to them. A second run finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_removes_what_the_client_left_but_the_program() {
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    let run = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("PATH", &path);
+        c
+    };
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "purgebox"])
+        .await;
+    env.ok(&["folder", "add", &env.p("home/proj")]).await;
+    let config = env.home.join(".config/pithagoras-sync");
+    let state = env.home.join(".local/state/pithagoras-sync");
+    // What the client and `update` leave, and what `install` put in place.
+    std::fs::create_dir_all(&state).unwrap();
+    for f in [
+        "client.log",
+        "update-released",
+        "update-released-0123456789abcdef",
+    ] {
+        std::fs::write(state.join(f), "1\n").unwrap();
+    }
+    let unit = env
+        .home
+        .join(".config/systemd/user/pithagoras-sync.service");
+    let program = env.home.join(".local/bin/pithagoras-sync");
+    for f in [&unit, &program] {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, "installed").unwrap();
+    }
+    // Next to the client's folders, and not the client's.
+    let others = [
+        env.home.join(".config/other.toml"),
+        env.home.join(".local/state/other.log"),
+    ];
+    for f in &others {
+        std::fs::write(f, "keep").unwrap();
+    }
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    let pid = daemon.id().unwrap();
+    let everything = [
+        config.join("config.toml"),
+        config.join("token"),
+        state.join("audit.jsonl"),
+        state.join("client.log"),
+        state.join("update-released"),
+        state.join("update-released-0123456789abcdef"),
+        state.join("run/control.sock"),
+        unit.clone(),
+    ];
+
+    let out = run(&["uninstall", "--purge", "--print"])
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("stop the running client (pid {pid})")),
+        "{text}"
+    );
+    for f in &everything {
+        assert!(text.contains(&format!("remove {}", f.display())), "{text}");
+        assert!(f.exists(), "{}", f.display());
+    }
+    assert!(
+        text.contains("remove the device in the portal as well"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "The program itself stays: {}. Delete it with `rm {}`",
+            program.display(),
+            program.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("other"), "{text}");
+
+    // No answer to the question (stdin is empty): nothing changes.
+    let out = run(&["uninstall", "--purge"]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Nothing changed."));
+    assert!(everything.iter().all(|f| f.exists()));
+    assert!(alive(pid));
+    assert!(!env.root.join("systemctl.log").exists());
+
+    let out = run(&["uninstall", "--purge", "--yes"])
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.ends_with("Removed.\n"), "{text}");
+    assert!(gone(pid).await, "the client was stopped");
+    assert!(!config.exists() && !state.exists(), "{text}");
+    for f in &others {
+        assert_eq!(std::fs::read_to_string(f).unwrap(), "keep");
+    }
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), "installed");
+    assert!(!unit.exists());
+    let calls = std::fs::read_to_string(env.root.join("systemctl.log")).unwrap();
+    let stop = calls.find("systemctl --user stop pithagoras-sync.service");
+    let disable = calls.find("systemctl --user disable --now pithagoras-sync.service");
+    assert!(stop.is_some() && stop < disable, "{calls}");
+
+    let out = run(&["uninstall", "--purge", "--yes"])
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.starts_with("Nothing to remove.\n"), "{text}");
+    assert!(text.contains("The program itself stays"), "{text}");
+}
+
+/// A client folder that is a link leads to files that are not the client's to
+/// delete: the purge refuses before anything goes.
+#[tokio::test]
+async fn purge_refuses_a_config_folder_that_is_a_link() {
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    let elsewhere = env.root.join("outside/config");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("config.toml"), "mode = \"ask\"\n").unwrap();
+    std::fs::create_dir_all(env.home.join(".config")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, env.home.join(".config/pithagoras-sync")).unwrap();
+    let state = env.home.join(".local/state/pithagoras-sync");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("audit.jsonl"), "{}\n").unwrap();
+    let out = env
+        .cmd(&["uninstall", "--purge", "--yes"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("is a link"), "{err}");
+    assert!(err.contains("nothing was removed"), "{err}");
+    assert!(elsewhere.join("config.toml").exists());
+    assert!(state.join("audit.jsonl").exists());
+}
+
 /// A config this user cannot read (another user's folder) is an error, never
 /// the defaults: `mode` and `config get` do not print made-up values, and no
 /// command writes defaults over it.
