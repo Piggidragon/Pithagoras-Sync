@@ -30,7 +30,7 @@ A window asks:
 In the portal, open Settings, Devices, "Pair a device". There are two ways to pair:
 
 - **Click the link** the portal shows. Your browser asks whether to open it with Pithagoras Sync; allow it.
-- **Paste it.** If the program is still open after installing, it asks you to "Paste the pairing link from the portal's Devices page". Copy the link in the portal and paste it there (on Windows: copy it, then press OK; the program reads it from the clipboard).
+- **Paste it.** If the program is still open after installing, it asks you to "Paste the pairing link from the portal's Devices page". Copy the link in the portal and paste it there (on Windows: copy it, then press OK; the program reads it from the clipboard). With nothing pasted, or no text in the clipboard, it says so and asks again.
 
 Either way, a window then shows the portal it would pair with and the name your computer will have there:
 

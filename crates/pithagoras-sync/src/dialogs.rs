@@ -532,7 +532,8 @@ mod win {
         }
     }
 
-    /// The clipboard's text, if it holds some of at most `MAX_ANSWER` units.
+    /// The clipboard's text, if it holds some: at most `MAX_ANSWER` units and
+    /// one more, so a longer text is still too long for the link's check.
     fn clipboard() -> Option<String> {
         // SAFETY: the clipboard is opened and closed here; the data is read
         // under GlobalLock, up to its NUL, never past the block's size or
@@ -558,9 +559,7 @@ mod win {
                         i += 1;
                     }
                     GlobalUnlock(h);
-                    if units.len() <= MAX_ANSWER {
-                        text = String::from_utf16(&units).ok();
-                    }
+                    text = Some(String::from_utf16_lossy(&units));
                 }
             }
             CloseClipboard();
@@ -586,7 +585,9 @@ mod win {
             if message(&t, MB_OKCANCEL | MB_ICONQUESTION) != IDOK {
                 return None;
             }
-            clipboard().map(|s| s.trim().to_string())
+            // OK with no text in the clipboard (empty, or a picture) is an
+            // answer too: the flow says so and asks again.
+            Some(clipboard().unwrap_or_default().trim().to_string())
         }
 
         fn password(&self, _text: &str) -> Option<Secret> {

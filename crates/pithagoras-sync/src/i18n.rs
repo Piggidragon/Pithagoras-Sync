@@ -90,6 +90,14 @@ impl Lang {
         )
     }
 
+    /// OK with nothing typed or pasted in (on Windows: nothing in the clipboard).
+    pub fn no_link(self) -> &'static str {
+        self.pick(
+            "No pairing link came in. Copy the link from the portal's Devices page, then try again.",
+            "Es kam kein Kopplungslink an. Kopiere den Link von der Geräteseite des Portals und versuche es noch einmal.",
+        )
+    }
+
     pub fn link_too_long(self) -> &'static str {
         self.pick(
             "This is not a pairing link: it is far too long.",

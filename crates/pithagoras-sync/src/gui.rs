@@ -231,6 +231,10 @@ async fn ask_and_pair(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         let Some(text) = d.entry(t.entry_text()) else {
             return Outcome::Cancelled;
         };
+        if text.trim().is_empty() {
+            d.error(t.no_link());
+            continue;
+        }
         match parse(t, text.trim()) {
             Ok(u) => return pair(d, h, t, &u).await,
             Err(e) => d.error(&e),
@@ -1218,6 +1222,38 @@ mod tests {
         run(&h, &["pick:sudo", "pick:set", "pw:right pw", "no"], None).await;
         assert_eq!(h.did(), ["sudo check", "keep"]);
         assert!(!*h.sudo_active.lock().unwrap());
+    }
+
+    /// OK with nothing in it (on Windows: no text in the clipboard) says so
+    /// and asks again; it is not a cancel.
+    #[tokio::test]
+    async fn no_link_at_all_is_asked_for_again() {
+        for t in [Lang::En, Lang::De] {
+            let h = installed();
+            let (o, seen) = run_in(t, &h, &["text:", "text:  \r\n", "cancel"], None).await;
+            assert_eq!(o, Outcome::Cancelled);
+            assert_eq!(seen.len(), 5, "{seen:?}");
+            for i in [1, 3] {
+                assert_eq!(seen[i], format!("error: {}", t.no_link()), "{seen:?}");
+            }
+            assert!(seen[4].starts_with("entry:"), "{seen:?}");
+            assert!(h.did().is_empty());
+        }
+    }
+
+    /// The link as Windows hands it to the handler, `pair/?`: the question,
+    /// then the pairing with the link rebuilt from what was shown.
+    #[tokio::test]
+    async fn a_link_from_the_windows_shell_pairs() {
+        let h = installed();
+        let link = LINK.replace("://pair?", "://pair/?");
+        let (o, seen) = run(&h, &["yes"], Some(&link)).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(
+            seen[0].starts_with("question: Pair this computer"),
+            "{seen:?}"
+        );
+        assert_eq!(h.did(), [format!("pair {LINK}")]);
     }
 
     #[tokio::test]
