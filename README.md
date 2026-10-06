@@ -30,7 +30,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
    chmod +x pithagoras-sync-x86_64-linux
    ```
 
-2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Until it is paired the client just waits (`status` says "not paired").
+2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Until it is paired the client just waits (`status` says "not paired"). You do not start it yourself: `pithagoras-sync run`, which the unit runs, is only for starting it by hand in a terminal, to see its log while debugging.
 
    ```sh
    ./pithagoras-sync-x86_64-linux install
@@ -78,7 +78,7 @@ Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://gi
 .\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. You never start it yourself (`pithagoras-sync run` is only for running it by hand in a terminal, for debugging). The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 

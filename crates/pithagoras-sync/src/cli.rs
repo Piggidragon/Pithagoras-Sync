@@ -32,7 +32,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Run the client (what the systemd unit or the logon task starts).
+    /// Run the client in this terminal, by hand (for debugging).
+    ///
+    /// You normally never need this: `install` already starts the client for you,
+    /// in the background and at every login (a systemd unit, or a logon task on
+    /// Windows), and that is what runs this command.
     Run {
         /// Run without a console (the Windows logon task): let go of the console
         /// window and write the log to `client.log` in the state folder.
@@ -61,10 +65,35 @@ pub enum Cmd {
     Unlock,
     /// Show or hide the quick-ask overlay (comes with the desktop app, phase 2).
     Toggle,
-    /// Show the mode, or set it: ask, folders or full.
+    /// Show the mode, or set it: ask, folders or full
+    ///
+    /// The mode decides what the portal's agent may do on this computer. Without
+    /// an argument this shows the current one.
+    ///
+    ///   ask      Every file access and every command asks you; nothing runs on
+    ///            its own. You answer in the portal's Devices tab, or here with
+    ///            `approvals`, `approve` and `deny`. This is the default.
+    ///
+    ///   folders  Files only inside the folders you granted with `folder add`
+    ///            (read-only unless --rw); commands only in folders granted with
+    ///            --exec. On Linux 5.13 or newer commands run under Landlock and
+    ///            can write only in read-write folders; without Landlock each
+    ///            command asks. Everything outside the folders is refused.
+    ///
+    ///   full     The agent acts with all your rights and is not asked. What
+    ///            still asks: protected paths (`~/.ssh` and the like) and risky
+    ///            commands (`sudo`, `git push`, `rm -r` outside the working
+    ///            folder), until you switch those prompts off in the settings.
+    ///            Full falls back to ask after --expiry-hours (default 8; 0 never).
+    ///
+    /// Only you change the mode, on this computer. The portal can change it only
+    /// if you set `portal_policy` to `write` (the default is `read`: it sees the
+    /// settings and cannot change them).
+    #[command(verbatim_doc_comment)]
     Mode {
+        /// ask, folders or full (`--help` explains them).
         mode: Option<ModeArg>,
-        /// Hours until Full falls back (0: never). Default 8.
+        /// Hours until Full falls back to ask (0: never). Default 8.
         #[arg(long)]
         expiry_hours: Option<u32>,
     },
@@ -163,8 +192,11 @@ pub enum Cmd {
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum ModeArg {
+    /// Every file access and command asks you.
     Ask,
+    /// Files only in the folders you granted; commands under Landlock.
     Folders,
+    /// All your rights, no questions but the protected paths and risky commands.
     Full,
 }
 
@@ -1779,6 +1811,47 @@ mod tests {
         assert!(e.contains("Linux only"), "{e}");
     }
 
+    fn long_help(name: &str) -> String {
+        Cli::command()
+            .find_subcommand(name)
+            .unwrap()
+            .clone()
+            .render_long_help()
+            .to_string()
+    }
+
+    #[test]
+    fn run_says_the_client_starts_without_it() {
+        let help = long_help("run");
+        assert!(help.contains("by hand"), "{help}");
+        assert!(
+            help.contains("`install` already starts the client"),
+            "{help}"
+        );
+        assert!(help.contains("never need this"), "{help}");
+        // The list of commands shows the short form, which says the same.
+        let list = Cli::command().render_help().to_string();
+        assert!(list.contains("by hand (for debugging)"), "{list}");
+    }
+
+    #[test]
+    fn mode_help_explains_the_three_modes() {
+        let help = long_help("mode");
+        for word in [
+            "ask      Every file access and every command asks you",
+            "`folder add`",
+            "Landlock",
+            "without Landlock each",
+            "--expiry-hours (default 8; 0 never)",
+            "shows the current one",
+            "`portal_policy` to `write`",
+        ] {
+            assert!(help.contains(word), "{word}: {help}");
+        }
+        // Each value has its own line too.
+        assert!(help.contains("- folders:"), "{help}");
+    }
+
     #[test]
     fn the_sudo_group_replaces_secret() {
         for args in [
@@ -1803,12 +1876,7 @@ mod tests {
             clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
         let cmd = Cli::command();
-        let help = cmd
-            .find_subcommand("sudo")
-            .unwrap()
-            .clone()
-            .render_long_help()
-            .to_string();
+        let help = long_help("sudo");
         for word in ["set", "activate", "deactivate", "clear", "status"] {
             assert!(help.contains(word), "{help}");
         }
