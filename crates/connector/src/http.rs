@@ -158,7 +158,7 @@ async fn read_response(io: &mut BoxIo, what: &str, max: usize) -> Result<Respons
             body.truncate(len);
             break;
         }
-        if chunked && let Some(done) = dechunk(&body)? {
+        if chunked && let Some(done) = dechunk(&body, max)? {
             body = done;
             break;
         }
@@ -185,8 +185,9 @@ async fn read_response(io: &mut BoxIo, what: &str, max: usize) -> Result<Respons
     })
 }
 
-/// Decodes a complete chunked body; `None` while more is needed.
-fn dechunk(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+/// Decodes a complete chunked body of at most `max` bytes; `None` while more is
+/// needed. A chunk size is the server's word: checked before any arithmetic.
+fn dechunk(data: &[u8], max: usize) -> Result<Option<Vec<u8>>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     loop {
@@ -200,7 +201,14 @@ fn dechunk(data: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if size == 0 {
             return Ok(Some(out));
         }
-        if data.len() < i + size + 2 {
+        if size > max.saturating_sub(out.len()) {
+            return Err(format!("the answer is larger than {max} bytes"));
+        }
+        let end = i
+            .checked_add(size)
+            .and_then(|e| e.checked_add(2))
+            .ok_or("bad chunk size")?;
+        if data.len() < end {
             return Ok(None);
         }
         out.extend_from_slice(&data[i..i + size]);
@@ -231,10 +239,20 @@ mod tests {
     #[test]
     fn dechunks() {
         assert_eq!(
-            dechunk(b"3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n").unwrap(),
+            dechunk(b"3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n", 100).unwrap(),
             Some(b"abcde".to_vec())
         );
-        assert_eq!(dechunk(b"3\r\nab").unwrap(), None);
-        assert!(dechunk(b"zz\r\n").is_err());
+        assert_eq!(dechunk(b"3\r\nab", 100).unwrap(), None);
+        assert!(dechunk(b"zz\r\n", 100).is_err());
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_an_error_not_a_panic() {
+        assert!(dechunk(b"ffffffffffffffff\r\nabc\r\n", 100).is_err());
+        assert!(dechunk(b"fffffffffffffffe\r\nabc\r\n", usize::MAX).is_err());
+        // Over the answer's limit, in one chunk or across several.
+        assert!(dechunk(b"65\r\n", 100).is_err());
+        assert!(dechunk(b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n", 5).is_err());
+        assert!(dechunk(b"3\r\nabc\r\n0\r\n\r\n", 3).unwrap().is_some());
     }
 }
