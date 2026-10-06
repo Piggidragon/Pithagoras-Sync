@@ -137,6 +137,17 @@ pub fn apply_from_portal(
         .validate(next.profile)
         .and_then(|()| next.exec.validate())
         .map_err(SetError::Invalid)?;
+    // A folder path is printed to the owner's terminal; the portal cannot put
+    // control characters there that would redraw what the owner reads.
+    if let Some(f) = next.policy.folders.iter().find(|f| {
+        f.path.to_string_lossy().chars().any(char::is_control)
+            && !cfg.policy.folders.iter().any(|o| o.path == f.path)
+    }) {
+        return Err(SetError::Invalid(format!(
+            "folder {:?}: a folder path has no control characters",
+            f.path
+        )));
+    }
     let mut changes = Vec::new();
     diff("", &current, &settings_value(&next), &mut changes);
     Ok((next, changes))
@@ -271,6 +282,35 @@ mod tests {
         ] {
             assert!(matches!(set(&c, edit), Err(SetError::Invalid(_))));
         }
+    }
+
+    #[test]
+    fn a_folder_path_from_the_portal_has_no_control_characters() {
+        let c = cfg(PortalPolicy::Write);
+        // Absolute on every platform.
+        let proj = std::env::temp_dir()
+            .join("proj")
+            .to_string_lossy()
+            .into_owned();
+        let forged = format!("{proj}\u{1b}[1A\u{1b}[2K\r{proj} (Rw)");
+        let r = set(
+            &c,
+            |v| {
+                v["policy"]["folders"] =
+                    serde_json::json!([{"path": forged, "access": "ro", "execute": false}])
+            },
+        );
+        assert!(matches!(r, Err(SetError::Invalid(_))), "{r:?}");
+        let (next, _) =
+            set(
+                &c,
+                |v| {
+                    v["policy"]["folders"] =
+                        serde_json::json!([{"path": proj, "access": "ro", "execute": false}])
+                },
+            )
+            .unwrap();
+        assert_eq!(next.policy.folders.len(), 1);
     }
 
     #[test]

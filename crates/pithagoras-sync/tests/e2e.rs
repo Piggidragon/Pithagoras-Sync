@@ -337,6 +337,23 @@ async fn pair_run_exec_panic_unlock() {
     assert!(!log.contains('\x1b'), "{log}");
 }
 
+/// `folder list` shows a folder path as `status` does: a control character the
+/// portal put there (`portal_policy = write`) is a visible escape, so it cannot
+/// move the cursor and overwrite the line above.
+#[tokio::test]
+async fn folder_list_shows_control_characters_as_escapes() {
+    let env = Env::new();
+    let proj = env.p("home/proj");
+    env.ok(&["folder", "add", &proj]).await;
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains(&format!("\"{proj}\"")), "{cfg}");
+    let forged = cfg.replace(&format!("\"{proj}\""), &format!("\"{proj}\\u001b[1A\""));
+    std::fs::write(env.config(), forged).unwrap();
+    let out = env.ok(&["folder", "list"]).await;
+    assert!(!out.contains('\x1b'), "{out:?}");
+    assert!(out.contains(&format!("{proj}\\u{{1b}}[1A (Ro)")), "{out:?}");
+}
+
 /// A deny rule that is slow on a long one-line command takes up to a second per
 /// command to check. Those checks run beside the client's two worker threads, so
 /// `status` and `panic` answer while the most commands the device starts at once

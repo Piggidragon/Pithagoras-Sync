@@ -776,9 +776,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Folder { cmd } => match cmd {
             FolderCmd::List => {
                 let cfg = DeviceConfig::load(&dirs.config_file())?;
+                // The portal may have set these paths (`portal_policy = write`).
                 for f in &cfg.policy.folders {
                     let x = if f.execute { ", exec" } else { "" };
-                    println!("{} ({:?}{x})", f.path.display(), f.access);
+                    let path = sync_policy::approve::visible(&f.path.display().to_string());
+                    println!("{path} ({:?}{x})", f.access);
                 }
             }
             FolderCmd::Add { path, rw, exec } => {

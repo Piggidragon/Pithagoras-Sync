@@ -362,7 +362,7 @@ Params:
 {"settings": {"policy": {...}, "exec": {...}}, "if_version": "9c1f0a2b3d4e5f60"}
 ```
 
-- `settings`: the whole document as `policy.get` returned it, changed. Every setting is checked as in the config file; an unknown field or a bad value is `INVALID_PARAMS`.
+- `settings`: the whole document as `policy.get` returned it, changed. Every setting is checked as in the config file; an unknown field or a bad value is `INVALID_PARAMS`. So is a new folder whose path holds a control character, which would redraw the owner's terminal in `folder list`.
 - `if_version` (optional): the `version` the change is based on. When the settings changed on the device meanwhile, the answer is `CONFLICT` and nothing changes. Left out, the change replaces whatever is there.
 - With `portal_policy` `read` or `off`, `DENIED`. A change to a `device_only` setting is `DENIED` as a whole.
 - The device keeps Full mode's end time itself: switching to Full dates it from now (`policy.full.until_ms` in the document is ignored).
