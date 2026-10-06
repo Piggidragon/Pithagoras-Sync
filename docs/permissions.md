@@ -17,7 +17,8 @@ Each change takes effect at once in the running client and is written to the aud
 Who may change them on the device:
 
 - Only the device's own user (the account the client runs as). On a Linux desktop (`profile = "desktop"`) every change also asks for that user's password in the terminal, through `su`.
-- On Linux, a change from a command the client runs for the portal (a process descending from the client) is refused, whatever the command: `config`, `mode`, `folder`, `secret`, `approve`, `deny`, `unlock`, `update`. The agent cannot widen its own rights through the shell. Windows has no such check yet (windows.md).
+- On Linux, a change through the CLI from a command the client runs for the portal (a process descending from the client) is refused, whatever the command: `config`, `mode`, `folder`, `secret`, `approve`, `deny`, `unlock`, `update`. Windows has no such check yet (windows.md).
+- That check is not a wall around the policy. A command that runs unconfined has all of the user's rights: it can edit `config.toml` itself and make the client read it (`SIGHUP` reloads the config, and a client killed by the command is started again by its unit). Unconfined are a command you approved in Ask mode, every command in Full mode, and Folders mode's shell with `folders_shell = "unconfined"` or without Landlock after its approval. Only a command confined by Landlock (Folders mode) cannot reach the config, since the client's own folders are protected. So approving a command means trusting it with your account, the policy included.
 
 ## The settings
 

@@ -44,8 +44,7 @@ fn confirm_desktop() -> Result<(), String> {
         return Err("cannot tell which user this is".into());
     }
     eprintln!("Changing what the portal may do on this device needs your password ({user}).");
-    let status = std::process::Command::new("su")
-        .args(["-c", "true", &user])
+    let status = su_check(&user)?
         .status()
         .map_err(|e| format!("cannot run su to check the password: {e}"))?;
     if status.success() {
@@ -53,6 +52,20 @@ fn confirm_desktop() -> Result<(), String> {
     } else {
         Err("password check failed; nothing changed".into())
     }
+}
+
+/// `su -c true <user>`, from a system folder: a `su` looked up through `PATH`
+/// could be any program the user (or a command of the agent) put there, and
+/// would answer "the password was right".
+#[cfg(unix)]
+fn su_check(user: &str) -> Result<std::process::Command, String> {
+    let su = ["/usr/bin/su", "/bin/su"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .ok_or("no su in /usr/bin or /bin to check the password with")?;
+    let mut cmd = std::process::Command::new(su);
+    cmd.args(["-c", "true", user]);
+    Ok(cmd)
 }
 
 #[cfg(windows)]
@@ -76,5 +89,20 @@ mod tests {
         }
         assert!(confirm(Profile::Desktop).unwrap_err().contains("terminal"));
         assert!(confirm(Profile::Headless).is_ok());
+    }
+
+    #[test]
+    fn the_password_check_runs_su_from_a_system_folder() {
+        // Whatever PATH holds, the check never runs a `su` found there.
+        let Ok(cmd) = su_check("someone") else {
+            return;
+        };
+        let program = std::path::Path::new(cmd.get_program());
+        assert!(
+            program.starts_with("/usr/bin") || program.starts_with("/bin"),
+            "{program:?}"
+        );
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-c", "true", "someone"]);
     }
 }
