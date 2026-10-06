@@ -393,12 +393,14 @@ mod tests {
 
     #[test]
     fn update_replaces_the_program_the_running_client_was_started_from() {
-        let me = Path::new("/home/u/Downloads/pithagoras-sync");
-        let installed = Path::new("/home/u/.local/bin/pithagoras-sync");
-        assert_eq!(target_exe(Some(installed), me), installed);
-        assert_eq!(target_exe(None, me), me);
+        // Absolute on every platform (`/home/u/...` is not on Windows).
+        let home = std::env::temp_dir().join("u");
+        let me = home.join("Downloads").join("pithagoras-sync");
+        let installed = home.join("bin").join("pithagoras-sync");
+        assert_eq!(target_exe(Some(&installed), &me), installed);
+        assert_eq!(target_exe(None, &me), me);
         // An old client that does not say where it runs from.
-        assert_eq!(target_exe(Some(Path::new("")), me), me);
+        assert_eq!(target_exe(Some(Path::new("")), &me), me);
     }
 
     #[cfg(unix)]
