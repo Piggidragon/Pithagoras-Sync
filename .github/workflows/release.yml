@@ -79,6 +79,27 @@ jobs:
             echo "the tag is $GITHUB_REF_NAME, Cargo.toml says $version" >&2
             exit 1
           fi
+      # The release notes are the version's section of CHANGELOG.md. A real release
+      # needs one (a release without a changelog stops here, before anything is
+      # built); a pre-release uses its version's section when there is one.
+      # `publish` has no checkout, so the section travels as an artifact.
+      - name: The changelog has this version's section
+        run: |
+          version=${GITHUB_REF_NAME##*v}
+          mkdir notes
+          awk -v v="$version" '
+            /^## / { on = ($2 == v) ; next }
+            on { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes/changelog.md
+          if [ ! -s notes/changelog.md ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+            echo "CHANGELOG.md has no section '## $version' with entries: write it, merge to main, then tag (docs/releasing.md)" >&2
+            exit 1
+          fi
+          cat notes/changelog.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: notes/changelog.md
       # The secret key is the `release` environment's, which this job cannot see:
       # `publish` checks it.
       - name: The public key is set up
@@ -224,6 +245,10 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: release-notes
+          path: notes
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
           name: sync-release
           path: tool
       - name: The manifest
@@ -276,15 +301,17 @@ jobs:
             v*)
               flags=(--latest)
               title="Pithagoras Sync $version"
-              notes="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs the latest release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
+              footer="Static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. \`pithagoras-sync update\` installs the latest release; SHA256SUMS lists the checksums, manifest.json.minisig signs the manifest (docs/releasing.md)."
               ;;
             *)
               flags=(--prerelease)
               title="Pithagoras Sync $version (pre-release $GITHUB_REF_NAME)"
-              notes="Pre-release for testing: static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. It has no update manifest, so \`pithagoras-sync update\` never offers it. To install it, download the binary of your platform and run its \`install\` (README); SHA256SUMS lists the checksums. If a client of this same version already runs, restart it afterwards: on Linux \`systemctl --user restart pithagoras-sync\`, on Windows sign out and in, or \`schtasks /End /TN \"Pithagoras Sync\"\` and then \`schtasks /Run /TN \"Pithagoras Sync\"\` (docs/releasing.md)."
+              footer="Pre-release for testing: static Linux binaries (x86_64, aarch64) and the Windows x86_64 program. It has no update manifest, so \`pithagoras-sync update\` never offers it. To install it, download the binary of your platform and run its \`install\` (README); SHA256SUMS lists the checksums. If a client of this same version already runs, restart it afterwards: on Linux \`systemctl --user restart pithagoras-sync\`, on Windows sign out and in, or \`schtasks /End /TN \"Pithagoras Sync\"\` and then \`schtasks /Run /TN \"Pithagoras Sync\"\` (docs/releasing.md)."
               ;;
           esac
+          # The changelog section first (CHANGELOG.md, made by `check`), then what the files are.
+          { cat notes/changelog.md; [ -s notes/changelog.md ] && echo; echo "$footer"; } > release-notes.md
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
             --title "$title" \
-            --notes "$notes" \
+            --notes-file release-notes.md \
             dist/*

@@ -62,7 +62,7 @@ The secret reaches one step of the workflow only: the one that runs `sync-releas
 
 ## Making a release
 
-1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and merge that to `main`.
+1. Set the version in the workspace `Cargo.toml` (`[workspace.package] version`), run `cargo build` so `Cargo.lock` follows, and add the version's section to `CHANGELOG.md` (`## <version> - <date>`, with Added / Changed / Fixed / Known limits as far as they apply; say what a user notices, not which commits went in). Merge that to `main`.
 2. Tag the merged commit on `main` and push the tag. `v<version>` is the real release, `pre-v<version>` (or `pre2-v<version>` for another try) a pre-release, binaries only, to test first:
 
    ```sh
@@ -73,6 +73,8 @@ The secret reaches one step of the workflow only: the one that runs `sync-releas
 
 3. In the Actions tab, open the run "Release". When check, builds and tool are done, `publish` waits for review: check that the commit is the one you tagged, then approve the deployment to `release`.
 4. When the run is green, check the release: the three binaries and `SHA256SUMS`, and for a real release also `manifest.json` and `manifest.json.minisig`. Then `sha256sum -c SHA256SUMS` on the downloaded files, and for a real release `pithagoras-sync update --check` from an installed client of an older version, which should offer the new version. A client that already runs that version (say, from its pre-release) says "Up to date": test `update` with a real release, or with the local release folder and test keys (testing.md), and install a pre-release by hand (above).
+
+Every real release has a changelog: the section of `CHANGELOG.md` with the tag's version is the release's notes (the files and checksums are listed under it), and a `v` tag without such a section stops in `check`, before anything is built. A pre-release uses its version's section when there is one and needs none. To fix the notes of a release that is out, edit the section and then `gh release edit v<version> --notes-file <file>`.
 
 The workflow checks that the version of the tag (what follows its last `v`) is the version in `Cargo.toml` and that each binary reports it (`pithagoras-sync --version`), so a mismatch fails before anything is published.
 
