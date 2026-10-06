@@ -2,7 +2,7 @@
 
 Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) portal reach your own computers, the way a file-sync client reaches the cloud: pair once, it starts with the machine, reconnects by itself, and from then on the agent can use that computer's files, shell and git when a chat is granted the device.
 
-**Status: 0.0.1, a preview.** It is the background client without a GUI (phase 1); the first stable release is 0.1.0, when all of phase 1 is done. The portal side is the Devices add-on of the portal (`thecodacus/pithagoras#87`, not merged yet); until it is, the client can be tried against a mock portal or a portal that runs that branch. The desktop app with overlay, voice and computer use is phase 2.
+**Status: 0.0.1.** It is the background client without a GUI (phase 1); 0.1.0 is the release where all of phase 1 is done. The portal side is the Devices add-on of the portal (`thecodacus/pithagoras#87`, not merged yet); until it is, the client can be tried against a mock portal or a portal that runs that branch. The desktop app with overlay, voice and computer use is phase 2.
 
 ## Platforms
 
@@ -23,23 +23,25 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 ## Linux laptop or desktop
 
-1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); before the first one, build it as described below and use `target/x86_64-unknown-linux-musl/release/pithagoras-sync`.
+1. Download the binary and make it executable (`pithagoras-sync-aarch64-linux` on ARM). Releases are published by a version tag ([docs/releasing.md](docs/releasing.md)); to build it yourself, see below.
 
    ```sh
    curl -LO https://github.com/Piggidragon/Pithagoras-Sync/releases/download/v0.0.1/pithagoras-sync-x86_64-linux
    chmod +x pithagoras-sync-x86_64-linux
    ```
 
-2. In the portal, open Settings, Devices, "Pair a device", and copy the pairing URI. Then pair. Quote the URI, since it contains `&`. On a desktop, this and every later policy change asks for your password in the terminal.
-
-   ```sh
-   ./pithagoras-sync-x86_64-linux pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
-   ```
-
-3. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit.
+2. Install it. This copies the program to `~/.local/bin/pithagoras-sync` and starts it now and at every login, as a systemd user unit. Until it is paired the client just waits (`status` says "not paired"). You do not start it yourself: `pithagoras-sync run`, which the unit runs, is only for starting it by hand in a terminal, to see its log while debugging.
 
    ```sh
    ./pithagoras-sync-x86_64-linux install
+   ```
+
+   `~/.local/bin` is on the `PATH` of most distributions once the folder exists and you log in again. Until then, in this terminal: `export PATH="$HOME/.local/bin:$PATH"`.
+
+3. In the portal, open Settings, Devices, "Pair a device", and copy the pairing URI. Then pair. Quote the URI, since it contains `&`. On a desktop, this and every later policy change asks for your password in the terminal. The running client takes the pairing at once.
+
+   ```sh
+   pithagoras-sync pair 'pithagoras-sync://pair?portal=...&code=...&spki=...'
    ```
 
 4. Check that it runs. To use Folders mode, grant folders first:
@@ -72,20 +74,24 @@ sudo systemctl start pithagoras-sync
 Download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases/tag/v0.0.1), save it as `pithagoras-sync.exe`, then in PowerShell:
 
 ```powershell
-.\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 .\pithagoras-sync.exe install
+.\pithagoras-sync.exe pair 'pithagoras-sync://pair?portal=...&code=...'
 ```
 
-`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only. Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
+`install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync` and adds a logon task that starts it at logon and again within a minute if it stops; it needs no admin rights. The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. You never start it yourself (`pithagoras-sync run` is only for running it by hand in a terminal, for debugging). The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; a launcher without console comes with the graphical install (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
 ## Commands as root (sudo)
 
 On Linux, the agent can run `sudo <command>` if you allow it and type your password on the device, never in the portal:
 
 ```sh
-pithagoras-sync config set policy.privilege.elevation sudo
-pithagoras-sync secret set elevation    # typed here, not echoed
+pithagoras-sync sudo set       # type the password (not echoed), then answer "activate now?"
+pithagoras-sync sudo status    # active or not, password set or not, and the next step
+pithagoras-sync sudo deactivate    # sudo access off again; the password stays
+pithagoras-sync sudo clear     # forget the password
 ```
+
+`sudo activate` switches sudo access on later (it offers to store a password first if there is none). On a headless machine (a server, `profile = headless`) `sudo set --stdin --activate` is the script route: it reads the password from stdin and switches sudo access on without asking. On a desktop profile every policy change checks your password in a terminal, so use `sudo set` there. `pithagoras-sync sudo --help` lists everything.
 
 The device hands the password to sudo itself; the agent never sees it, and it is scrubbed from command output, the audit log and everything sent to the portal. It stays in the running client's memory unless you choose `policy.privilege.secret_storage file`. Every `sudo` command asks for your approval, in every mode. A client that already runs as root (an LXC, say) has nothing to elevate, so its `sudo` is an ordinary command that does not ask. Details in [docs/permissions.md](docs/permissions.md).
 
@@ -104,7 +110,7 @@ A server set up with `setup --create-user` or `install --system` has its program
 sudo pithagoras-sync update
 ```
 
-As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file, every folder above it and every folder that holds a link on the way belong to root and are writable by nobody else, since root runs it; `setup` and `install --system` warn at once when that is not so, with the fix), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). A release is refused if it was made before the newest one seen for that program or the newest one this user installed for any program, so an older release served again is not taken, not even by a program updated for the first time. Updates come from the newest GitHub release of this repository (a pre-release such as 0.0.1 is not "newest": take it with `pithagoras-sync update --manifest https://github.com/Piggidragon/Pithagoras-Sync/releases/download/v0.0.1/manifest.json`); a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
+As root, `update` replaces the program the system unit starts, even when root also runs a client of its own from elsewhere (and only if that file, every folder above it and every folder that holds a link on the way belong to root and are writable by nobody else, since root runs it; `setup` and `install --system` warn at once when that is not so, with the fix), and restarts the unit if it runs (also when the program is current but the unit still runs an older copy of it). A release is refused if it was made before the newest one seen for that program or the newest one this user installed for any program, so an older release served again is not taken, not even by a program updated for the first time. Updates come from the newest GitHub release of this repository (a test pre-release such as `pre-v0.0.2` has binaries and checksums but no update manifest, so `update` never offers it: download the binary from its release page and run its `install`, then restart a client of the same version that already runs, as [docs/releasing.md](docs/releasing.md) says); a build of your own has no release key and says so. How releases are made: [docs/releasing.md](docs/releasing.md).
 
 ## Self-signed certificates
 

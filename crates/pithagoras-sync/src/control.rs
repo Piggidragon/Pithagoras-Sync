@@ -4,7 +4,7 @@
 //!
 //! The channel carries no policy: `mode`, `folder` and `config` edit the config file
 //! as the owner and then ask for a `reload`. It also carries the owner's answers to
-//! approvals and the elevation secret. Commands the client runs for the portal may
+//! approvals and the elevation password (`sudo set`). Commands the client runs for the portal may
 //! still ask for `status` or `panic`, nothing else.
 
 use std::path::Path;
@@ -77,9 +77,12 @@ pub struct Status {
     /// `off`, `read` or `write`.
     #[serde(default)]
     pub portal_policy: String,
-    /// `off`, or `sudo` with whether the secret is set.
+    /// `off`, or `sudo` with whether the password is set.
     #[serde(default)]
     pub elevation: String,
+    /// Whether the client holds the elevation password now (for `sudo status`).
+    #[serde(default)]
+    pub elevation_password: bool,
     pub running_commands: usize,
     pub cgroups: bool,
     pub landlock: bool,

@@ -55,14 +55,15 @@ systemctl start pithagoras-sync
 
 ### Elevation with real sudo
 
+Run before the `sudo` command group replaced the `secret` commands and the elevation setting; the commands below are today's names for what was run (`sudo set --stdin --activate` was `config set policy.privilege.elevation sudo` and `secret set elevation --stdin`, `sudo status` was `secret status`).
+
 A user `elevtest` with a password containing a quote and a backslash, in sudoers with `ALL=(ALL:ALL) ALL`. Lingering was enabled by root (the user's own `loginctl enable-linger` was refused by polkit, and `install` printed the hint for it).
 
 ```sh
 pithagoras-sync install                                  # user unit
 pithagoras-sync pair '<uri>'
-pithagoras-sync config set policy.privilege.elevation sudo
 pithagoras-sync mode full
-printf '%s\n' "$PW" | pithagoras-sync secret set elevation --stdin
+printf '%s\n' "$PW" | pithagoras-sync sudo set --stdin --activate
 ```
 
 Results, each command approved through the mock portal:
@@ -72,11 +73,11 @@ Results, each command approved through the mock portal:
 - `cat /root/pw.txt` (a file holding the password): permission denied. `sudo cat /root/pw.txt`: the output reached the portal as `[redacted]`.
 - `sudo -u nobody id`: refused (sudo's own options are not taken).
 - The client's `/proc/<pid>/environ` belongs to root:root (the client is undumpable), so the user's other processes cannot read its memory.
-- With `strace` attached to the client: the exec shim refused to take the password (exit 126) and `secret set` was refused ("being traced").
+- With `strace` attached to the client: the exec shim refused to take the password (exit 126) and `sudo set` was refused ("being traced").
 - A wrong stored password: sudo answered "Sorry, try again" and "1 incorrect password attempt", exit 1.
-- After `panic`, `secret status` said "no password set".
+- After `panic`, `sudo status` showed `Password:    not set` (`secret status` said "no password set" then).
 - The audit log, the user's journal, the full system journal and the mock portal's transcript of everything the device sent (`dump`) held the password neither as it is nor JSON-escaped.
-- `secret_storage = file`: `~/.config/pithagoras-sync/elevation.secret` was 0600 and the password worked after a restart of the client. `fs.read` of the file was denied (sealed). An unconfined Full-mode `cat` of it was readable, its output `[redacted]`: the known limit of file storage. `secret clear` removed the file.
+- `secret_storage = file`: `~/.config/pithagoras-sync/elevation.secret` was 0600 and the password worked after a restart of the client. `fs.read` of the file was denied (sealed). An unconfined Full-mode `cat` of it was readable, its output `[redacted]`: the known limit of file storage. `sudo clear` removed the file.
 
 ### Update
 
