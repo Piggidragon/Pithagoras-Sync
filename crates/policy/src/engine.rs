@@ -801,7 +801,7 @@ impl Engine {
                 let elevate = match (policy.privilege.elevation, elevated) {
                     (Elevation::Sudo, Some(rest)) if rest.starts_with('-') || rest.is_empty() => {
                         return Ok(Verdict::Deny(
-                            "elevated commands are `sudo <command>`, run as root; sudo's own options are not taken".into(),
+                            "elevated commands are `sudo <command>`, run as root; sudo's own options (-n, -u, -E, -s ...) are not taken: run the command again as `sudo <command>` without them".into(),
                         ));
                     }
                     (Elevation::Sudo, Some(_)) => Some(policy.privilege.sudo_path.clone()),

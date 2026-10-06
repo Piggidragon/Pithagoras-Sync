@@ -1006,6 +1006,9 @@ async fn elevation_is_the_owners_choice_and_root_always_asks() {
     for c in ["sudo -u nobody id", "sudo -E env", "sudo -s", "sudo  "] {
         denied(exec(&e, c, &cwd).await);
     }
+    // The refusal tells the agent what to do instead: models write `sudo -n` by habit.
+    let m = denied(exec(&e, "sudo -n whoami", &cwd).await);
+    assert!(m.contains("without them"), "{m}");
     // Nobody to ask: refused.
     let e = f.engine(on(&f), Profile::Headless, none());
     denied(exec(&e, "sudo apt update", &cwd).await);
