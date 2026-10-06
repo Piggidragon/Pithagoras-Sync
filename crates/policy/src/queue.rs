@@ -357,10 +357,15 @@ mod tests {
             };
             reqs.push(r);
         }
-        let asks = futures_util::future::join_all(reqs.iter().map(|r| q.ask(r)));
+        let n = reqs.len();
+        let mut asks = tokio::task::JoinSet::new();
+        for r in reqs {
+            let q = q.clone();
+            asks.spawn(async move { q.ask(&r).await });
+        }
         let check = async {
             let mut seen = Vec::new();
-            while seen.len() < reqs.len() {
+            while seen.len() < n {
                 if let ApprovalEvent::Requested(i) = ev.recv().await.unwrap() {
                     seen.push(i);
                 }
@@ -377,7 +382,7 @@ mod tests {
             assert!(!whole.cut && whole.choices.contains(&Choice::Once));
             let (approvals, left_out) = q.list_within();
             assert!(left_out > 0 && !approvals.is_empty());
-            assert_eq!(approvals.len() + left_out, reqs.len());
+            assert_eq!(approvals.len() + left_out, n);
             let json = serde_json::to_string(&ApprovalListResult {
                 approvals,
                 left_out,
@@ -386,7 +391,9 @@ mod tests {
             assert!(json.len() <= MAX_APPROVAL_LIST, "{}", json.len());
             q.cancel_all();
         };
-        let (answers, ()) = tokio::join!(asks, check);
+        check.await;
+        let answers = asks.join_all().await;
+        assert_eq!(answers.len(), n);
         assert!(answers.iter().all(|a| *a == Answer::Deny));
     }
 
