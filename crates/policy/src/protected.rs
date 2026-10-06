@@ -30,6 +30,14 @@ const HOME: &[&str] = &[
     ".kube",
     ".docker",
     ".config/gh",
+    ".config/hub",
+    ".config/gcloud",
+    ".azure",
+    ".npmrc",
+    ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".vault-token",
     // browser and mail profiles
     ".mozilla",
     ".librewolf",
@@ -44,6 +52,7 @@ const HOME: &[&str] = &[
     ".local/share/flatpak/app",
     // shell start-up and session environment
     ".bashrc",
+    ".bashrc.d",
     ".bash_profile",
     ".bash_login",
     ".bash_logout",
@@ -70,9 +79,17 @@ const HOME: &[&str] = &[
     ".local/share/systemd",
 ];
 
-/// Relative to the home directory: config that makes tools run commands. Reading
-/// it is harmless and tools need it (git's identity), so only writes prompt.
-const HOME_WRITE_ONLY: &[&str] = &[".gitconfig", ".config/git"];
+/// Relative to the home directory: config that makes tools run commands, and
+/// programs that run later in place of others (`~/.local/bin` comes early in
+/// `PATH` on many systems, a fake `sudo` there would catch the password; a
+/// `.desktop` file runs its `Exec=` line when its app is opened). Reading them is
+/// harmless and tools need it (git's identity), so only writes prompt.
+const HOME_WRITE_ONLY: &[&str] = &[
+    ".gitconfig",
+    ".config/git",
+    ".local/bin",
+    ".local/share/applications",
+];
 
 /// Relative to the user profile on Windows.
 #[cfg(windows)]
@@ -93,11 +110,18 @@ const HOME: &[&str] = &[
     "AppData/Roaming/KeePassXC",
     "AppData/Local/1Password",
     "AppData/Roaming/GitHub CLI",
+    "AppData/Roaming/gcloud",
     ".git-credentials",
     "_netrc",
     ".aws",
     ".kube",
     ".docker",
+    ".azure",
+    ".npmrc",
+    ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".vault-token",
     // browser and mail profiles
     "AppData/Local/Google/Chrome/User Data",
     "AppData/Local/Microsoft/Edge/User Data",
@@ -400,8 +424,24 @@ mod tests {
             "/home/u/.config/autostart/a.desktop",
             "/home/u/.config/pithagoras-sync/config.toml",
             "/etc/sudoers.d/x",
+            "/home/u/.config/gcloud/application_default_credentials.json",
+            "/home/u/.azure/msal_token_cache.json",
+            "/home/u/.npmrc",
+            "/home/u/.pypirc",
+            "/home/u/.cargo/credentials.toml",
+            "/home/u/.config/hub",
+            "/home/u/.vault-token",
+            "/home/u/.bashrc.d/x.sh",
         ] {
             assert!(p.check(Path::new(path), false, &[]).is_some(), "{path}");
+        }
+        // Programs that run in place of others or when an app opens: their writes.
+        for path in [
+            "/home/u/.local/bin/sudo",
+            "/home/u/.local/share/applications/x.desktop",
+        ] {
+            assert!(p.check(Path::new(path), false, &[]).is_none(), "{path}");
+            assert!(p.check(Path::new(path), true, &[]).is_some(), "{path}");
         }
         for path in ["/home/u/proj/a.rs", "/home/u/.sshx", "/home/u/.config"] {
             assert!(p.check(Path::new(path), false, &[]).is_none(), "{path}");

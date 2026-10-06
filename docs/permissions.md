@@ -66,7 +66,7 @@ A command rule is exactly one of `{"exact": "..."}` (the whole command, spaces n
 
 ### Protected paths: `policy.protected`
 
-Built in: `~/.ssh`, `~/.gnupg`, keyrings and password managers, cloud credentials, browser and mail profiles, shell start-up files, autostart folders, the client's own folders and more. Writes into folders named in `tool_config` (anywhere in a path) ask as well. Protected paths ask in Ask and Folders mode, and in Full mode while `policy.full.protected_paths` is on.
+Built in: `~/.ssh`, `~/.gnupg`, keyrings and password managers, credentials of cloud and developer tools (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/hub`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.vault-token`, `~/.git-credentials`, `~/.netrc`), browser and mail profiles, shell start-up files (`~/.bashrc` and `~/.bashrc.d`, the zsh and fish files, `~/.profile`), autostart folders and systemd user units, the client's own folders and more; `crates/policy/src/protected.rs` has the whole list. Only writes ask for `~/.gitconfig`, `~/.config/git`, `~/.local/bin` (early in `PATH` on many systems, where a program could stand in for another) and `~/.local/share/applications` (a `.desktop` file runs its `Exec=` line when the app is opened). Writes into folders named in `tool_config` (anywhere in a path) ask as well. Protected paths ask in Ask and Folders mode, and in Full mode while `policy.full.protected_paths` is on.
 
 | Setting | Values | Default | What it does | CLI | Portal |
 |---|---|---|---|---|---|
