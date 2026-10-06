@@ -317,13 +317,39 @@ pub fn system_unit_file() -> PathBuf {
     Path::new("/etc/systemd/system").join(UNIT_NAME)
 }
 
-/// The program a systemd unit starts: the first word of its `ExecStart=`.
-pub fn unit_program(unit: &str) -> Option<PathBuf> {
-    unit.lines()
-        .find_map(|l| l.trim().strip_prefix("ExecStart="))
-        .and_then(|cmd| cmd.split_whitespace().next())
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+/// The program the system unit starts, as systemd has it: drop-ins and an
+/// `ExecStart=` reset included, which the unit file alone does not show.
+pub fn unit_program(runner: &dyn Runner) -> Option<PathBuf> {
+    let show = runner
+        .run(&argv(&[
+            "systemctl",
+            "show",
+            "-p",
+            "ExecStart",
+            "--value",
+            UNIT_NAME,
+        ]))
+        .ok()?;
+    exec_start_path(&show)
+}
+
+/// The `path=` of what `systemctl show -p ExecStart --value` prints:
+/// `{ path=/usr/local/bin/pithagoras-sync ; argv[]=... ; ... }`.
+fn exec_start_path(show: &str) -> Option<PathBuf> {
+    let rest = &show[show.find("path=")? + "path=".len()..];
+    let path = rest.split(" ;").next()?.trim();
+    Some(PathBuf::from(path)).filter(|p| p.is_absolute())
+}
+
+/// What a process runs, seen against the program file at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runs {
+    /// That file, as it is now.
+    Same,
+    /// The file that was at that path before it was replaced.
+    Replaced,
+    /// Another program.
+    Other(PathBuf),
 }
 
 /// Whether only root can change `exe`: the file and every folder above it
@@ -365,14 +391,18 @@ fn only_owner_changes(
 }
 
 /// After `update` as root, for the system unit that starts `exe`: restarts it
-/// when it runs and `stale` says its process runs an older file than `exe` is
-/// now. A system unit's client cannot be asked to restart itself (its control
-/// socket answers its own user only), so systemd does it. What happened, for the
-/// owner; `None` when the unit does not run or runs `exe` as it is.
+/// when its process runs the file that was at `exe` before (`look` tells what
+/// it runs; when it cannot, `replaced` says whether this update replaced the
+/// file). A system unit's client cannot be asked to restart itself (its control
+/// socket answers its own user only), so systemd does it. A unit that runs
+/// another program is left alone and the owner told, so `update` never restarts
+/// it over and over without effect. What happened, for the owner; `None` when
+/// there is nothing to say.
 pub fn restart_system_unit(
     runner: &dyn Runner,
     exe: &Path,
-    stale: impl Fn(u32) -> bool,
+    replaced: bool,
+    look: impl Fn(u32) -> Option<Runs>,
 ) -> Option<String> {
     let pid = runner
         .run(&argv(&[
@@ -383,13 +413,29 @@ pub fn restart_system_unit(
             "--value",
             UNIT_NAME,
         ]))
-        .ok()?
-        .trim()
-        .parse::<u32>()
         .ok()
-        .filter(|p| *p != 0)?;
-    if !stale(pid) {
-        return None;
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|p| *p != 0);
+    let Some(pid) = pid else {
+        return replaced.then(|| {
+            format!(
+                "{UNIT_NAME} is not running; it starts {} as it is now when it starts.",
+                exe.display()
+            )
+        });
+    };
+    match look(pid) {
+        Some(Runs::Replaced) => {}
+        None if replaced => {}
+        Some(Runs::Other(p)) => {
+            return Some(format!(
+                "{UNIT_NAME} runs {}, not {}, so it was not restarted. Once it should run {}: sudo systemctl restart {UNIT_NAME}",
+                p.display(),
+                exe.display(),
+                exe.display()
+            ));
+        }
+        Some(Runs::Same) | None => return None,
     }
     Some(
         match runner.run(&argv(&["systemctl", "restart", UNIT_NAME])) {
@@ -398,25 +444,37 @@ pub fn restart_system_unit(
                 exe.display()
             ),
             Err(e) => format!(
-                "{UNIT_NAME} still runs the program it had and did not restart ({e}): systemctl restart {UNIT_NAME}"
+                "{UNIT_NAME} still runs the program it had and did not restart ({e}): sudo systemctl restart {UNIT_NAME}"
             ),
         },
     )
 }
 
-/// Whether process `pid` runs another file than the one at `exe` now: one that
-/// was replaced after it started (by this update, or by hand before it).
+/// What process `pid` runs, seen against the file at `exe`: that file, the one
+/// that was there before it was replaced (by this update, or by hand before
+/// it), or another program. `None` when it cannot be told.
 #[cfg(target_os = "linux")]
-pub fn runs_other_file(pid: u32, exe: &Path) -> bool {
+pub fn what_runs(pid: u32, exe: &Path) -> Option<Runs> {
     use std::os::unix::fs::MetadataExt;
-    // /proc/PID/exe leads to the file the process runs, even once it is deleted.
-    match (
-        std::fs::metadata(format!("/proc/{pid}/exe")),
-        std::fs::metadata(exe),
-    ) {
-        (Ok(a), Ok(b)) => (a.dev(), a.ino()) != (b.dev(), b.ino()),
-        _ => false,
+    let proc_exe = format!("/proc/{pid}/exe");
+    // The link names the path the program was started from, marked once the
+    // file is deleted (replaced); the link itself leads to the running file.
+    let named = std::fs::read_link(&proc_exe).ok()?;
+    let named = named.to_string_lossy();
+    let path = PathBuf::from(named.strip_suffix(" (deleted)").unwrap_or(&named));
+    let exe_real = std::fs::canonicalize(exe).ok()?;
+    if path != exe_real {
+        return Some(Runs::Other(path));
     }
+    let (a, b) = (
+        std::fs::metadata(&proc_exe).ok()?,
+        std::fs::metadata(exe).ok()?,
+    );
+    Some(if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+        Runs::Same
+    } else {
+        Runs::Replaced
+    })
 }
 
 /// Downloads the binary, checks it against the manifest and that it runs and
@@ -668,20 +726,31 @@ mod tests {
     }
 
     #[test]
-    fn the_program_of_a_unit_is_its_exec_start() {
-        assert_eq!(
-            unit_program(&crate::install::system_unit(Some("pithagoras-sync"))),
-            Some(PathBuf::from(crate::install::SYSTEM_BIN))
+    fn the_program_of_a_unit_is_what_systemd_starts() {
+        let show = |out: &str| crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok(out.into()))],
+            ..Default::default()
+        };
+        // A drop-in that reset ExecStart= and set another: systemd says which.
+        let r = show(
+            "{ path=/opt/ps/pithagoras-sync ; argv[]=/opt/ps/pithagoras-sync run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n",
         );
         assert_eq!(
-            unit_program("[Service]\nExecStart=/opt/ps/pithagoras-sync run --x\n"),
+            unit_program(&r),
             Some(PathBuf::from("/opt/ps/pithagoras-sync"))
         );
         assert_eq!(
-            unit_program("[Service]\nExecStart=-pithagoras-sync run\n"),
-            None
+            r.ran.lock().unwrap()[0],
+            crate::actions::argv(&["systemctl", "show", "-p", "ExecStart", "--value", UNIT_NAME])
         );
-        assert_eq!(unit_program("[Service]\n"), None);
+        // No such unit (empty), or nothing usable.
+        assert_eq!(unit_program(&show("\n")), None);
+        assert_eq!(unit_program(&show("{ path=pithagoras-sync ; }")), None);
+        let r = crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Err("no systemd".into()))],
+            ..Default::default()
+        };
+        assert_eq!(unit_program(&r), None);
     }
 
     #[test]
@@ -699,25 +768,47 @@ mod tests {
                 .filter(|a| a.get(1).map(String::as_str) == Some("restart"))
                 .count()
         };
-        // Running an older file: restarted.
+        // Running the replaced file: restarted, whether or not this update
+        // replaced it.
+        for replaced in [true, false] {
+            let r = runner("4242");
+            let said = restart_system_unit(&r, exe, replaced, |pid| {
+                (pid == 4242).then_some(Runs::Replaced)
+            })
+            .unwrap();
+            assert!(
+                said.starts_with("Restarted pithagoras-sync.service"),
+                "{said}"
+            );
+            assert_eq!(restarts(&r), 1);
+            assert_eq!(
+                r.ran.lock().unwrap()[1],
+                crate::actions::argv(&["systemctl", "restart", UNIT_NAME])
+            );
+        }
+        // Running the file as it is: left alone.
         let r = runner("4242");
-        let said = restart_system_unit(&r, exe, |pid| pid == 4242).unwrap();
-        assert!(
-            said.starts_with("Restarted pithagoras-sync.service"),
-            "{said}"
-        );
-        assert_eq!(restarts(&r), 1);
         assert_eq!(
-            r.ran.lock().unwrap()[1],
-            crate::actions::argv(&["systemctl", "restart", UNIT_NAME])
+            restart_system_unit(&r, exe, false, |_| Some(Runs::Same)),
+            None
         );
-        // Running the file as it is, or not running: left alone.
+        assert_eq!(restarts(&r), 0);
+        // What it runs cannot be told: restarted only after a replace.
         let r = runner("4242");
-        assert_eq!(restart_system_unit(&r, exe, |_| false), None);
+        assert_eq!(restart_system_unit(&r, exe, false, |_| None), None);
         assert_eq!(restarts(&r), 0);
+        let r = runner("4242");
+        assert!(restart_system_unit(&r, exe, true, |_| None).is_some());
+        assert_eq!(restarts(&r), 1);
+        // Not running: said after a replace, nothing restarted.
         let r = runner("0");
-        assert_eq!(restart_system_unit(&r, exe, |_| true), None);
+        let said = restart_system_unit(&r, exe, true, |_| Some(Runs::Replaced)).unwrap();
+        assert!(said.contains("is not running"), "{said}");
         assert_eq!(restarts(&r), 0);
+        assert_eq!(
+            restart_system_unit(&runner("0"), exe, false, |_| None),
+            None
+        );
         // The restart fails: the owner is told how to do it.
         let r = crate::actions::Fake {
             answers: vec![
@@ -726,10 +817,40 @@ mod tests {
             ],
             ..Default::default()
         };
-        let said = restart_system_unit(&r, exe, |_| true).unwrap();
+        let said = restart_system_unit(&r, exe, true, |_| Some(Runs::Replaced)).unwrap();
         assert!(
-            said.contains("systemctl restart pithagoras-sync.service"),
+            said.contains("sudo systemctl restart pithagoras-sync.service"),
             "{said}"
+        );
+    }
+
+    #[test]
+    fn a_unit_running_another_program_is_not_restarted() {
+        let exe = Path::new("/usr/local/bin/pithagoras-sync");
+        let r = crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok("4242\n".into()))],
+            ..Default::default()
+        };
+        // Neither after a replace nor when nothing was replaced: restarting would
+        // not make it run `exe`, so every `update` would restart it again.
+        for replaced in [true, false] {
+            let said = restart_system_unit(&r, exe, replaced, |_| {
+                Some(Runs::Other(PathBuf::from("/opt/ps/pithagoras-sync")))
+            })
+            .unwrap();
+            assert!(
+                said.starts_with(
+                    "pithagoras-sync.service runs /opt/ps/pithagoras-sync, not /usr/local/bin/pithagoras-sync, so it was not restarted"
+                ),
+                "{said}"
+            );
+        }
+        assert!(
+            r.ran
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|a| a.get(1).map(String::as_str) != Some("restart"))
         );
     }
 
@@ -758,11 +879,17 @@ mod tests {
             }
         };
         let pid = child.id();
-        assert!(!runs_other_file(pid, &exe));
+        assert_eq!(what_runs(pid, &exe), Some(Runs::Same));
+        let other = t.path().join("other");
+        std::fs::copy(&exe, &other).unwrap();
+        assert_eq!(
+            what_runs(pid, &other),
+            Some(Runs::Other(std::fs::canonicalize(&exe).unwrap()))
+        );
         let new = t.path().join("prog.new");
         std::fs::copy(&exe, &new).unwrap();
         std::fs::rename(&new, &exe).unwrap();
-        assert!(runs_other_file(pid, &exe));
+        assert_eq!(what_runs(pid, &exe), Some(Runs::Replaced));
         let _ = child.kill();
         let _ = child.wait();
     }

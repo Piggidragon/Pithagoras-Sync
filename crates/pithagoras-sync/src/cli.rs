@@ -232,20 +232,15 @@ pub fn is_root() -> bool {
     crate::daemon::is_root()
 }
 
-/// Restarts the system unit when its process runs an older file than `exe` is
-/// now (`replaced`: this update just replaced it). Whether it runs.
-fn restart_unit(exe: &Path, replaced: bool) -> bool {
+/// Restarts the system unit when its process runs the file that was at `exe`
+/// before (`replaced`: this update just replaced it), and says what happened.
+fn restart_unit(exe: &Path, replaced: bool) {
     #[cfg(target_os = "linux")]
-    let stale = |pid| replaced || crate::update::runs_other_file(pid, exe);
+    let look = |pid| crate::update::what_runs(pid, exe);
     #[cfg(not(target_os = "linux"))]
-    let stale = |_| replaced;
-    let runner = actions::System;
-    match crate::update::restart_system_unit(&runner, exe, stale) {
-        Some(said) => {
-            println!("{said}");
-            true
-        }
-        None => false,
+    let look = |_| None;
+    if let Some(said) = crate::update::restart_system_unit(&actions::System, exe, replaced, look) {
+        println!("{said}");
     }
 }
 
@@ -963,9 +958,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             // As root, the program of the system unit (`setup`'s dedicated user),
             // whose client root cannot reach over its control socket.
             let system = if cfg!(target_os = "linux") && is_root() {
-                std::fs::read_to_string(crate::update::system_unit_file())
-                    .ok()
-                    .and_then(|u| crate::update::unit_program(&u))
+                crate::update::unit_program(&actions::System)
             } else {
                 None
             };
@@ -1039,12 +1032,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     "The running client restarts with it (its unit or logon task starts it again)."
                 );
             } else if unit_runs_exe {
-                if !restart_unit(&exe, true) {
-                    println!(
-                        "{} is not running; it starts the new version when it starts.",
-                        crate::install::UNIT_NAME
-                    );
-                }
+                restart_unit(&exe, true);
             } else {
                 println!(
                     "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
