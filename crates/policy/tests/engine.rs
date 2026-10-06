@@ -1187,3 +1187,46 @@ async fn huge_targets_cannot_flush_the_audit_log() {
         recs[0].target
     );
 }
+
+/// The owner judges a command by where it runs as well: the approval and the
+/// audit name the folder (resolved, as it would run there).
+#[tokio::test]
+async fn a_commands_approval_and_audit_name_its_folder() {
+    let f = Fixture::new();
+    let approver = scripted(Answer::Once);
+    let e = f.engine(
+        Policy {
+            mode: Mode::Ask,
+            ..Policy::default()
+        },
+        Profile::Headless,
+        approver.clone(),
+    );
+    exec(&e, "make install", &f.p("home/proj/src/.."))
+        .await
+        .unwrap();
+    let req = approver.last.lock().unwrap().clone().unwrap();
+    assert_eq!(req.target, "make install");
+    assert_eq!(req.cwd.as_deref(), Some(f.p("home/proj").as_str()));
+    let rec = f.audit().pop().unwrap();
+    assert_eq!(
+        (rec.target.as_str(), rec.decision.as_str()),
+        ("make install", "approved")
+    );
+    assert_eq!(rec.cwd.as_deref(), Some(f.p("home/proj").as_str()));
+    // A file call has no folder of its own.
+    read(&e, &f.p("home/proj/a.txt")).await.unwrap();
+    assert_eq!(approver.last.lock().unwrap().clone().unwrap().cwd, None);
+    assert_eq!(f.audit().pop().unwrap().cwd, None);
+    // A denied command names the folder as the portal gave it.
+    let e = f.engine(
+        f.folders(&[("home/proj", Access::Rw)]),
+        Profile::Headless,
+        none(),
+    );
+    denied(exec(&e, "ls", &f.p("outside")).await);
+    assert_eq!(
+        f.audit().pop().unwrap().cwd.as_deref(),
+        Some(f.p("outside").as_str())
+    );
+}

@@ -400,6 +400,21 @@ impl Engine {
         reason: Option<String>,
         exit_code: Option<i32>,
     ) {
+        self.record_in(chat, tool, target, None, decision, reason, exit_code);
+    }
+
+    /// `record` with the folder a command runs in.
+    #[allow(clippy::too_many_arguments)]
+    fn record_in(
+        &self,
+        chat: Option<&str>,
+        tool: &str,
+        target: &str,
+        cwd: Option<&str>,
+        decision: &str,
+        reason: Option<String>,
+        exit_code: Option<i32>,
+    ) {
         // Whatever a command or the owner wrote, the elevation secret stays out.
         let scrub = |t: &str| match self.secrets.get() {
             Some(s) => s.scrub(t),
@@ -411,6 +426,7 @@ impl Engine {
             chat: chat.map(|c| crate::audit::cut(&scrub(c), sync_proto::methods::MAX_CHAT_ID)),
             tool: tool.to_string(),
             target: crate::audit::cut(&scrub(target), crate::audit::MAX_FIELD),
+            cwd: cwd.map(|c| crate::audit::cut(&scrub(c), crate::audit::MAX_FIELD)),
             decision: decision.to_string(),
             reason: reason
                 .as_deref()
@@ -428,18 +444,29 @@ impl Engine {
             Request::Write { path, .. } => path.to_string(),
             Request::Exec { command, .. } => command.to_string(),
         };
-        let deny = |reason: String| {
-            self.record(
+        // Where a command runs: as the portal named it until the policy resolved
+        // it, then the resolved folder, which is where it would run.
+        let mut cwd = match &req {
+            Request::Exec { cwd, .. } => Some(cwd.to_string()),
+            _ => None,
+        };
+        let record = |cwd: &Option<String>, decision: &str, reason: Option<String>| {
+            self.record_in(
                 Some(call.chat),
                 call.tool,
                 &target,
-                "denied",
-                Some(reason.clone()),
+                cwd.as_deref(),
+                decision,
+                reason,
+                None,
             );
+        };
+        let deny = |cwd: &Option<String>, reason: String| {
+            record(cwd, "denied", Some(reason.clone()));
             reason
         };
         if self.is_paused() {
-            return Err(Refusal::Denied(deny("the device is paused".into())));
+            return Err(Refusal::Denied(deny(&cwd, "the device is paused".into())));
         }
         if call.portal_tainted {
             self.mark_tainted(call.chat);
@@ -448,16 +475,27 @@ impl Engine {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
-                deny(format!("bad path: {msg}"));
+                deny(&cwd, format!("bad path: {msg}"));
                 return Err(Refusal::BadPath(msg));
             }
         };
+        if let (
+            Some(c),
+            Verdict::Allow(Permit { path, .. })
+            | Verdict::Prompt {
+                permit: Permit { path, .. },
+                ..
+            },
+        ) = (&mut cwd, &verdict)
+        {
+            *c = crate::paths::to_wire(path);
+        }
         let (permit, reasons, offer) = match verdict {
             Verdict::Allow(permit) => {
-                self.record(Some(call.chat), call.tool, &target, "allowed", None);
+                record(&cwd, "allowed", None);
                 return Ok(permit);
             }
-            Verdict::Deny(reason) => return Err(Refusal::Denied(deny(reason))),
+            Verdict::Deny(reason) => return Err(Refusal::Denied(deny(&cwd, reason))),
             Verdict::Prompt {
                 permit,
                 reasons,
@@ -466,9 +504,12 @@ impl Engine {
         };
         let reason_text = reasons.join("; ");
         if !self.approver.can_prompt() {
-            return Err(Refusal::Denied(deny(format!(
-                "needs the owner's approval ({reason_text}), and nobody can answer prompts on this device"
-            ))));
+            return Err(Refusal::Denied(deny(
+                &cwd,
+                format!(
+                    "needs the owner's approval ({reason_text}), and nobody can answer prompts on this device"
+                ),
+            )));
         }
         let preview = match &req {
             Request::Write { preview, .. } => preview.clone(),
@@ -481,6 +522,7 @@ impl Engine {
             chat: call.chat.to_string(),
             tool: call.tool.to_string(),
             target: target.clone(),
+            cwd: cwd.clone(),
             reasons,
             preview,
             offer_chat: offer.is_some(),
@@ -491,10 +533,8 @@ impl Engine {
         let answer = match tokio::time::timeout(timeout, self.approver.ask(&request)).await {
             Ok(a) => a,
             Err(_) if opts.on_timeout == TimeoutAnswer::Allow && !self.is_paused() => {
-                self.record(
-                    Some(call.chat),
-                    call.tool,
-                    &target,
+                record(
+                    &cwd,
                     "approved",
                     Some(format!(
                         "no answer within {}s, and this device allows on timeout ({reason_text})",
@@ -504,20 +544,21 @@ impl Engine {
                 return Ok(permit);
             }
             Err(_) => {
-                return Err(Refusal::Denied(deny(format!(
-                    "no answer to the approval within {}s",
-                    timeout.as_secs()
-                ))));
+                return Err(Refusal::Denied(deny(
+                    &cwd,
+                    format!("no answer to the approval within {}s", timeout.as_secs()),
+                )));
             }
         };
         // The owner may have paused while the prompt was open.
         if self.is_paused() {
-            return Err(Refusal::Denied(deny("the device is paused".into())));
+            return Err(Refusal::Denied(deny(&cwd, "the device is paused".into())));
         }
         match answer {
-            Answer::Deny => Err(Refusal::Denied(deny(format!(
-                "the owner denied it ({reason_text})"
-            )))),
+            Answer::Deny => Err(Refusal::Denied(deny(
+                &cwd,
+                format!("the owner denied it ({reason_text})"),
+            ))),
             Answer::Once | Answer::ForChat | Answer::ForTime(_) => {
                 let until = match answer {
                     Answer::ForChat if opts.remember_minutes == 0 => Some(None),
@@ -535,13 +576,7 @@ impl Engine {
                         .approved
                         .insert(scope, until);
                 }
-                self.record(
-                    Some(call.chat),
-                    call.tool,
-                    &target,
-                    "approved",
-                    Some(reason_text),
-                );
+                record(&cwd, "approved", Some(reason_text));
                 Ok(permit)
             }
         }

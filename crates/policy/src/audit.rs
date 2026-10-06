@@ -36,6 +36,9 @@ pub struct AuditRecord {
     pub tool: String,
     /// Path or command.
     pub target: String,
+    /// The folder a command runs in (commands only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// `allowed` (by policy), `approved` (by the owner), `denied`, or for `exit` and
     /// state changes a short word of their own.
     pub decision: String,
@@ -118,6 +121,7 @@ mod tests {
             chat: Some("c".into()),
             tool: "write".into(),
             target: "/w/a".into(),
+            cwd: None,
             decision: "denied".into(),
             reason: Some("outside".into()),
             exit_code: None,

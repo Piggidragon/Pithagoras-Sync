@@ -60,6 +60,7 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
                                 chat: info.chat,
                                 tool: info.tool,
                                 target: info.target,
+                                cwd: info.cwd,
                                 reasons: info.reasons,
                                 preview: info.preview,
                                 offer_chat: false,

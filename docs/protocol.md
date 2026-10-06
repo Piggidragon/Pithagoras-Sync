@@ -420,6 +420,8 @@ There is no answer to `hello`. A portal that does not speak `proto` closes with 
 {"time_ms": 1760000000000, "chat": "<id or null>", "tool": "write", "target": "/abs/path", "decision": "denied", "reason": "protected path"}
 ```
 
+A command's event also has `cwd`, the folder it runs in (as the portal gave it when it was refused before the device resolved it).
+
 A settings change is one event per setting: `"tool": "policy"`, the setting's name in `target` (`policy.tools.bash`), `"decision": "changed"` and the old and new value in `reason` (`by the portal: true -> false`, `by the device owner: ...`).
 
 `approval.requested`: a call waits for the owner's approval. The portal shows it in the Devices tab (and next to the chat) with the choices it offers, and sends the owner's answer with `approval.answer`. The owner can also answer on the device (`pithagoras-sync approvals`, `approve <id>`, `deny <id>`).
@@ -427,7 +429,7 @@ A settings change is one event per setting: `"tool": "policy"`, the setting's na
 ```json
 {
   "id": 12, "call": 41, "chat": "<chat id>",
-  "tool": "write", "target": "/home/alice/src/app/main.rs",
+  "tool": "write", "target": "/home/alice/src/app/main.rs", "cwd": null,
   "reasons": ["Ask mode: every call asks"],
   "preview": "fn main() {...",
   "choices": ["once", "chat", "time", "deny"], "max_minutes": 480,
@@ -438,6 +440,7 @@ A settings change is one event per setting: `"tool": "policy"`, the setting's na
 - `id`: the device's number for this approval; answers name it.
 - `call`: the JSON-RPC id of the waiting call (`null` for a question that did not come from a portal call).
 - `tool`, `target`: the method's tool (`read`, `write`, `ls`, `exec`, ...) and the path or command, with the elevation password scrubbed out.
+- `cwd`: for a command, the folder it runs in, resolved as the device would run it (the same command means something else in another folder); absent for file calls.
 - `reasons`: why it asks (the mode, a protected path, a command pattern, taint, an always-ask rule, an elevated command).
 - `preview`: for a write, the first 2000 characters of the new content, or "binary content, N bytes".
 - `choices`: the answers the device takes for this call (section 7, `approval.answer`). `max_minutes`: the longest `time` answer.

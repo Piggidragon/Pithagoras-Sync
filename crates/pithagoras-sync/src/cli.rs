@@ -456,6 +456,10 @@ fn approval_text(a: &ApprovalInfo, now: i64) -> String {
     for l in target {
         let _ = writeln!(out, "    > {}", visible(l));
     }
+    // Where a command runs: the same command means something else elsewhere.
+    if let Some(cwd) = &a.cwd {
+        let _ = writeln!(out, "    in: {}", visible(cwd));
+    }
     for r in &a.reasons {
         let _ = writeln!(out, "    why: {}", visible(r));
     }
@@ -1096,6 +1100,7 @@ mod tests {
             chat: "c\x1b[2K".into(),
             tool: "exec".into(),
             target: "cat ~/.bashrc\n#8 chat c: read /w/notes.md\x1b[1A".into(),
+            cwd: Some("/home/u\x1b[2K".into()),
             reasons: vec!["protected\r".into()],
             preview: Some("\x1b[2A\x1b[2K#7 chat c: write /w/notes.md\nline 2\u{9b}".into()),
             choices: vec![Choice::Once, Choice::Deny],
@@ -1118,6 +1123,7 @@ mod tests {
             text.contains("    > #8 chat c: read /w/notes.md\\u{1b}[1A"),
             "{text}"
         );
+        assert!(text.contains("\n    in: /home/u\\u{1b}[2K\n"), "{text}");
     }
 
     #[test]
@@ -1130,6 +1136,7 @@ mod tests {
             chat: "c".into(),
             tool: "write".into(),
             target: "/home/u/.bashrc".into(),
+            cwd: None,
             reasons: vec!["/home/u/.bashrc is a protected path".into()],
             preview: Some(lines.join("\n")),
             choices: vec![Choice::Once, Choice::Deny],

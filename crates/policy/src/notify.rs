@@ -83,8 +83,14 @@ impl NotifyApprover {
                 esc(&clip(&req.target, MAX_TARGET))
             )
         };
+        // Where a command runs; cut like the chat id, the target says the rest.
+        let cwd = req
+            .cwd
+            .as_ref()
+            .map(|c| format!("\nin {}", esc(&clip(c, MAX_TARGET))))
+            .unwrap_or_default();
         let mut body = format!(
-            "Chat {}\n{target}\n{}",
+            "Chat {}\n{target}{cwd}\n{}",
             esc(&clip(&req.chat, MAX_CHAT)),
             esc(&req.reasons.join("; "))
         );

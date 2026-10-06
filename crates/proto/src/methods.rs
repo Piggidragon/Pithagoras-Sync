@@ -407,6 +407,9 @@ pub struct AuditEvent {
     pub chat: Option<String>,
     pub tool: String,
     pub target: String,
+    /// The folder a command runs in (commands only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub decision: String,
     pub reason: Option<String>,
 }
@@ -438,6 +441,9 @@ pub struct ApprovalInfo {
     pub tool: String,
     /// The path or command.
     pub target: String,
+    /// The folder a command runs in (commands only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Why it asks (mode, protected path, pattern, taint, a rule).
     pub reasons: Vec<String>,
     /// The start of what a write puts there.

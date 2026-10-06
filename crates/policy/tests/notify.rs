@@ -177,6 +177,7 @@ fn request(offer_chat: bool) -> ApprovalRequest {
         chat: "chat-1".into(),
         tool: "write".into(),
         target: "/w/<a>".into(),
+        cwd: None,
         reasons: vec!["protected".into()],
         preview: None,
         offer_chat,
@@ -231,6 +232,7 @@ async fn portal_text_cannot_redraw_the_notification() {
         let mut req = request(false);
         req.chat = format!("chat\x1b]0;x\x07{}", "c".repeat(200));
         req.target = target;
+        req.cwd = Some("/w/proj\x1b[1A".into());
         req.preview = Some("line 1\r\x1b[2Aline 2\nline 3".into());
         let answer = tokio::time::timeout(Duration::from_secs(5), approver.ask(&req))
             .await
@@ -243,6 +245,11 @@ async fn portal_text_cannot_redraw_the_notification() {
             seen.body
         );
         assert!(seen.body.contains("line 2\nline 3"), "{:?}", seen.body);
+        assert!(
+            seen.body.contains("\nin /w/proj\\u{1b}[1A\n"),
+            "{:?}",
+            seen.body
+        );
         assert!(
             !seen.body.contains(&"c".repeat(100)),
             "the chat id is not cut"

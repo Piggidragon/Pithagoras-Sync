@@ -277,11 +277,16 @@ async fn pair_run_exec_panic_unlock() {
         .await
         .expect("the portal hears of the approval");
     assert_eq!(asked["target"], "echo approved-run");
+    assert_eq!(asked["cwd"], env.p("home/proj"));
     let listed: Value = serde_json::from_str(&env.ok(&["approvals", "--json"]).await).unwrap();
     let id = listed[0]["id"].as_u64().unwrap();
     assert_eq!(asked["id"], id);
     let out = env.ok(&["approvals"]).await;
     assert!(out.contains("echo approved-run"), "{out}");
+    assert!(
+        out.contains(&format!("in: {}", env.p("home/proj"))),
+        "{out}"
+    );
     env.ok(&["approve", &id.to_string()]).await;
     tokio::time::timeout(WAIT, pending)
         .await

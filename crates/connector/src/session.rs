@@ -150,6 +150,7 @@ pub async fn run(
                         chat: r.chat,
                         tool: r.tool,
                         target: r.target,
+                        cwd: r.cwd,
                         decision: r.decision,
                         reason: r.reason,
                     },

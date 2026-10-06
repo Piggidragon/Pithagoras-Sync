@@ -43,6 +43,8 @@ pub struct ApprovalRequest {
     pub tool: String,
     /// The path or command.
     pub target: String,
+    /// The folder a command runs in (commands only).
+    pub cwd: Option<String>,
     /// Why it asks (mode, protected path, pattern, taint).
     pub reasons: Vec<String>,
     /// A short preview of what a write puts there.
