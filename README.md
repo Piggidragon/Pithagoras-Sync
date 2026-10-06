@@ -65,7 +65,7 @@ sudo -H -u pithagoras-sync pithagoras-sync pair '<uri from the portal>'
 sudo systemctl start pithagoras-sync
 ```
 
-`setup --create-user` creates the user with a locked password and installs the program to `/usr/local/bin` with a system unit; `sudo pithagoras-sync setup --remove` undoes it. For an existing user, use `sudo pithagoras-sync install --system --user <name>`; as your own user without root, use `pithagoras-sync install`, which turns on lingering so the unit runs without a login. Approvals work on a server as anywhere else, through the portal or `pithagoras-sync approve` over ssh.
+`setfacl` comes with the `acl` package, which Debian and Ubuntu leave out (`sudo apt install acl`); `setup` says so when it is missing, and `sudo chown -R pithagoras-sync: /srv/project` works instead where the project need not stay another user's. `setup --create-user` creates the user with a locked password and installs the program to `/usr/local/bin` with a system unit, enabled but not started until you pair (`pair` then names the `systemctl start`); `sudo pithagoras-sync setup --remove` undoes it. For an existing user, use `sudo pithagoras-sync install --system --user <name>`; as your own user without root, use `pithagoras-sync install`, which turns on lingering so the unit runs without a login. Approvals work on a server as anywhere else, through the portal or `pithagoras-sync approve` over ssh.
 
 ## Windows
 

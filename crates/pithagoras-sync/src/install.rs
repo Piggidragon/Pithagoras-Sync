@@ -64,6 +64,23 @@ WantedBy=multi-user.target
     )
 }
 
+/// What `pair` says when no client runs yet: start the unit that exists for
+/// `user` (`setup` enables its system unit but leaves it stopped), or install one.
+pub fn start_hint(system_unit: Option<&str>, user: &str, user_unit: bool) -> String {
+    let runs_as = |unit: &str| {
+        unit.lines()
+            .find_map(|l| l.trim().strip_prefix("User="))
+            .map(|u| u.trim().to_string())
+    };
+    if system_unit.and_then(runs_as).as_deref() == Some(user) {
+        format!("Start it: sudo systemctl start {UNIT_NAME}")
+    } else if user_unit {
+        format!("Start it: systemctl --user start {UNIT_NAME}")
+    } else {
+        "Start it with the machine: pithagoras-sync install".into()
+    }
+}
+
 pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Action> {
     let mut v = vec![
         Action::Copy {
@@ -345,6 +362,32 @@ pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::actions::{Fake, apply};
+
+    #[test]
+    fn pair_names_the_unit_that_exists_for_this_user() {
+        let unit = system_unit(Some("pithagoras-sync"));
+        assert_eq!(
+            start_hint(Some(&unit), "pithagoras-sync", false),
+            "Start it: sudo systemctl start pithagoras-sync.service"
+        );
+        // The system unit is another user's: this one has none yet.
+        assert_eq!(
+            start_hint(Some(&unit), "alice", false),
+            "Start it with the machine: pithagoras-sync install"
+        );
+        assert_eq!(
+            start_hint(Some(&system_unit(None)), "root", false),
+            "Start it: sudo systemctl start pithagoras-sync.service"
+        );
+        assert_eq!(
+            start_hint(None, "alice", true),
+            "Start it: systemctl --user start pithagoras-sync.service"
+        );
+        assert_eq!(
+            start_hint(None, "alice", false),
+            "Start it with the machine: pithagoras-sync install"
+        );
+    }
 
     #[test]
     fn units_run_the_client_with_delegation() {

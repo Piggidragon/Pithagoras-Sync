@@ -673,7 +673,23 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             match control::send(&dirs.socket(), Request::Reload).await {
                 Ok(Some(_)) => println!("The running client connects now."),
-                _ => println!("Start it with the machine: pithagoras-sync install"),
+                _ => {
+                    // The unit `setup` or `install` made for this user, if any.
+                    let linux = cfg!(target_os = "linux");
+                    let system = linux
+                        .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
+                        .flatten();
+                    let user_unit = linux
+                        && info::home().is_some_and(|h| {
+                            h.join(".config/systemd/user")
+                                .join(install::UNIT_NAME)
+                                .is_file()
+                        });
+                    println!(
+                        "{}",
+                        install::start_hint(system.as_deref(), &info::user().0, user_unit)
+                    );
+                }
             }
         }
         Cmd::Unpair => {
@@ -1072,7 +1088,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             apply_plan(&plan)?;
             if create_user {
-                print!("{}", setup::next_steps(&name));
+                print!("{}", setup::next_steps(&name, setup::on_path("setfacl")));
             } else {
                 println!("Removed.");
             }

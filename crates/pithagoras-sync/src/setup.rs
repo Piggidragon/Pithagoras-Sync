@@ -75,12 +75,28 @@ pub fn create_plan(
     Ok(v)
 }
 
-/// What to do after `create_plan` ran.
-pub fn next_steps(name: &str) -> String {
+/// Whether `prog` is a file in one of the `PATH` folders.
+pub fn on_path(prog: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
+}
+
+/// What to do after `create_plan` ran. `setfacl`: whether that program is
+/// installed (Debian and Ubuntu leave it out until the `acl` package is).
+pub fn next_steps(name: &str, setfacl: bool) -> String {
+    let acl = if setfacl {
+        String::new()
+    } else {
+        format!(
+            "     setfacl is not installed: sudo apt install acl (Debian, Ubuntu; elsewhere the acl
+     package), or give the project to the user: sudo chown -R {name}: /path/to/project
+"
+        )
+    };
     format!(
         "Next steps:
   1. Grant folders (ACLs; the user needs x on every parent folder too):
-       sudo setfacl -R -m u:{name}:rwX /path/to/project
+{acl}       sudo setfacl -R -m u:{name}:rwX /path/to/project
        sudo setfacl -R -d -m u:{name}:rwX /path/to/project
        sudo -H -u {name} pithagoras-sync folder add /path/to/project --rw --exec
   2. Pair:  sudo -H -u {name} pithagoras-sync pair '<uri from the portal>'
@@ -177,6 +193,21 @@ mod tests {
         let unit = std::fs::read_to_string(root.path().join("etc/systemd/system").join(UNIT_NAME))
             .unwrap();
         assert!(unit.contains("User=pithagoras-sync"));
+    }
+
+    #[test]
+    fn next_steps_say_when_setfacl_is_missing() {
+        let with = next_steps("ps", true);
+        assert!(with.contains("sudo setfacl -R -m u:ps:rwX"), "{with}");
+        assert!(!with.contains("apt install acl"), "{with}");
+        let without = next_steps("ps", false);
+        assert!(without.contains("sudo apt install acl"), "{without}");
+        assert!(
+            without.contains("sudo chown -R ps: /path/to/project"),
+            "{without}"
+        );
+        assert!(on_path("sh"));
+        assert!(!on_path("no-such-program-pithagoras-sync-test"));
     }
 
     #[test]
