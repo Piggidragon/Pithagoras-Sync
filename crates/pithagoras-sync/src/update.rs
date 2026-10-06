@@ -657,7 +657,9 @@ pub fn restart_system_unit(
         Some(Runs::Other(p)) => {
             return Some(format!(
                 "{UNIT_NAME} runs {}, not {}, so it was not restarted. Once it should run {}: sudo systemctl restart {UNIT_NAME}",
-                p.display(),
+                // Named by the unit's process, so escaped like other text from
+                // outside: it cannot redraw root's terminal.
+                sync_policy::approve::visible(&p.to_string_lossy()),
                 exe.display(),
                 exe.display()
             ));
@@ -1262,6 +1264,21 @@ mod tests {
         let said =
             restart_system_unit(&r, exe, true, Some(1111), |_| Some(Runs::Replaced)).unwrap();
         assert!(said.starts_with("Restarted"), "{said}");
+    }
+
+    #[test]
+    fn the_program_another_process_runs_is_shown_escaped() {
+        let exe = Path::new("/usr/local/bin/pithagoras-sync");
+        let r = crate::actions::Fake {
+            answers: vec![("systemctl show".into(), Ok("4242\n".into()))],
+            ..Default::default()
+        };
+        let said = restart_system_unit(&r, exe, false, None, |_| {
+            Some(Runs::Other(PathBuf::from("/tmp/x\x1b[2K\rRestarted")))
+        })
+        .unwrap();
+        assert!(!said.contains('\x1b') && !said.contains('\r'), "{said:?}");
+        assert!(said.contains("/tmp/x\\u{1b}[2K\\rRestarted"), "{said:?}");
     }
 
     #[test]
