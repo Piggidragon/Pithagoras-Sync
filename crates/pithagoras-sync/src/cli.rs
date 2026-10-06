@@ -1782,7 +1782,8 @@ pub(crate) fn install_plan(
 pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     if cfg!(windows) {
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
-        return Ok(install::windows_uninstall_plan(&local));
+        let task = install::task_installed(&actions::System);
+        return Ok(install::windows_uninstall_plan(&local, task));
     }
     if system {
         if !is_root() {

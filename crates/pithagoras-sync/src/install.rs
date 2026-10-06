@@ -577,21 +577,26 @@ pub fn windows_stop_plan() -> Vec<Action> {
     ]
 }
 
-pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
+/// `task`: whether the logon task is there (`task_installed`). Without it
+/// there is nothing to end or delete, and `uninstall` again succeeds.
+pub fn windows_uninstall_plan(local_app_data: &str, task: bool) -> Vec<Action> {
     let base = local_app_data.trim_end_matches('\\');
-    let mut plan = vec![
-        Action::Try {
-            argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            // Not running (every first install): no news, no note.
-            hint: String::new(),
-        },
-        Action::Run {
-            argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
-        },
-        Action::Remove {
-            path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
-        },
-    ];
+    let mut plan = Vec::new();
+    if task {
+        plan.extend([
+            Action::Try {
+                argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
+                // Not running (every first install): no news, no note.
+                hint: String::new(),
+            },
+            Action::Run {
+                argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
+            },
+        ]);
+    }
+    plan.push(Action::Remove {
+        path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
+    });
     plan.extend(windows_link_uninstall_plan());
     plan
 }
@@ -882,7 +887,7 @@ mod tests {
             apply(&install, root.path(), &fake).unwrap(),
             ["`schtasks /Run` failed: it starts at the next logon"]
         );
-        for plan in [windows_stop_plan(), windows_uninstall_plan(r"C:\x")] {
+        for plan in [windows_stop_plan(), windows_uninstall_plan(r"C:\x", true)] {
             assert_eq!(
                 apply(&tries(plan), root.path(), &fake).unwrap(),
                 Vec::<String>::new()
@@ -937,13 +942,26 @@ mod tests {
                 .describe()
                 .starts_with(r"set HKCU\Software\Classes\pithagoras-sync")
         );
-        let un = windows_uninstall_plan(r"C:\Users\ann\AppData\Local");
+        let un = windows_uninstall_plan(r"C:\Users\ann\AppData\Local", true);
         assert_eq!(
             un.last(),
             Some(&Action::RegDelete {
                 key: r"Software\Classes\pithagoras-sync".into()
             })
         );
+        let schtasks = |plan: &[Action]| -> Vec<String> {
+            plan.iter()
+                .filter_map(|a| match a {
+                    Action::Try { argv, .. } | Action::Run { argv } => Some(argv[1].clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(schtasks(&un), ["/End", "/Delete"]);
+        // Uninstalled already: nothing for schtasks to fail on, the rest again.
+        let again = windows_uninstall_plan(r"C:\Users\ann\AppData\Local", false);
+        assert!(schtasks(&again).is_empty(), "{again:?}");
+        assert_eq!(again[..], un[2..]);
         // The real runner refuses the registry off Windows rather than doing
         // something else.
         #[cfg(not(windows))]
