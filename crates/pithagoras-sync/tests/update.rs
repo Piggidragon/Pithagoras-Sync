@@ -391,6 +391,31 @@ async fn a_program_is_never_taken_below_what_this_user_installed() {
     assert!(check(manifest, fresh).await.is_ok());
 }
 
+/// A program reached through a link (/usr/local/bin/pithagoras-sync leading to
+/// /opt/...): the file it leads to is replaced and the link stays, so the
+/// program's record of releases is found again at the next update.
+#[tokio::test]
+async fn a_linked_program_keeps_its_link_and_its_record() {
+    let r = Release::new();
+    let dirs = sync_policy::config::Dirs::under(&r.dir.join("cfg"));
+    let real = r.installed();
+    let link = r.dir.join("link-to-pithagoras-sync");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let record = dirs.update_seen_file(&link);
+    let manifest = r.publish("0.2.0", &program("0.2.0"), None);
+    let plan = check(&manifest, &r.pk(), "0.1.0").await.unwrap().unwrap();
+    update::install(&plan, &link).await.unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&real).unwrap(), program("0.2.0"));
+    assert_eq!(dirs.update_seen_file(&link), record);
+    assert!(leftovers(real.parent().unwrap()).is_empty());
+}
+
 /// A release made the way `.github/workflows/release.yml` makes it, with
 /// `sync-release manifest` and `sync-release sign`: the client takes it.
 #[tokio::test]

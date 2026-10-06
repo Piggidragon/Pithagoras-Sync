@@ -422,8 +422,12 @@ pub fn runs_other_file(pid: u32, exe: &Path) -> bool {
 /// Downloads the binary, checks it against the manifest and that it runs and
 /// reports the new version, then puts it in place of `exe` in one rename. On
 /// Windows, where a running program cannot be replaced, the old one is moved
-/// aside to `<exe>.old` first.
+/// aside to `<exe>.old` first. A link to the program stays a link: the file it
+/// leads to is replaced, so the program keeps its path, and with it its record
+/// of the releases taken.
 pub async fn install(plan: &Plan, exe: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let exe = &std::fs::canonicalize(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let data = fetch(&plan.source, plan.artifact.size).await?;
     if data.len() as u64 != plan.artifact.size {
         return Err(format!(
