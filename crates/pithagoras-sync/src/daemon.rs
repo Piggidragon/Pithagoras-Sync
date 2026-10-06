@@ -419,10 +419,14 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),
             },
-            Request::Approvals => Reply {
-                approvals: Some(self.queue.list()),
-                ..Reply::ok()
-            },
+            Request::Approvals => {
+                let (list, left_out) = self.queue.list_within();
+                Reply {
+                    approvals: Some(list),
+                    left_out: (left_out > 0).then_some(left_out),
+                    ..Reply::ok()
+                }
+            }
             Request::Answer {
                 id,
                 answer,

@@ -470,16 +470,26 @@ fn approval_text(a: &ApprovalInfo, now: i64) -> String {
             let _ = writeln!(out, "    | {}", visible(l));
         }
     }
+    if a.cut {
+        let _ = writeln!(
+            out,
+            "    (too long to show whole, so it can only be denied)"
+        );
+    }
     let more = if a.choices.contains(&Choice::Chat) {
         format!(", --chat or --minutes 1..{}", a.max_minutes)
     } else {
         String::new()
     };
-    let _ = writeln!(
-        out,
-        "    approve {}{more} or deny {}; denied in {secs}s",
-        a.id, a.id
-    );
+    if a.choices.contains(&Choice::Once) {
+        let _ = writeln!(
+            out,
+            "    approve {}{more} or deny {}; denied in {secs}s",
+            a.id, a.id
+        );
+    } else {
+        let _ = writeln!(out, "    deny {}; denied in {secs}s", a.id);
+    }
     out
 }
 
@@ -824,10 +834,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Approvals { json } => {
             owner::not_from_own_command(&dirs).await?;
-            let list = to_running(&dirs, Request::Approvals)
-                .await?
-                .approvals
-                .unwrap_or_default();
+            let reply = to_running(&dirs, Request::Approvals).await?;
+            let list = reply.approvals.unwrap_or_default();
             if json {
                 println!(
                     "{}",
@@ -838,6 +846,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             if !json {
                 list.iter().for_each(print_approval);
+                if let Some(n) = reply.left_out {
+                    println!(
+                        "{n} more waiting, left out because the list is too long to show at once; answer some of these first"
+                    );
+                }
             }
         }
         Cmd::Approve { id, chat, minutes } => {
@@ -1107,6 +1120,7 @@ mod tests {
             max_minutes: 60,
             created_ms: 0,
             expires_ms: 0,
+            cut: false,
         };
         let text = approval_text(&a, 0);
         assert!(
@@ -1143,6 +1157,7 @@ mod tests {
             max_minutes: 60,
             created_ms: 0,
             expires_ms: 0,
+            cut: false,
         };
         let text = approval_text(&a, 0);
         for l in &lines {

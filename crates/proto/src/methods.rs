@@ -428,6 +428,15 @@ pub enum Choice {
     Deny,
 }
 
+/// Longest command or path (and folder) an approval shows. A longer one is shown
+/// cut, says `cut`, and takes only `deny`: nobody could read what they allow.
+pub const MAX_APPROVAL_TEXT: usize = 64 * 1024;
+/// Longest reason an approval shows.
+pub const MAX_APPROVAL_REASON: usize = 4096;
+/// Most bytes of JSON one `approval.list` answer (or the local `approvals`) holds,
+/// well below the 4 MiB message limit; approvals past it are left out and counted.
+pub const MAX_APPROVAL_LIST: usize = 3 << 20;
+
 /// Device to portal (`approval.requested`), and what `approval.list` and the local
 /// `approvals` command show: a call waits for the owner's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -455,6 +464,36 @@ pub struct ApprovalInfo {
     pub created_ms: i64,
     /// When the device stops waiting and applies its timeout answer.
     pub expires_ms: i64,
+    /// The target or folder is longer than `MAX_APPROVAL_TEXT` and shown cut; such
+    /// an approval takes only `deny`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+}
+
+impl ApprovalInfo {
+    /// This approval as it is shown and sent: target and folder cut at
+    /// `MAX_APPROVAL_TEXT`, each reason at `MAX_APPROVAL_REASON` bytes.
+    pub fn shown(&self) -> ApprovalInfo {
+        let mut a = self.clone();
+        a.target = cut_text(&a.target, MAX_APPROVAL_TEXT);
+        a.cwd = a.cwd.map(|c| cut_text(&c, MAX_APPROVAL_TEXT));
+        for r in &mut a.reasons {
+            *r = cut_text(r, MAX_APPROVAL_REASON);
+        }
+        a
+    }
+}
+
+/// `s` cut at a char boundary to at most `max` bytes, with `…` when cut.
+fn cut_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max - '…'.len_utf8();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Device to portal (`approval.resolved`): an approval was answered, timed out or
@@ -483,6 +522,13 @@ pub struct ApprovalAnswerParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalListResult {
     pub approvals: Vec<ApprovalInfo>,
+    /// Approvals left out because the answer would pass `MAX_APPROVAL_LIST`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub left_out: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// `policy.set`: the whole settings document as `policy.get` returned it, changed.

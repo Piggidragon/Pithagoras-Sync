@@ -96,6 +96,9 @@ pub struct Reply {
     pub status: Option<Status>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvals: Option<Vec<ApprovalInfo>>,
+    /// Approvals left out of `approvals` to keep the answer small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<usize>,
 }
 
 impl Reply {
@@ -105,6 +108,7 @@ impl Reply {
             error: None,
             status: None,
             approvals: None,
+            left_out: None,
         }
     }
 
@@ -114,6 +118,7 @@ impl Reply {
             error: Some(e.into()),
             status: None,
             approvals: None,
+            left_out: None,
         }
     }
 }
@@ -156,7 +161,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Resu
     wipe(text);
     w.flush().await.map_err(|e| e.to_string())?;
     let mut line = String::new();
-    let mut r = BufReader::new(r).take(1 << 20);
+    // Room for the approvals list (`MAX_APPROVAL_LIST`) and its escapes.
+    let mut r = BufReader::new(r).take(4 << 20);
     tokio::time::timeout(Duration::from_secs(30), r.read_line(&mut line))
         .await
         .map_err(|_| "the client did not answer".to_string())?

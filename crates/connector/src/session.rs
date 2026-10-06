@@ -514,8 +514,10 @@ async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| unknown(method))?;
             parse::<EmptyParams>(params)?;
+            let (approvals, left_out) = queue.list_within();
             to_value(ApprovalListResult {
-                approvals: queue.list(),
+                approvals,
+                left_out,
             })
         }
         POLICY_GET => {

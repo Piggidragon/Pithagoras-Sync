@@ -332,7 +332,7 @@ Result: `{}`. An approval that is not waiting (answered, timed out, withdrawn, u
 
 ### `approval.list`
 
-The approvals waiting now, for a Devices tab opened after they were asked. Approvals belong to the calls of the current connection: when it ends, the calls end and their approvals are withdrawn (`approval.resolved` with `by: "withdrawn"` goes nowhere then, so the portal drops them itself). Only with `approvals` in `hello`. Params: `{}`. Result: `{"approvals": [<ApprovalInfo>...]}`, each as in `approval.requested`.
+The approvals waiting now, for a Devices tab opened after they were asked. Approvals belong to the calls of the current connection: when it ends, the calls end and their approvals are withdrawn (`approval.resolved` with `by: "withdrawn"` goes nowhere then, so the portal drops them itself). Only with `approvals` in `hello`. Params: `{}`. Result: `{"approvals": [<ApprovalInfo>...], "left_out": 2}`, each as in `approval.requested`. The answer holds at most about 3 MiB of JSON; approvals past that are left out and counted in `left_out` (absent when none are), and come in as the ones before them are answered.
 
 ### `policy.get`
 
@@ -444,6 +444,7 @@ A settings change is one event per setting: `"tool": "policy"`, the setting's na
 - `reasons`: why it asks (the mode, a protected path, a command pattern, taint, an always-ask rule, an elevated command).
 - `preview`: for a write, the first 2000 characters of the new content, or "binary content, N bytes".
 - `choices`: the answers the device takes for this call (section 7, `approval.answer`). `max_minutes`: the longest `time` answer.
+- `cut`: present and `true` when the command or path (or the folder) is longer than 64 KiB. They are then shown cut at 64 KiB, ending in `…`, and `choices` is only `deny`: nobody could read whole what they would allow. Each reason is cut at 4 KiB.
 - `expires_ms`: when the device stops waiting. Nobody answering by then is a denial (`DENIED`, "no answer to the approval within 120s"), unless the owner set `policy.approvals.on_timeout = "allow"`.
 
 `approval.resolved`: an approval ended, however it ended, so every view of it can close.
@@ -487,6 +488,7 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | One `fs.list`, `fs.grep` or `fs.find` answer | about 3 MiB of JSON, context lines included; past it the answer stops with `truncated: true` |
 | Chat id (`ctx.chat`, `grant.end`) | 256 bytes, no control characters (else `INVALID_PARAMS`); the device keeps state for 4096 chats, forgetting the one unused longest |
 | Audit record | target and reason cut at 4 KiB, chat id at 256 bytes |
+| Approval text | command or path and folder 64 KiB (longer: cut, deny only), each reason 4 KiB; `approval.list` about 3 MiB, the rest counted in `left_out` |
 | Approval timeout | 120 s (config `policy.approvals.timeout_secs`, 1 to 3600) |
 | Ping / dead | 20 s / 45 s |
 | Backoff | 1 s to 60 s |

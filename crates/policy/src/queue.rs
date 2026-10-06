@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use sync_proto::methods::{ApprovalInfo, ApprovalResolved, Choice};
+use sync_proto::methods::{
+    ApprovalInfo, ApprovalResolved, Choice, MAX_APPROVAL_LIST, MAX_APPROVAL_TEXT,
+};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::approve::{Answer, ApprovalRequest, Approver, BoxFuture};
@@ -66,10 +68,29 @@ impl ApprovalQueue {
         self.events.subscribe()
     }
 
-    /// The approvals waiting now, oldest first.
+    /// The approvals waiting now, oldest first, as they are shown (cut).
     pub fn list(&self) -> Vec<ApprovalInfo> {
         let inner = self.inner.lock().unwrap();
-        inner.pending.values().map(|p| p.info.clone()).collect()
+        inner.pending.values().map(|p| p.info.shown()).collect()
+    }
+
+    /// `list` as far as `MAX_APPROVAL_LIST` bytes of JSON hold it, so it fits one
+    /// message; and how many approvals were left out.
+    pub fn list_within(&self) -> (Vec<ApprovalInfo>, usize) {
+        let all = self.list();
+        let total = all.len();
+        let mut used = 0usize;
+        let mut out = Vec::new();
+        for a in all {
+            let n = serde_json::to_string(&a).map_or(usize::MAX, |s| s.len() + 1);
+            if used.saturating_add(n) > MAX_APPROVAL_LIST {
+                break;
+            }
+            used += n;
+            out.push(a);
+        }
+        let left_out = total - out.len();
+        (out, left_out)
     }
 
     /// Answers approval `id`. `by` says who (`portal`, `device`, ...) for the
@@ -184,7 +205,15 @@ impl Approver for ApprovalQueue {
     fn ask<'a>(&'a self, req: &'a ApprovalRequest) -> BoxFuture<'a, Answer> {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
-            let choices = if req.offer_chat {
+            // What nobody can read whole cannot be allowed, from anywhere.
+            let cut = req.target.len() > MAX_APPROVAL_TEXT
+                || req
+                    .cwd
+                    .as_ref()
+                    .is_some_and(|c| c.len() > MAX_APPROVAL_TEXT);
+            let choices = if cut {
+                vec![Choice::Deny]
+            } else if req.offer_chat {
                 vec![Choice::Once, Choice::Chat, Choice::Time, Choice::Deny]
             } else {
                 vec![Choice::Once, Choice::Deny]
@@ -206,6 +235,7 @@ impl Approver for ApprovalQueue {
                     max_minutes: req.max_minutes,
                     created_ms: (self.clock)(),
                     expires_ms: req.expires_ms,
+                    cut,
                 };
                 inner.pending.insert(
                     id,
@@ -222,7 +252,7 @@ impl Approver for ApprovalQueue {
                 expires_ms: req.expires_ms,
                 on_timeout_allow: req.on_timeout_allow,
             };
-            let _ = self.events.send(ApprovalEvent::Requested(info));
+            let _ = self.events.send(ApprovalEvent::Requested(info.shown()));
             rx.await.unwrap_or(Answer::Deny)
         })
     }
@@ -307,6 +337,57 @@ mod tests {
         };
         let (answer, ()) = tokio::join!(ask, waiter);
         assert_eq!(answer, Answer::Deny);
+    }
+
+    #[tokio::test]
+    async fn long_targets_are_cut_and_the_list_fits_one_message() {
+        use sync_proto::methods::ApprovalListResult;
+        let q = queue();
+        let mut ev = q.subscribe();
+        // Two heredocs of 2.5 MiB, and twenty commands whose 64 KiB of control
+        // characters take six times as much as JSON escapes.
+        let mut reqs = Vec::new();
+        for i in 0..22 {
+            let mut r = req(true);
+            r.tool = "exec".into();
+            r.target = if i < 2 {
+                "x".repeat(5 << 19)
+            } else {
+                "\u{1}".repeat(MAX_APPROVAL_TEXT)
+            };
+            reqs.push(r);
+        }
+        let asks = futures_util::future::join_all(reqs.iter().map(|r| q.ask(r)));
+        let check = async {
+            let mut seen = Vec::new();
+            while seen.len() < reqs.len() {
+                if let ApprovalEvent::Requested(i) = ev.recv().await.unwrap() {
+                    seen.push(i);
+                }
+            }
+            let big = seen.iter().find(|i| i.target.starts_with('x')).unwrap();
+            assert!(big.cut && big.target.len() <= MAX_APPROVAL_TEXT);
+            assert_eq!(big.choices, [Choice::Deny]);
+            assert!(matches!(
+                q.answer(big.id, Choice::Once, None, "portal"),
+                Err(AnswerError::Invalid(_))
+            ));
+            // Exactly at the limit: shown whole, and it may be allowed.
+            let whole = seen.iter().find(|i| i.target.starts_with('\u{1}')).unwrap();
+            assert!(!whole.cut && whole.choices.contains(&Choice::Once));
+            let (approvals, left_out) = q.list_within();
+            assert!(left_out > 0 && !approvals.is_empty());
+            assert_eq!(approvals.len() + left_out, reqs.len());
+            let json = serde_json::to_string(&ApprovalListResult {
+                approvals,
+                left_out,
+            })
+            .unwrap();
+            assert!(json.len() <= MAX_APPROVAL_LIST, "{}", json.len());
+            q.cancel_all();
+        };
+        let (answers, ()) = tokio::join!(asks, check);
+        assert!(answers.iter().all(|a| *a == Answer::Deny));
     }
 
     #[tokio::test]
