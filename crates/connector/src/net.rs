@@ -127,6 +127,11 @@ fn check_local_peer(tcp: &TcpStream) -> Result<(), String> {
         tcp.local_addr().map_err(|e| e.to_string())?,
         tcp.peer_addr().map_err(|e| e.to_string())?,
     );
+    // A test plays the listener of another user, which needs a second account.
+    #[cfg(test)]
+    if let Some(owner) = tests::FAKE_OWNER.with(std::cell::Cell::get) {
+        return owner_verdict(owner, sync_ops::info::euid(), peer);
+    }
     owner_verdict(peer_owner(local, peer), sync_ops::info::euid(), peer)
 }
 
@@ -185,6 +190,15 @@ pub async fn open(url: &PortalUrl, pin: Option<&str>) -> Result<BoxIo, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        /// The owner `check_local_peer` finds instead of the real one, on this
+        /// thread (a `#[tokio::test]` runs on one): `Some(None)` for an owner it
+        /// cannot tell.
+        pub(super) static FAKE_OWNER: std::cell::Cell<Option<Option<u32>>> =
+            const { std::cell::Cell::new(None) };
+    }
 
     fn a(s: &str) -> SocketAddr {
         s.parse().unwrap()
@@ -295,5 +309,30 @@ mod tests {
             Ok(())
         );
         assert_eq!(open_ok(format!("http://127.0.0.1:{port}")).await, Ok(()));
+    }
+
+    /// `open` hands out no plain-http connection that another user's program
+    /// answers, or one whose owner it cannot tell; TLS is not checked.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn plain_http_is_refused_when_another_user_answers() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = PortalUrl::parse(&format!(
+            "http://127.0.0.1:{}",
+            l.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let me = sync_ops::info::euid();
+        for (owner, refused) in [
+            (Some(me + 1), true),
+            (None, true),
+            (Some(me), false),
+            (Some(0), false),
+        ] {
+            FAKE_OWNER.with(|f| f.set(Some(owner)));
+            let got = open(&url, None).await;
+            FAKE_OWNER.with(|f| f.set(None));
+            assert_eq!(got.is_err(), refused, "owner {owner:?}");
+        }
     }
 }
