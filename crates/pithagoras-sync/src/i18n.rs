@@ -787,6 +787,14 @@ impl Lang {
         use std::fmt::Write;
         let mut out = String::new();
         let client = match &s.link {
+            // An update restarted it a moment ago: the new process is up, but
+            // its control channel is not, so it counts for a silent one too.
+            None if s.restarting => self
+                .pick(
+                    "restarting, it is back within a minute",
+                    "startet neu, in höchstens einer Minute wieder da",
+                )
+                .to_string(),
             None if s.silent => self
                 .pick(
                     "running, but it did not answer",
@@ -858,8 +866,22 @@ impl Lang {
                 )
             );
         }
-        if let Some(on) = s.sudo {
-            let _ = writeln!(out, "{}: {}", self.label("sudo"), self.on_off(on));
+        if let Some(sudo) = s.sudo {
+            let on = self.on_off(sudo.active);
+            // Switched on in the settings, but the client lost the password
+            // (a restart drops one kept in memory): sudo commands cannot run.
+            let line = if sudo.active && !sudo.password {
+                format!(
+                    "{on}, {}",
+                    self.pick(
+                        "but no password is stored: enter it again under Sudo access",
+                        "aber kein Passwort gespeichert: gib es unter Sudo-Zugriff erneut ein",
+                    )
+                )
+            } else {
+                on.to_string()
+            };
+            let _ = writeln!(out, "{}: {line}", self.label("sudo"));
         }
         if let Some(p) = &s.problem {
             let _ = writeln!(out, "{}: {p}", self.pick("Problem", "Problem"));

@@ -27,7 +27,7 @@ use sync_proto::methods::FolderInfo;
 
 use crate::cli::{Asked, Changed, Kept, Update, UpdateNote};
 use crate::dialogs::{
-    Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines,
+    Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines, shown_url,
 };
 use crate::i18n::{InstallPair, Lang};
 use crate::secrets::SudoCheck;
@@ -38,6 +38,11 @@ pub const LINK_WAIT: Duration = Duration::from_secs(10);
 /// How long the menu waits for the client's status before it shows the
 /// settings instead: a client that hangs does not hold the menu up.
 const STATUS_WAIT: Duration = Duration::from_secs(2);
+
+/// How long after an update restarted the client the menu calls one that does
+/// not answer "restarting", not "not running": the unit starts it again after
+/// 5 seconds, the logon task within a minute.
+const CLIENT_RESTART: Duration = Duration::from_secs(60);
 
 /// Whether the link came up after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +91,8 @@ pub struct StatusView {
     pub link: Option<(LinkState, Option<String>)>,
     /// A client runs but did not answer in time: the rest is the settings'.
     pub silent: bool,
+    /// An update restarted the client a moment ago, and it is not back yet.
+    pub restarting: bool,
     /// The portal's URL and this device's name there.
     pub portal: Option<(String, String)>,
     pub paused: bool,
@@ -94,8 +101,9 @@ pub struct StatusView {
     pub full_left_ms: Option<i64>,
     pub folders: Vec<FolderInfo>,
     pub approvals_waiting: usize,
-    /// Whether sudo access is on, where there is sudo access to set up.
-    pub sudo: Option<bool>,
+    /// Whether sudo access is on and a password is stored, where there is
+    /// sudo access to set up.
+    pub sudo: Option<SudoState>,
     /// The settings could not be read.
     pub problem: Option<String>,
 }
@@ -209,7 +217,7 @@ fn usable(t: Lang, u: PairUri) -> Result<PairUri, String> {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.to_canonical().is_loopback());
     if !u.portal.tls && !local {
-        return Err(t.link_plain_http(&shown(&u.portal.to_string())));
+        return Err(t.link_plain_http(&shown_url(&u.portal.to_string())));
     }
     Ok(u)
 }
@@ -399,9 +407,9 @@ async fn install(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<PairUri>)
             .and_then(Result::ok)
     });
     if let Some(u) = link {
-        let portal = shown(&u.portal.to_string());
+        let portal = shown_url(&u.portal.to_string());
         let name = shown(&h.device_name());
-        let old = h.paired().map(|o| shown(&o));
+        let old = h.paired().map(|o| shown_url(&o));
         let mut q = t.install_pair_question(
             &user,
             path.as_deref(),
@@ -471,7 +479,7 @@ async fn ask_link(d: &dyn Dialogs, h: &impl Host, t: Lang, install: bool) -> Out
         (d.style() == Style::Forms && h.owner_password_needed()).then(|| shown(&h.account()));
     let text = if install {
         let (user, path) = h.install_target();
-        let old = h.paired().map(|o| shown(&o));
+        let old = h.paired().map(|o| shown_url(&o));
         t.install_form_text(
             &shown(&user),
             path.map(|p| shown(&p)).as_deref(),
@@ -563,12 +571,12 @@ async fn confirm_and_pair(
     install: bool,
     password: Option<Secret>,
 ) -> Outcome {
-    let portal = shown(&uri.portal.to_string());
+    let portal = shown_url(&uri.portal.to_string());
     let name = shown(&h.device_name());
     let pinned = uri.spki.is_some();
     let mode = h.pair_mode();
     let mut q = match h.paired() {
-        Some(old) => t.replace_question(&shown(&old), &portal, &name, pinned, mode),
+        Some(old) => t.replace_question(&shown_url(&old), &portal, &name, pinned, mode),
         None => t.pair_question(&portal, &name, pinned, mode),
     };
     // Only a portal on this computer gets this far over plain http (`parse`).
@@ -660,7 +668,7 @@ async fn owner_password(
             Some(pw) => pw,
             None if d.style() == Style::Forms => {
                 let text = t.password_again_text(
-                    &shown(&uri.portal.to_string()),
+                    &shown_url(&uri.portal.to_string()),
                     &shown(&h.device_name()),
                     &account,
                 );
@@ -730,7 +738,7 @@ fn link_of(u: &PairUri) -> String {
 async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang, notes: &[String]) -> Outcome {
     let log = shown(&t.log_place(&h.log_place()));
     let mut text = match h.wait_for_link().await {
-        Link::Connected(portal) => t.connected(&shown(&portal), &log),
+        Link::Connected(portal) => t.connected(&shown_url(&portal), &log),
         Link::Down(state, detail) => {
             let why = t.link_state(state, detail.map(|d| shown(&d)).as_deref());
             t.not_connected(&why, &log)
@@ -760,10 +768,19 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         ok: t.open_button(),
         cancel: t.close_button(),
     };
+    // Until when a client that does not answer is on its way back from the
+    // restart of an update.
+    let mut restarting: Option<std::time::Instant> = None;
     loop {
+        let mut view = h.status().await;
+        if view.link.is_some() {
+            restarting = None;
+        } else {
+            view.restarting = restarting.is_some_and(|until| std::time::Instant::now() < until);
+        }
         // Every value in the status is escaped already.
-        let status = t.status(&h.status().await);
-        let text = t.menu_text(&shown(&h.paired().unwrap_or_default()), &status);
+        let status = t.status(&view);
+        let text = t.menu_text(&shown_url(&h.paired().unwrap_or_default()), &status);
         match d.menu(&text, &items, buttons) {
             None => return Outcome::Done,
             Some("pair") => {
@@ -775,7 +792,9 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
                 sudo_menu(d, h, t).await;
             }
             Some("update") => {
-                update(d, h, t).await;
+                if update(d, h, t).await {
+                    restarting = Some(std::time::Instant::now() + CLIENT_RESTART);
+                }
             }
             Some("log") => {
                 if let Err(e) = h.open_log() {
@@ -794,18 +813,29 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     }
 }
 
+/// A folder the running client reported, as the status shows it. The client
+/// reports it in the portal's form (`/c/Users/x`); the config's is the
+/// computer's own, and so is what the owner typed.
+fn reported_folder(f: &FolderInfo) -> FolderInfo {
+    FolderInfo {
+        path: shown(&sync_policy::paths::wire_for_display(&f.path)),
+        ..f.clone()
+    }
+}
+
 /// `update`: what `update --check` finds, and on a Yes the update to that
 /// version. The release is checked as the command checks it (signed by the
-/// key built in, no older release served again).
-async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+/// key built in, no older release served again). Whether the client was
+/// restarted, which the menu says until it is back.
+async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> bool {
     if !owner_ok(d, h, t).await {
-        return Outcome::Failed;
+        return false;
     }
     let found = match h.update_check().await {
         Ok(u) => u,
         Err(e) => {
             d.error(&t.update_failed(&shown(&e)));
-            return Outcome::Failed;
+            return false;
         }
     };
     let current = shown(&found.current);
@@ -814,7 +844,7 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     let asked = match (&version, &found.stale_client) {
         (Some(v), _) => {
             if !d.question(&t.update_question(v, &released, &current, found.client)) {
-                return Outcome::Cancelled;
+                return false;
             }
             Asked::Release(found.available.as_deref().unwrap_or_default())
         }
@@ -822,23 +852,23 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         // replaced: a restart is what is left to do.
         (None, Some(old)) => {
             if !d.question(&t.restart_question(&current, &released, &shown(old))) {
-                return Outcome::Cancelled;
+                return false;
             }
             Asked::Restart
         }
         (None, None) => {
             d.info(&t.up_to_date(&current, &released));
-            return Outcome::Done;
+            return false;
         }
     };
     if !owner_ok(d, h, t).await {
-        return Outcome::Failed;
+        return false;
     }
     let done = match h.update(asked).await {
         Ok(u) => u,
         Err(e) => {
             d.error(&t.update_failed(&shown(&e)));
-            return Outcome::Failed;
+            return false;
         }
     };
     if let Some(c) = &done.changed {
@@ -847,7 +877,7 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             Changed::Gone(v) => t.release_gone(&shown(v)),
             Changed::Offered(v) => t.release_offered(&shown(v)),
         });
-        return Outcome::Failed;
+        return false;
     }
     let (error, text) = match (&done.installed, &done.stale_client) {
         (Some(v), _) => (false, t.updated(&shown(v), done.restarted)),
@@ -863,11 +893,10 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     }
     if error {
         d.error(&text);
-        Outcome::Failed
     } else {
         d.info(&text);
-        Outcome::Done
     }
+    done.restarted
 }
 
 /// A note of `update` in the window's language, escaped. What systemd said
@@ -1227,14 +1256,6 @@ impl Host for RealHost {
         use sync_policy::config::Elevation;
         let now = sync_policy::system_clock()();
         let cfg = crate::cli::load_config(&self.dirs);
-        let sudo = self.sudo_available().then(|| {
-            cfg.as_ref()
-                .is_ok_and(|c| c.policy.privilege.elevation == Elevation::Sudo)
-        });
-        let folder = |f: &FolderInfo| FolderInfo {
-            path: shown(&f.path),
-            ..f.clone()
-        };
         let reply = tokio::time::timeout(
             STATUS_WAIT,
             control::send(&self.dirs.socket(), Request::Status),
@@ -1242,17 +1263,43 @@ impl Host for RealHost {
         .await;
         // No answer in time, or none at all from a client that is there.
         let silent = matches!(reply, Err(_) | Ok(Err(_)));
+        // Sudo access is on in the settings, but the client only has the
+        // password while it runs and was given it: a restart drops one kept
+        // in memory. The running client says; for one that does not answer,
+        // the place the password would be loaded from does.
+        let sudo = if self.sudo_available() {
+            let privilege = cfg.as_ref().ok().map(|c| &c.policy.privilege);
+            let active = privilege.is_some_and(|p| p.elevation == Elevation::Sudo);
+            let held = match &reply {
+                Ok(Ok(Some(r))) => r.status.as_ref().map(|s| s.elevation_password),
+                _ => None,
+            };
+            let password = match (held, privilege) {
+                (Some(held), _) => held,
+                (None, Some(p)) if active => {
+                    crate::cli::password_kept(&self.dirs, p.secret_storage).await
+                }
+                _ => false,
+            };
+            Some(SudoState { active, password })
+        } else {
+            None
+        };
         if let Ok(Ok(Some(r))) = reply
             && let Some(s) = r.status
         {
             return StatusView {
                 link: Some((s.link.state, s.link.detail.as_deref().map(shown))),
                 silent: false,
-                portal: s.portal.zip(s.name).map(|(p, n)| (shown(&p), shown(&n))),
+                restarting: false,
+                portal: s
+                    .portal
+                    .zip(s.name)
+                    .map(|(p, n)| (shown_url(&p), shown(&n))),
                 paused: s.paused,
                 mode: s.mode,
                 full_left_ms: s.mode_expires_ms.map(|t| t - now),
-                folders: s.folders.iter().map(folder).collect(),
+                folders: s.folders.iter().map(reported_folder).collect(),
                 approvals_waiting: s.approvals_waiting,
                 sudo,
                 problem: None,
@@ -1262,7 +1309,11 @@ impl Host for RealHost {
             Ok(c) => StatusView {
                 link: None,
                 silent,
-                portal: c.portal.as_ref().map(|p| (shown(&p.url), shown(&p.name))),
+                restarting: false,
+                portal: c
+                    .portal
+                    .as_ref()
+                    .map(|p| (shown_url(&p.url), shown(&p.name))),
                 paused: false,
                 mode: c.policy.effective_mode(c.profile, now),
                 full_left_ms: c.policy.full.until_ms.map(|t| t - now),
@@ -1283,6 +1334,7 @@ impl Host for RealHost {
             Err(e) => StatusView {
                 link: None,
                 silent,
+                restarting: false,
                 portal: None,
                 paused: false,
                 mode: Mode::Ask,
@@ -1493,6 +1545,12 @@ mod tests {
         no_client: bool,
         /// What changed on offer between the question and the Yes.
         changed: Option<Changed>,
+        /// The client does not answer this many more status reads: it is
+        /// restarting.
+        down_reads: Mutex<usize>,
+        /// While it does not answer, its new process is up already (a unit
+        /// that runs but has no control channel yet).
+        down_silent: bool,
         did: Mutex<Vec<String>>,
     }
 
@@ -1529,6 +1587,8 @@ mod tests {
                 no_restart: false,
                 no_client: false,
                 changed: None,
+                down_reads: Mutex::new(0),
+                down_silent: false,
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -1552,6 +1612,15 @@ mod tests {
 
         fn did(&self) -> Vec<String> {
             self.did.lock().unwrap().clone()
+        }
+
+        /// The client restarts: it is down for a status read, and a password
+        /// it holds in memory is gone.
+        fn restart(&self) {
+            *self.down_reads.lock().unwrap() = 1;
+            if self.kept == Kept::InClient {
+                *self.password.lock().unwrap() = None;
+            }
         }
 
         fn step(&self, s: &str) -> Result<(), String> {
@@ -1625,16 +1694,26 @@ mod tests {
             }
         }
         async fn status(&self) -> StatusView {
+            let down = {
+                let mut n = self.down_reads.lock().unwrap();
+                let down = *n > 0;
+                *n = n.saturating_sub(1);
+                down
+            };
             StatusView {
-                link: Some((LinkState::Connected, None)),
-                silent: false,
+                link: (!down).then_some((LinkState::Connected, None)),
+                silent: down && self.down_silent,
+                restarting: false,
                 portal: Some(("https://portal.example".into(), "laptop".into())),
                 paused: false,
                 mode: Mode::Ask,
                 full_left_ms: None,
                 folders: Vec::new(),
                 approvals_waiting: 0,
-                sudo: Some(*self.sudo_active.lock().unwrap()),
+                sudo: Some(SudoState {
+                    active: *self.sudo_active.lock().unwrap(),
+                    password: self.password.lock().unwrap().is_some(),
+                }),
                 problem: None,
             }
         }
@@ -1677,6 +1756,9 @@ mod tests {
             match asked {
                 Asked::Release(v) => {
                     self.step(&format!("update {v}"))?;
+                    if !self.no_restart {
+                        self.restart();
+                    }
                     Ok(Update {
                         installed: Some(v.into()),
                         restarted: !self.no_restart,
@@ -1686,6 +1768,9 @@ mod tests {
                 }
                 Asked::Restart => {
                     self.step("restart")?;
+                    if !self.no_restart {
+                        self.restart();
+                    }
                     Ok(Update {
                         restarted: !self.no_restart,
                         ..found
@@ -2942,6 +3027,160 @@ mod tests {
         assert_eq!(h.did(), ["update check"]);
     }
 
+    /// Right after an update the client is down for a few seconds, and what
+    /// it held in memory is gone: the menu says it restarts (not that it is
+    /// not running) and that sudo access, which is still switched on, has no
+    /// password any more. Once it answers again the status is the plain one.
+    #[tokio::test]
+    async fn after_an_update_the_menu_says_the_client_restarts_and_sudo_lost_its_password() {
+        for (t, restarting, no_password) in [
+            (
+                Lang::En,
+                "Client: restarting, it is back within a minute\n",
+                "Sudo access: on, but no password is stored: enter it again under Sudo access",
+            ),
+            (
+                Lang::De,
+                "Client: startet neu, in höchstens einer Minute wieder da\n",
+                "Sudo-Zugriff: eingeschaltet, aber kein Passwort gespeichert: gib es unter Sudo-Zugriff erneut ein",
+            ),
+        ] {
+            let h = FakeHost {
+                release: Some("0.0.3"),
+                sudo_active: Mutex::new(true),
+                password: Mutex::new(Some("my sudo password".into())),
+                ..paired()
+            };
+            let (_, seen) =
+                run_in(t, &h, &["pick:update", "yes", "pick:log", "cancel"], None).await;
+            assert_eq!(seen.len(), 4, "{seen:#?}");
+            // Before: running, with its password.
+            assert!(seen[0].contains(match t {
+                Lang::En => "Client: running, connected\n",
+                Lang::De => "Client: läuft, verbunden\n",
+            }));
+            assert!(!seen[0].contains("password"), "{seen:#?}");
+            assert!(!seen[0].contains("Passwort"), "{seen:#?}");
+            // Right after: restarting, and no password for sudo access.
+            assert!(seen[2].contains(restarting), "{seen:#?}");
+            assert!(seen[2].contains(no_password), "{seen:#?}");
+            // Back: the plain status (the password stays gone until entered).
+            assert!(!seen[3].contains("restarting"), "{seen:#?}");
+            assert!(!seen[3].contains("startet neu"), "{seen:#?}");
+            assert!(
+                seen[3].contains("Client: l") || seen[3].contains("Client: running"),
+                "{seen:#?}"
+            );
+            assert!(seen[3].contains(no_password), "{seen:#?}");
+        }
+        // A new process that is up but does not answer yet is restarting too,
+        // not "did not answer".
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            down_silent: true,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:update", "yes", "cancel"], None).await;
+        assert!(
+            seen[2].contains("Client: restarting, it is back within a minute\n"),
+            "{seen:#?}"
+        );
+        // A client that is not running and was not just restarted is not
+        // called restarting.
+        let h = FakeHost {
+            down_reads: Mutex::new(1),
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["cancel"], None).await;
+        assert!(seen[0].contains("Client: not running\n"), "{seen:#?}");
+        // Sudo access switched on with its password stored is plain "on".
+        let h = FakeHost {
+            sudo_active: Mutex::new(true),
+            password: Mutex::new(Some("pw".into())),
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["cancel"], None).await;
+        assert!(seen[0].ends_with("Sudo access: on"), "{seen:#?}");
+    }
+
+    /// The running client reports a folder in the portal's form: the menu
+    /// shows it the way the computer writes it (`C:\pst\work` on Windows, as
+    /// `folder list` and the config do), and escaped as any outside text.
+    #[test]
+    fn a_folder_the_client_reports_is_shown_as_the_computer_writes_it() {
+        use sync_proto::methods::Access;
+        let folder = |path: &str| FolderInfo {
+            path: path.into(),
+            access: Access::Ro,
+            execute: true,
+        };
+        let shown = reported_folder(&folder("/c/pst/work/fx"));
+        if cfg!(windows) {
+            assert_eq!(shown.path, "C:\\pst\\work\\fx");
+        } else {
+            assert_eq!(shown.path, "/c/pst/work/fx");
+        }
+        assert_eq!(shown.access, Access::Ro);
+        assert!(shown.execute);
+        assert!(
+            !reported_folder(&folder("/w/\x1b[2Kx"))
+                .path
+                .contains('\x1b')
+        );
+    }
+
+    /// A long portal URL is cut in its path, so zenity's windows are no
+    /// wider than their text; the host and the port are always shown whole,
+    /// as the owner tells the portal by them.
+    #[tokio::test]
+    async fn a_long_portal_url_is_cut_in_the_path_and_never_in_the_host() {
+        let enc = |s: &str| s.replace(':', "%3A").replace('/', "%2F");
+        let path = "/some/long/path/segments/that/keep/going/and/going/to/test/the/width";
+        let long = format!("https://portal.example.org:8443{path}");
+        let link = format!("pithagoras-sync://pair?portal={}&code=AB12CD34", enc(&long));
+        for t in [Lang::En, Lang::De] {
+            let h = installed();
+            let (_, seen) = run_in(t, &h, &["no"], Some(&link)).await;
+            let q = &seen[0];
+            assert!(
+                q.contains("https://portal.example.org:8443/some/long/"),
+                "{q}"
+            );
+            assert!(q.contains('…'), "{q}");
+            assert!(!q.contains(path), "{q}");
+            // Nothing is paired: the full URL is what the pairing would use.
+            assert!(h.did().is_empty());
+        }
+        // The menu's header and the question that replaces an old pairing
+        // show the paired portal the same way.
+        let h = FakeHost {
+            paired: Mutex::new(Some(long.clone())),
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["cancel"], None).await;
+        assert!(
+            seen[0].contains("paired with https://portal.example.org:8443/some/long/"),
+            "{seen:?}"
+        );
+        assert!(!seen[0].contains(path), "{seen:?}");
+        let (_, seen) = run(&h, &["no"], Some(LINK)).await;
+        assert!(
+            seen[0].contains("https://portal.example.org:8443/some/long/"),
+            "{seen:?}"
+        );
+        assert!(!seen[0].contains(path), "{seen:?}");
+        // A short one is shown as it is.
+        let h = installed();
+        let (_, seen) = run(&h, &["no"], Some(LINK)).await;
+        assert!(seen[0].contains("https://portal.example"), "{seen:?}");
+        assert!(!seen[0].contains('…'), "{seen:?}");
+        // A host of its own length is not cut, however long.
+        let host = format!("https://{}.example.org", "very-long-host-name".repeat(5));
+        let link = format!("pithagoras-sync://pair?portal={}&code=AB12CD34", enc(&host));
+        let (_, seen) = run(&installed(), &["no"], Some(&link)).await;
+        assert!(seen[0].contains(&host), "{seen:?}");
+    }
+
     /// The program is current but the client still runs the one it replaced:
     /// the window offers the restart `update` would do, and does only that.
     #[tokio::test]
@@ -3384,6 +3623,7 @@ mod tests {
         let s = StatusView {
             link: Some((LinkState::Waiting, Some("refused (401)".into()))),
             silent: false,
+            restarting: false,
             portal: None,
             paused: true,
             mode: Mode::Full,

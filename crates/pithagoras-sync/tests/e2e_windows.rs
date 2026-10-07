@@ -197,6 +197,26 @@ async fn windows_pair_run_exec_panic_unlock() {
     let status = env.status().await;
     assert_eq!(status["link"]["state"], "connected");
     assert_eq!(status["folders_shell"], "prompt");
+    // The client reports the folder in the portal's form (`--json` shows it
+    // so), but `status` for the owner writes it as `folder list` does, from
+    // the config: `C:\...`, not `/c/...`.
+    assert_eq!(status["folders"][0]["path"], env.p("home/proj"));
+    let listed = env.ok(&["folder", "list"]).await;
+    let text = env.ok(&["status"]).await;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("Folder:"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let shown = line.trim_start_matches("Folder:").trim();
+    let shown = shown.split(" (").next().unwrap();
+    assert!(
+        shown.as_bytes()[1..3] == *b":\\",
+        "a drive path, not the wire form: {line}"
+    );
+    assert!(
+        listed.to_lowercase().contains(&shown.to_lowercase()),
+        "{line}\n{listed}"
+    );
     // The control pipe is this user's and SYSTEM's alone: no Everyone or anonymous
     // entry that would let another user hold its instances.
     // Built as the client builds it from APPDATA, which the name is a hash of.

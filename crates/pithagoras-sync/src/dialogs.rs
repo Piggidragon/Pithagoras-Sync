@@ -34,6 +34,30 @@ pub fn shown(s: &str) -> String {
     clip(&visible(s), MAX_SHOWN)
 }
 
+/// The longest portal URL a window shows whole.
+const MAX_URL: usize = 64;
+
+/// A portal URL as a dialog may show it: escaped as `shown` does, and a long
+/// one cut in its path (`…`), since zenity makes a window as wide as its
+/// longest line. The scheme and the host with its port always stay whole:
+/// the owner tells by them which portal this is.
+pub fn shown_url(s: &str) -> String {
+    let v = visible(s);
+    if v.chars().count() <= MAX_URL {
+        return v;
+    }
+    let from = v.find("://").map_or(0, |i| i + 3);
+    let end = v[from..].find('/').map_or(v.len(), |i| from + i);
+    let (head, path) = v.split_at(end);
+    if path.is_empty() {
+        return clip(head, MAX_SHOWN);
+    }
+    // At least the slash that starts the path, and the cut marked.
+    let keep = MAX_URL.saturating_sub(head.chars().count() + 1).max(1);
+    let start: String = path.chars().take(keep).collect();
+    clip(&format!("{head}{start}…"), MAX_SHOWN)
+}
+
 /// `shown` line by line, for a text whose line breaks are the client's own
 /// (an uninstall's error, then what its stop left and how to go on): they
 /// stay, every other control character is escaped, and each line is cut
@@ -165,10 +189,11 @@ pub enum Ask<'a> {
 /// pairing link holds and the password check refuses, unlike zenity's `|`.
 pub const FORM_SEPARATOR: char = '\u{1f}';
 
-/// How many characters a line of a form's or a list's text holds: zenity 4
-/// does not wrap either (the form's is its frame's title), so the window
-/// would grow as wide as the longest line.
-const FORM_LINE: usize = 72;
+/// How many characters a line of a form's, a list's or a kdialog window's text
+/// holds: zenity 4 does not wrap a form's (its frame's title) or a list's
+/// text, and kdialog sizes its window to the longest line, so the window
+/// would grow as wide as that.
+const TEXT_LINE: usize = 72;
 
 /// `text` broken into lines of at most `width` characters at spaces; a longer
 /// word gets a line of its own, cut only past twice `width`.
@@ -230,9 +255,6 @@ fn qt(s: &str) -> String {
 }
 
 impl Helper {
-    /// The program's arguments for `ask`, with the program's icon (`icon`)
-    /// where the dialog shows one. Every value is one argument; zenity's take
-    /// the `--name=value` form, so none can be read as an option.
     /// Whether a window of `ask` shows the icon option: every kdialog one;
     /// zenity 4 shows it in questions, information and errors, and takes it
     /// but shows nothing in its forms, lists and entries.
@@ -243,7 +265,11 @@ impl Helper {
         }
     }
 
-    pub fn args(&self, ask: &Ask, icon: bool) -> Vec<String> {
+    /// The program's arguments for `ask`, with `icon` as the value of the
+    /// program's icon option where the dialog shows one (`icon_value`). Every
+    /// value is one argument; zenity's take the `--name=value` form, so none
+    /// can be read as an option.
+    pub fn args(&self, ask: &Ask, icon: Option<&str>) -> Vec<String> {
         let clipped = |t: &str| clip(t, MAX_TEXT);
         match self {
             Helper::Zenity(_) => {
@@ -260,8 +286,8 @@ impl Helper {
                         );
                         // zenity 4 shows it in these three; its forms, lists
                         // and entries take the option but show no icon.
-                        if icon {
-                            a.push(format!("--icon={ICON_NAME}"));
+                        if let Some(i) = icon {
+                            a.push(format!("--icon={i}"));
                         }
                         a.push("--no-markup".into());
                         a.push("--width=480".into());
@@ -292,14 +318,14 @@ impl Helper {
                         // As the form's, the list's text is not wrapped.
                         a.push(format!(
                             "--text={}",
-                            pango(&wrapped(&clipped(t), FORM_LINE))
+                            pango(&wrapped(&clipped(t), TEXT_LINE))
                         ));
                     }
                     Ask::Form(t, form, _) => {
                         a.push("--forms".into());
                         a.push(format!(
                             "--text={}",
-                            pango(&wrapped(&clipped(t), FORM_LINE))
+                            pango(&wrapped(&clipped(t), TEXT_LINE))
                         ));
                         if let Some(l) = form.entry {
                             a.push(format!("--add-entry={l}"));
@@ -326,10 +352,10 @@ impl Helper {
             Helper::Kdialog(_) => {
                 let mut a = vec!["--title".to_string(), TITLE.to_string()];
                 // The window's icon, in every kdialog dialog.
-                if icon {
-                    a.extend(["--icon".to_string(), ICON_NAME.to_string()]);
+                if let Some(i) = icon {
+                    a.extend(["--icon".to_string(), i.to_string()]);
                 }
-                let text = |t: &str| qt(&clipped(t));
+                let text = |t: &str| qt(&wrapped(&clipped(t), TEXT_LINE));
                 if let Ask::Entry(_, b) | Ask::Menu(_, _, b) = ask {
                     a.extend([
                         "--ok-label".into(),
@@ -581,12 +607,39 @@ fn takes_icon(helper: &Helper, version: Option<&str>) -> bool {
 }
 
 /// Whether `install` put the icon below the data home: before that (the
-/// downloaded file's first windows) zenity would draw a missing image in
-/// place of its own icon.
+/// downloaded file's first windows), and after `uninstall`, zenity would draw
+/// a missing image in place of its own icon.
 fn icon_there(data_home: &Path) -> bool {
     crate::install::icon_paths(data_home)
         .iter()
         .any(|p| p.is_file())
+}
+
+/// The size of the raster icon zenity is given: it draws the icon at about 32
+/// pixels, so this is sharp on a screen with twice the pixels as well.
+const ICON_FILE_SIZE: u32 = 64;
+
+/// The raster icon `install` put below `data_home`, by its absolute path.
+fn icon_file(data_home: &Path) -> Option<PathBuf> {
+    let size = |s: u32| crate::install::png_icon_path(data_home, s);
+    std::iter::once(size(ICON_FILE_SIZE))
+        .chain(crate::install::ICON_PNGS.iter().map(|(s, _)| size(*s)))
+        .filter(|p| p.is_absolute())
+        .find(|p| p.is_file())
+}
+
+/// What `helper`'s icon option is given for the icon `install` put below
+/// `data_home`, `None` while it is not there. kdialog looks the icon's name
+/// up in the icon theme. zenity 4 reads its value as a file first, relative
+/// to its working directory, and with one it cannot read (the folder a
+/// browser was started in) it shows a missing image whatever the name is: it
+/// is given the absolute path of a PNG instead, which no working directory
+/// changes.
+fn icon_value(helper: &Helper, data_home: &Path) -> Option<String> {
+    match helper {
+        Helper::Kdialog(_) => icon_there(data_home).then(|| ICON_NAME.to_string()),
+        Helper::Zenity(_) => icon_file(data_home).map(|p| p.to_string_lossy().into_owned()),
+    }
 }
 
 /// `zenity --version`, run as the dialogs are, or `None`.
@@ -618,34 +671,44 @@ pub struct Native {
     helper: Helper,
     /// Locale variables set over the session's (`locale_fix`).
     locale: Vec<(&'static str, String)>,
-    /// Whether `install` put the icon in place (`icon_there`).
-    icon_there: bool,
+    /// The data home `install` puts the icon below, where it is known. Whether
+    /// the icon is there is looked at for each window (`icon_value`): the
+    /// windows themselves install and uninstall.
+    data_home: Option<PathBuf>,
     /// Whether the program takes the icon option (`takes_icon`): zenity is
     /// asked its version once, the first time a window would show the icon.
     takes_icon: std::cell::OnceCell<bool>,
 }
 
 impl Native {
-    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>, icon_there: bool) -> Native {
+    pub fn new(
+        helper: Helper,
+        locale: Vec<(&'static str, String)>,
+        data_home: Option<PathBuf>,
+    ) -> Native {
         Native {
             helper,
             locale,
-            icon_there,
+            data_home,
             takes_icon: std::cell::OnceCell::new(),
         }
     }
 
-    /// Whether `ask` gets the program's icon.
-    fn icon(&self, ask: &Ask) -> bool {
-        self.icon_there
-            && self.helper.shows_icon(ask)
-            && *self.takes_icon.get_or_init(|| {
-                let version = match &self.helper {
-                    Helper::Zenity(p) => zenity_version(p),
-                    Helper::Kdialog(_) => None,
-                };
-                takes_icon(&self.helper, version.as_deref())
-            })
+    /// The value of the icon option for `ask`, when it gets the program's
+    /// icon.
+    fn icon(&self, ask: &Ask) -> Option<String> {
+        if !self.helper.shows_icon(ask) {
+            return None;
+        }
+        let value = icon_value(&self.helper, self.data_home.as_deref()?)?;
+        let takes = *self.takes_icon.get_or_init(|| {
+            let version = match &self.helper {
+                Helper::Zenity(p) => zenity_version(p),
+                Helper::Kdialog(_) => None,
+            };
+            takes_icon(&self.helper, version.as_deref())
+        });
+        takes.then_some(value)
     }
 
     /// The answer of an entry or password window: the line end cut off in
@@ -676,8 +739,7 @@ impl Native {
         let helper = find_helper(&path, &desktop, &system_program)?;
         let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
         let data = sync_ops::info::home().map(|h| crate::cli::data_home(&h));
-        let icon = data.is_some_and(|d| icon_there(&d));
-        Some(Native::new(helper, locale, icon))
+        Some(Native::new(helper, locale, data))
     }
 
     /// Runs the program; its exit code and up to `MAX_ANSWER` bytes of its
@@ -691,7 +753,7 @@ impl Native {
             _ => MAX_ANSWER,
         };
         let mut cmd = dialog_command(self.helper.program());
-        cmd.args(self.helper.args(ask, self.icon(ask)))
+        cmd.args(self.helper.args(ask, self.icon(ask).as_deref()))
             .stdout(std::process::Stdio::piped());
         for (k, v) in &self.locale {
             cmd.env(k, v);
@@ -1144,7 +1206,7 @@ mod tests {
     #[test]
     fn zenity_gets_plain_text_one_argument_each() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"), false);
+        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"), None);
         assert_eq!(
             a,
             [
@@ -1156,7 +1218,7 @@ mod tests {
             ]
         );
         // Texts that zenity reads as markup are escaped.
-        let a = z.args(&Ask::Entry("a <i>b</i> & c", B), false);
+        let a = z.args(&Ask::Entry("a <i>b</i> & c", B), None);
         assert!(
             a.contains(&"--text=a &lt;i&gt;b&lt;/i&gt; &amp; c".to_string()),
             "{a:?}"
@@ -1166,7 +1228,7 @@ mod tests {
             ["--ok-label=Open", "--cancel-label=Close"]
         );
         // A password is not shown as it is typed.
-        let a = z.args(&Ask::Password("pw <x>"), false);
+        let a = z.args(&Ask::Password("pw <x>"), None);
         assert_eq!(&a[1..3], ["--entry", "--hide-text"]);
         assert_eq!(a.last().unwrap(), "--text=pw &lt;x&gt;");
         let a = z.args(
@@ -1175,7 +1237,7 @@ mod tests {
                 &[("pair", "Pair again"), ("log", "Log")],
                 B,
             ),
-            false,
+            None,
         );
         assert!(a.contains(&"--print-column=1".to_string()), "{a:?}");
         assert!(
@@ -1196,7 +1258,7 @@ mod tests {
         );
         // Every option is one `--name=value` argument: no text is a separate
         // argument zenity could take for an option.
-        let a = z.args(&Ask::Info("--help"), false);
+        let a = z.args(&Ask::Info("--help"), None);
         assert!(a.iter().all(|x| x.starts_with("--")), "{a:?}");
         assert_eq!(a.last().unwrap(), "--text=--help");
     }
@@ -1204,7 +1266,7 @@ mod tests {
     #[test]
     fn kdialog_text_cannot_carry_markup() {
         let k = Helper::Kdialog("/usr/bin/kdialog".into());
-        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"), false);
+        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"), None);
         assert_eq!(
             a,
             [
@@ -1214,7 +1276,7 @@ mod tests {
                 "<qt>&lt;img src=x&gt; &amp; &quot;q&quot;<br>line 2</qt>"
             ]
         );
-        let a = k.args(&Ask::Entry("Paste the link", B), false);
+        let a = k.args(&Ask::Entry("Paste the link", B), None);
         assert_eq!(
             &a[2..],
             [
@@ -1227,12 +1289,12 @@ mod tests {
                 ""
             ]
         );
-        let a = k.args(&Ask::Password("Passwort für <b>"), false);
+        let a = k.args(&Ask::Password("Passwort für <b>"), None);
         assert_eq!(&a[2..], ["--password", "<qt>Passwort für &lt;b&gt;</qt>"]);
-        let a = k.args(&Ask::Menu("m", &[("log", "Open log")], B), false);
+        let a = k.args(&Ask::Menu("m", &[("log", "Open log")], B), None);
         assert_eq!(&a[6..], ["--menu", "<qt>m</qt>", "log", "Open log"]);
         // A text that starts with a dash is still inside `<qt>`.
-        assert!(k.args(&Ask::Error("-x"), false)[3].starts_with("<qt>"));
+        assert!(k.args(&Ask::Error("-x"), None)[3].starts_with("<qt>"));
     }
 
     /// The program's icon where the dialog shows one; never for a zenity
@@ -1240,10 +1302,11 @@ mod tests {
     #[test]
     fn the_dialogs_carry_the_programs_icon() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
+        let file = "/home/a/.local/share/icons/hicolor/64x64/apps/pithagoras-sync.png";
         for ask in [Ask::Question("q"), Ask::Info("i"), Ask::Error("e")] {
-            let a = z.args(&ask, true);
-            assert_eq!(a[2], "--icon=pithagoras-sync", "{a:?}");
-            assert!(!z.args(&ask, false).iter().any(|x| x.starts_with("--icon")));
+            let a = z.args(&ask, Some(file));
+            assert_eq!(a[2], format!("--icon={file}"), "{a:?}");
+            assert!(!z.args(&ask, None).iter().any(|x| x.starts_with("--icon")));
         }
         for ask in [
             Ask::Entry("e", B),
@@ -1251,13 +1314,13 @@ mod tests {
             Ask::Menu("m", &[], B),
             Ask::Form("f", Form::default(), B),
         ] {
-            let a = z.args(&ask, true);
+            let a = z.args(&ask, Some(file));
             assert!(!a.iter().any(|x| x.starts_with("--icon")), "{a:?}");
         }
         let k = Helper::Kdialog("/usr/bin/kdialog".into());
-        let form = std::panic::catch_unwind(|| k.args(&Ask::Form("f", Form::default(), B), false));
+        let form = std::panic::catch_unwind(|| k.args(&Ask::Form("f", Form::default(), B), None));
         assert!(form.is_err(), "kdialog has no forms");
-        let a = k.args(&Ask::Password("p"), true);
+        let a = k.args(&Ask::Password("p"), Some("pithagoras-sync"));
         assert_eq!(&a[2..5], ["--icon", "pithagoras-sync", "--password"]);
         assert!(takes_icon(&k, None));
         assert!(takes_icon(&z, Some("4.0.1\n")));
@@ -1265,13 +1328,106 @@ mod tests {
         assert!(!takes_icon(&z, Some("3.44.0\n")));
         assert!(!takes_icon(&z, Some("")));
         assert!(!takes_icon(&z, None));
-        // Only once the icon is installed.
+    }
+
+    /// Writes the icon files `install` writes below `data` (a PNG of each
+    /// size and the SVG), or only some of them.
+    fn put_icons(data: &Path, png: bool, svg: bool) {
+        for p in crate::install::icon_paths(data) {
+            let is_svg = p.extension().is_some_and(|e| e == "svg");
+            if (is_svg && svg) || (!is_svg && png) {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, "x").unwrap();
+            }
+        }
+    }
+
+    /// What the icon option is given: kdialog the name in the icon theme,
+    /// zenity the absolute path of a PNG, so a working directory it cannot
+    /// read (zenity 4 reads the value as a file there first) does not show a
+    /// missing image. Nothing while the icon is not installed.
+    #[test]
+    fn zenity_gets_the_icon_as_an_absolute_path_and_kdialog_by_name() {
         let t = tempfile::tempdir().unwrap();
-        assert!(!icon_there(t.path()));
-        let png = crate::install::png_icon_path(t.path(), 48);
-        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
-        std::fs::write(&png, crate::install::ICON_PNGS[0].1).unwrap();
-        assert!(icon_there(t.path()));
+        let data = t.path();
+        let z = Helper::Zenity("/usr/bin/zenity".into());
+        let k = Helper::Kdialog("/usr/bin/kdialog".into());
+        assert_eq!(icon_value(&z, data), None);
+        assert_eq!(icon_value(&k, data), None);
+        assert!(!icon_there(data));
+        // The SVG alone: kdialog's theme lookup takes it, zenity cannot load
+        // it as a file.
+        put_icons(data, false, true);
+        assert!(icon_there(data));
+        assert_eq!(icon_value(&z, data), None);
+        assert_eq!(icon_value(&k, data).as_deref(), Some("pithagoras-sync"));
+        put_icons(data, true, true);
+        let path = icon_value(&z, data).unwrap();
+        assert!(Path::new(&path).is_absolute(), "{path}");
+        assert!(path.ends_with("64x64/apps/pithagoras-sync.png"), "{path}");
+        assert_eq!(icon_value(&k, data).as_deref(), Some("pithagoras-sync"));
+        // A data home that is not absolute would be read from the working
+        // directory: no icon rather than that.
+        assert_eq!(icon_value(&z, Path::new("share")), None);
+    }
+
+    /// A stand-in zenity that answers its version and writes every other
+    /// argument line to `log`; returns its path.
+    #[cfg(unix)]
+    fn recording_zenity(dir: &Path, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let z = dir.join("zenity");
+        std::fs::write(
+            &z,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 4.0.1; exit 0; fi\necho \"$@\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
+        z
+    }
+
+    /// Whether the icon is there is looked at for each window: the result
+    /// right after `install` shows it, the last window after `uninstall` does
+    /// not ask for a file that is gone (zenity would draw a missing image).
+    #[cfg(unix)]
+    #[test]
+    fn the_icon_is_looked_for_at_each_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("share");
+        let log = dir.path().join("args");
+        let z = recording_zenity(dir.path(), &log);
+        let n = Native::new(Helper::Zenity(z), Vec::new(), Some(data.clone()));
+        let icons = |n: usize| {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.lines()
+                .nth(n)
+                .map(|l| l.split(' ').any(|a| a.starts_with("--icon=")))
+                .unwrap()
+        };
+        // Before the install (the downloaded file's first windows).
+        n.info("one");
+        assert!(!icons(0));
+        // The install ran meanwhile.
+        put_icons(&data, true, true);
+        n.info("two");
+        assert!(icons(1));
+        let line = std::fs::read_to_string(&log).unwrap();
+        let arg = line
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .find(|a| a.starts_with("--icon="))
+            .unwrap()
+            .to_string();
+        assert!(Path::new(&arg["--icon=".len()..]).is_absolute(), "{arg}");
+        // And the uninstall.
+        std::fs::remove_dir_all(data.join("icons")).unwrap();
+        n.info("three");
+        assert!(!icons(2));
     }
 
     /// zenity's form gives back a link and a password of the most each may
@@ -1290,7 +1446,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let n = Native::new(Helper::Zenity(z), Vec::new(), false);
+        let n = Native::new(Helper::Zenity(z), Vec::new(), None);
         let form = Form {
             entry: Some("Link"),
             password: Some("Password"),
@@ -1324,10 +1480,15 @@ mod tests {
                 .lines()
                 .count()
         };
-        let n = Native::new(Helper::Zenity(z.clone()), Vec::new(), false);
+        let data = dir.path().join("share");
+        let n = Native::new(Helper::Zenity(z.clone()), Vec::new(), None);
         assert!(n.question("q"));
         assert_eq!(asked(), 0);
-        let n = Native::new(Helper::Zenity(z), Vec::new(), true);
+        // A data home without the icon in it yet.
+        let n = Native::new(Helper::Zenity(z), Vec::new(), Some(data.clone()));
+        assert!(n.question("q"));
+        assert_eq!(asked(), 0);
+        put_icons(&data, true, true);
         n.form("f", Form::default(), B);
         assert_eq!(asked(), 0);
         assert!(n.question("q"));
@@ -1349,7 +1510,7 @@ mod tests {
     #[test]
     fn a_long_text_is_cut_before_it_reaches_the_dialog() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)), false);
+        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)), None);
         assert!(a.last().unwrap().chars().count() < MAX_TEXT + 10);
     }
 
@@ -1477,7 +1638,7 @@ mod tests {
             ok: "Install and pair",
             cancel: "Cancel",
         };
-        let a = z.args(&Ask::Form(&text, form, b), true);
+        let a = z.args(&Ask::Form(&text, form, b), Some("pithagoras-sync"));
         assert_eq!(&a[1..2], ["--forms"]);
         let t = a[2].strip_prefix("--text=").unwrap();
         assert!(
@@ -1486,7 +1647,7 @@ mod tests {
         );
         assert!(t.lines().count() > 1, "{t}");
         assert!(
-            t.lines().all(|l| l.chars().count() <= FORM_LINE + 20),
+            t.lines().all(|l| l.chars().count() <= TEXT_LINE + 20),
             "{t}"
         );
         assert_eq!(
@@ -1504,8 +1665,58 @@ mod tests {
             entry: None,
             password: Some("Login password"),
         };
-        let a = z.args(&Ask::Form("t", only, b), false);
+        let a = z.args(&Ask::Form("t", only, b), None);
         assert!(!a.iter().any(|x| x.starts_with("--add-entry")), "{a:?}");
+    }
+
+    /// A long portal URL is cut in its path (marked with `…`) so a window is
+    /// not as wide as the URL is long; the scheme, host and port stay whole,
+    /// and escapes still show.
+    #[test]
+    fn a_long_url_is_cut_in_the_path_and_never_in_the_host() {
+        assert_eq!(
+            shown_url("https://portal.example"),
+            "https://portal.example"
+        );
+        let exact = format!("https://portal.example/{}", "p".repeat(MAX_URL - 23));
+        assert_eq!(exact.chars().count(), MAX_URL);
+        assert_eq!(shown_url(&exact), exact);
+        let long =
+            "https://portal.example.org:8443/some/long/path/segments/that/keep/going/and/going/on";
+        let cut = shown_url(long);
+        assert!(
+            cut.starts_with("https://portal.example.org:8443/some/long/path"),
+            "{cut}"
+        );
+        assert!(cut.ends_with('…'), "{cut}");
+        assert_eq!(cut.chars().count(), MAX_URL, "{cut}");
+        // A host that takes the whole room keeps it, and the path goes.
+        let host = format!("https://{}.example.org", "very-long-host-name".repeat(5));
+        assert_eq!(shown_url(&format!("{host}/base")), format!("{host}/…"));
+        assert_eq!(shown_url(&host), host);
+        // Not a URL (an old config's text): cut like any text, escaped.
+        assert_eq!(shown_url("a\x1b[2Kb"), "a\\u{1b}[2Kb");
+        assert!(shown_url(&"x".repeat(1000)).chars().count() <= MAX_SHOWN + 1);
+    }
+
+    /// kdialog's windows are as wide as their longest line: its text is
+    /// wrapped as zenity's forms are.
+    #[test]
+    fn kdialogs_text_is_wrapped_like_the_forms() {
+        let k = Helper::Kdialog("/usr/bin/kdialog".into());
+        let text = "Install Pithagoras Sync for alice? It copies the program to /home/alice/.local/bin/pithagoras-sync, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).";
+        let a = k.args(&Ask::Info(text), None);
+        let body = a[3]
+            .strip_prefix("<qt>")
+            .unwrap()
+            .strip_suffix("</qt>")
+            .unwrap();
+        assert!(body.contains("<br>"), "{body}");
+        assert!(
+            body.split("<br>").all(|l| l.chars().count() <= TEXT_LINE),
+            "{body}"
+        );
+        assert_eq!(body.replace("<br>", " "), text);
     }
 
     #[test]
