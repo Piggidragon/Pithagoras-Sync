@@ -312,10 +312,10 @@ impl Lang {
                 format!("das Journal (journalctl --user -u {unit})")
             }
             (LogPlace::SystemJournal(unit), Lang::En) => format!(
-                "the system journal (journalctl -u {unit}; root and the groups systemd-journal and adm can read it)"
+                "the system journal (journalctl -u {unit}; you can read the client's own lines there, systemd's lines about the unit need root or the groups systemd-journal and adm)"
             ),
             (LogPlace::SystemJournal(unit), Lang::De) => format!(
-                "das Systemjournal (journalctl -u {unit}; lesen können es root und die Gruppen systemd-journal und adm)"
+                "das Systemjournal (journalctl -u {unit}; die Zeilen des Clients kannst du dort selbst lesen, die von systemd über die Unit nur root und die Gruppen systemd-journal und adm)"
             ),
         }
     }
@@ -385,6 +385,18 @@ impl Lang {
             "forget" => self.pick("Forget the password", "Passwort vergessen"),
             "back" => self.pick("Back", "Zurück"),
             _ => self.pick("Close", "Schließen"),
+        }
+    }
+
+    /// `journalctl` showed none of the client's lines in the system journal.
+    pub fn no_journal_lines(self) -> &'static str {
+        match self {
+            Lang::En => {
+                "journalctl shows no lines of the client here. Either it has not written any yet, or this system lets only root and the groups systemd-journal and adm read them: it does where the journal is kept only in memory (no /var/log/journal) or is not split by user."
+            }
+            Lang::De => {
+                "journalctl zeigt hier keine Zeilen des Clients. Entweder hat er noch keine geschrieben, oder dieses System lässt sie nur root und die Gruppen systemd-journal und adm lesen: So ist es, wo das Journal nur im Speicher liegt (kein /var/log/journal) oder nicht nach Benutzern getrennt wird."
+            }
         }
     }
 

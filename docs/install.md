@@ -53,7 +53,7 @@ Open Pithagoras Sync again (from the menu on Linux, or by double clicking the pr
 - **Status:** whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on.
 - **Pair again:** pair with another portal, or again with the same one (it asks before it replaces the pairing).
 - **Sudo access** (Linux only): see below.
-- **Open log:** the client's log in a text editor. On Linux, without a log file, that is the client's lines from the journal; for a client the system unit runs (`install --system`, `setup`) the system journal, which only root and the groups `systemd-journal` and `adm` can read.
+- **Open log:** the client's log in a text editor. On Linux, without a log file, that is the client's lines from the journal; for a client the system unit runs (`install --system`, `setup`) the system journal (`journalctl -u`). The user it runs as can read the client's own lines there where the journal is kept on disk, since journald keeps each user's lines in a file of their own; systemd's lines about the unit need root or the groups `systemd-journal` and `adm`, and so do all lines where the journal is kept only in memory or not split by user. When journalctl shows no lines of the client, the window says that it may not have written any yet, or that the journal is kept in one of these ways.
 - **Uninstall:** see below.
 - **Quit:** closes the window; the client keeps running in the background.
 

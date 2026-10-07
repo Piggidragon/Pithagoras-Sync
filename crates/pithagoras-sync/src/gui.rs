@@ -49,9 +49,15 @@ pub enum LogPlace {
     /// The journal of this systemd user unit.
     Journal(&'static str),
     /// The system journal of this system unit (`install --system`, `setup`),
-    /// which only root and the journal's groups can read.
+    /// run as this user. Its user reads the client's lines there where the
+    /// journal is kept on disk (journald splits it by user); systemd's own
+    /// lines about the unit need root or the journal's groups.
     SystemJournal(&'static str),
 }
+
+/// What opening the log fails with when `journalctl` shows none of the
+/// client's lines, which the window explains in its own words.
+pub const NO_JOURNAL_LINES: &str = "journalctl shows no lines of the client here";
 
 /// The arguments of `journalctl` for the client's lines in `place`.
 fn journal_args(place: &LogPlace) -> Option<Vec<&'static str>> {
@@ -392,7 +398,12 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             Some("log") => {
                 if let Err(e) = h.open_log() {
                     let place = t.log_place(&h.log_place());
-                    d.error(&t.log_open_failed(&shown(&e), &shown(&place)));
+                    let e = if e == NO_JOURNAL_LINES {
+                        t.no_journal_lines().to_string()
+                    } else {
+                        shown(&e)
+                    };
+                    d.error(&t.log_open_failed(&e, &shown(&place)));
                 }
             }
             Some("uninstall") => return uninstall(d, h, t).await,
@@ -903,10 +914,12 @@ impl RealHost {
             .stderr(std::process::Stdio::null())
             .output()
             .map_err(|e| format!("journalctl: {e}"))?;
-        // Another user's lines in the system journal: journalctl shows none
-        // of them to a user outside its groups, and says so only on stderr.
+        // Nothing of the client in the system journal: it has not logged
+        // yet, or the journal is not split by user (kept only in memory, or
+        // set up so), and then only root and the journal's groups read it.
+        // journalctl says the latter only on stderr.
         if matches!(place, LogPlace::SystemJournal(_)) && out.stdout.trim_ascii().is_empty() {
-            return Err("journalctl shows no lines of it to this user".into());
+            return Err(NO_JOURNAL_LINES.into());
         }
         let saved = self.dirs.state.join("journal.log");
         sync_policy::config::write_private(&saved, &out.stdout)
@@ -970,6 +983,8 @@ mod tests {
         system_unit: bool,
         /// Where the log is.
         log: LogPlace,
+        /// What opening the log fails with.
+        log_fails: Option<&'static str>,
         did: Mutex<Vec<String>>,
     }
 
@@ -999,6 +1014,7 @@ mod tests {
                 uninstall_notes: Vec::new(),
                 system_unit: false,
                 log: LogPlace::Journal("pithagoras-sync.service"),
+                log_fails: None,
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -1093,6 +1109,9 @@ mod tests {
             }
         }
         fn open_log(&self) -> Result<(), String> {
+            if let Some(e) = self.log_fails {
+                return Err(e.into());
+            }
             self.step("log")
         }
         fn uninstall_refused(&self) -> Option<String> {
@@ -1571,6 +1590,31 @@ mod tests {
                 "{info}"
             );
             assert!(!info.contains("--user"), "{info}");
+            // The client's own lines are this user's to read; only systemd's
+            // need the journal's groups.
+            assert!(
+                info.contains(match t {
+                    Lang::En => "you can read the client's own lines there",
+                    Lang::De => "die Zeilen des Clients kannst du dort selbst lesen",
+                }),
+                "{info}"
+            );
+            // No lines: why that may be, not a claim it is the groups.
+            let h = FakeHost {
+                log_fails: Some(NO_JOURNAL_LINES),
+                ..h
+            };
+            let (_, seen) = run_in(t, &h, &["pick:log", "cancel"], None).await;
+            let e = &seen[1];
+            assert!(e.starts_with("error: "), "{seen:?}");
+            assert!(e.contains(t.no_journal_lines()), "{e}");
+            assert!(
+                e.contains(match t {
+                    Lang::En => "has not written any yet",
+                    Lang::De => "noch keine geschrieben",
+                }),
+                "{e}"
+            );
             let (o, seen) = run_in(t, &h, &["pick:uninstall", "yes", "yes"], None).await;
             assert_eq!(o, Outcome::Failed);
             assert_eq!(seen.len(), 2, "{seen:?}");
