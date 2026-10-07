@@ -1915,7 +1915,9 @@ pub(crate) fn install_plan(
     // In a graphical session: the menu entry and the handler of pairing links.
     if !headless {
         let program = install::user_program(&home);
-        plan.extend(install::desktop_plan(&data_home(&home), &program)?);
+        let data = data_home(&home);
+        let cache = install::icon_cache(&data).exists();
+        plan.extend(install::desktop_plan(&data, &program, cache)?);
     }
     Ok(plan)
 }
@@ -1936,7 +1938,10 @@ pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     let mut plan = install::user_uninstall_plan(&home);
     let data = data_home(&home);
     if desktop_installed(&data) {
-        plan.extend(install::desktop_uninstall_plan(&data));
+        plan.extend(install::desktop_uninstall_plan(
+            &data,
+            install::icon_cache(&data).exists(),
+        ));
     }
     Ok(plan)
 }
@@ -2152,7 +2157,7 @@ pub(crate) async fn purge(
             .map(|h| data_home(h))
             && desktop_installed(&data)
         {
-            links = install::desktop_uninstall_plan(&data);
+            links = install::desktop_uninstall_plan(&data, install::icon_cache(&data).exists());
         }
         (Vec::new(), links)
     } else if cfg!(windows) {

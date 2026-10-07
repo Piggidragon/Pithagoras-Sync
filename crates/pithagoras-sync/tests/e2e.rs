@@ -1091,15 +1091,10 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     assert!(std::fs::read_to_string(&icon).unwrap().starts_with("<svg"));
     assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
     let calls = std::fs::read_to_string(&log).unwrap();
-    // The icon cache of the user's hicolor folder, so the menu shows the
-    // icon without a new login.
-    assert!(
-        calls.contains(&format!(
-            "gtk-update-icon-cache -f -t {}",
-            data.join("icons/hicolor").display()
-        )),
-        "{calls}"
-    );
+    // The user's hicolor folder has no icon cache here: none is made, since
+    // it would hide the icons other programs add later without one.
+    assert!(!calls.contains("gtk-update-icon-cache"), "{calls}");
+    assert!(!data.join("icons/hicolor/icon-theme.cache").exists());
     assert!(
         calls.contains(&format!(
             "update-desktop-database {}",

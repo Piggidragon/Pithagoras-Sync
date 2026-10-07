@@ -246,9 +246,19 @@ pub fn icon_paths(data_home: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Brings the icon cache of the user's `hicolor` folder up to date (`-t`: the
-/// folder has no `index.theme` of its own), so the menu and the windows find
-/// the icon without a new login.
+/// The icon cache of the user's `hicolor` folder. Most have none: GTK then
+/// reads the folders themselves. One that is there is trusted while the
+/// folder is not newer than it, which a file added to a subfolder does not
+/// change, so it must be rebuilt after one.
+pub fn icon_cache(data_home: &Path) -> PathBuf {
+    hicolor(data_home).join("icon-theme.cache")
+}
+
+/// Rebuilds the icon cache of the user's `hicolor` folder (`-t`: the folder
+/// has no `index.theme` of its own), so the menu and the windows find the
+/// icon without a new login. Only where there is one (`icon_cache`): a cache
+/// made here would hide the icons other programs add later without
+/// rebuilding it.
 fn icon_cache_update(data_home: &Path, hint: &str) -> Action {
     Action::Try {
         argv: argv(&[
@@ -262,8 +272,9 @@ fn icon_cache_update(data_home: &Path, hint: &str) -> Action {
 }
 
 /// The desktop entry, the icon and the link handler for the program `install`
-/// put in place. The two tools are best effort: one that is missing is a note.
-pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, String> {
+/// put in place. The tools are best effort: one that is missing is a note.
+/// `cache`: the user's `hicolor` folder has an icon cache (`icon_cache`).
+pub fn desktop_plan(data_home: &Path, program: &Path, cache: bool) -> Result<Vec<Action>, String> {
     let apps = data_home.join("applications");
     let mut plan = vec![Action::Write {
         path: icon_path(data_home),
@@ -275,10 +286,12 @@ pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, Str
         content: png.to_vec(),
         mode: 0o644,
     }));
-    plan.push(icon_cache_update(
-        data_home,
-        "the menu may show Pithagoras Sync with a generic icon until the next login",
-    ));
+    if cache {
+        plan.push(icon_cache_update(
+            data_home,
+            "the menu may show Pithagoras Sync with a generic icon until the next login",
+        ));
+    }
     plan.extend([
         Action::Write {
             path: apps.join(DESKTOP_FILE),
@@ -304,8 +317,9 @@ pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, Str
 
 /// Undoes `desktop_plan`. The `x-scheme-handler` line `xdg-mime` wrote to
 /// `mimeapps.list` stays: the file is the desktop's, and the line leads nowhere
-/// once the entry is gone.
-pub fn desktop_uninstall_plan(data_home: &Path) -> Vec<Action> {
+/// once the entry is gone. `cache`: as for `desktop_plan`; the cache is
+/// rebuilt without the icon, and stays.
+pub fn desktop_uninstall_plan(data_home: &Path, cache: bool) -> Vec<Action> {
     let apps = data_home.join("applications");
     let mut plan = vec![Action::Remove {
         path: apps.join(DESKTOP_FILE),
@@ -315,16 +329,16 @@ pub fn desktop_uninstall_plan(data_home: &Path) -> Vec<Action> {
             .into_iter()
             .map(|path| Action::Remove { path }),
     );
-    plan.extend([
-        icon_cache_update(
+    if cache {
+        plan.push(icon_cache_update(
             data_home,
             "the icon cache may list Pithagoras Sync's icon until it is rebuilt",
-        ),
-        Action::Try {
-            argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
-            hint: "the menu may show Pithagoras Sync until the next login".into(),
-        },
-    ]);
+        ));
+    }
+    plan.push(Action::Try {
+        argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
+        hint: "the menu may show Pithagoras Sync until the next login".into(),
+    });
     plan
 }
 
@@ -1029,7 +1043,7 @@ mod tests {
         );
         // A path with a line break could add lines to the file.
         assert!(desktop_entry(Path::new("/home/a\nExec=evil/p")).is_err());
-        assert!(desktop_plan(Path::new("/d"), Path::new("/x\ry")).is_err());
+        assert!(desktop_plan(Path::new("/d"), Path::new("/x\ry"), false).is_err());
     }
 
     /// The desktop entry is Linux's: its folders are Unix paths, which a
@@ -1041,7 +1055,12 @@ mod tests {
         let data = Path::new("/home/someone/.local/share");
         let program = Path::new("/home/someone/.local/bin/pithagoras-sync");
         let fake = Fake::default();
-        apply(&desktop_plan(data, program).unwrap(), root.path(), &fake).unwrap();
+        apply(
+            &desktop_plan(data, program, true).unwrap(),
+            root.path(),
+            &fake,
+        )
+        .unwrap();
         let r = root.path();
         let entry = r.join("home/someone/.local/share/applications/pithagoras-sync.desktop");
         let icon =
@@ -1089,7 +1108,7 @@ mod tests {
             answers: vec![("xdg-mime default".into(), Err("xdg-mime: not found".into()))],
             ..Fake::default()
         };
-        let hints = apply(&desktop_plan(data, program).unwrap(), r, &missing).unwrap();
+        let hints = apply(&desktop_plan(data, program, true).unwrap(), r, &missing).unwrap();
         assert_eq!(hints.len(), 1);
         assert!(hints[0].contains("paste the link"), "{hints:?}");
         // Without gtk-update-icon-cache the icon is still written.
@@ -1100,18 +1119,32 @@ mod tests {
             )],
             ..Fake::default()
         };
-        let hints = apply(&desktop_plan(data, program).unwrap(), r, &no_cache).unwrap();
+        let hints = apply(&desktop_plan(data, program, true).unwrap(), r, &no_cache).unwrap();
         assert_eq!(hints.len(), 1);
         assert!(hints[0].contains("generic icon"), "{hints:?}");
         let uninstall = Fake::default();
-        apply(&desktop_uninstall_plan(data), r, &uninstall).unwrap();
+        apply(&desktop_uninstall_plan(data, true), r, &uninstall).unwrap();
         assert!(!entry.exists() && !icon.exists());
         for p in icon_paths(data) {
             assert!(!crate::actions::rooted(r, &p).exists(), "{}", p.display());
         }
         assert!(uninstall.ran.lock().unwrap().contains(&cache));
+        // Without an icon cache none is made, on install or uninstall: one
+        // made here would hide icons other programs add later.
+        let fake = Fake::default();
+        apply(&desktop_plan(data, program, false).unwrap(), r, &fake).unwrap();
+        apply(&desktop_uninstall_plan(data, false), r, &fake).unwrap();
+        let ran = fake.ran.lock().unwrap().clone();
+        assert!(
+            ran.iter().all(|a| a[0] != "gtk-update-icon-cache"),
+            "{ran:?}"
+        );
+        assert_eq!(
+            icon_cache(data),
+            Path::new("/home/someone/.local/share/icons/hicolor/icon-theme.cache")
+        );
         // The plans as `--print` lists them.
-        let listed: Vec<String> = desktop_plan(data, program)
+        let listed: Vec<String> = desktop_plan(data, program, true)
             .unwrap()
             .iter()
             .map(Action::describe)
