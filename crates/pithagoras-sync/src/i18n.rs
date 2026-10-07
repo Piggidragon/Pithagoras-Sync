@@ -529,12 +529,50 @@ impl Lang {
         match key {
             "pair" => self.pick("Pair again", "Neu koppeln"),
             "sudo" => self.pick("Sudo access", "Sudo-Zugriff"),
+            "update" => self.pick("Update", "Aktualisieren"),
             "log" => self.pick("Open log", "Protokoll öffnen"),
             "uninstall" => self.pick("Uninstall", "Deinstallieren"),
             "set" => self.pick("Enter the password", "Passwort eingeben"),
             "off" => self.pick("Switch sudo access off", "Sudo-Zugriff ausschalten"),
             "forget" => self.pick("Forget the password", "Passwort vergessen"),
             _ => "?",
+        }
+    }
+
+    // Update.
+
+    /// `lines` are what `update --check` said (escaped).
+    pub fn update_question(self, version: &str, lines: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "{lines}\n\nUpdate Pithagoras Sync to {version} now? The release is signed; the client restarts with it."
+            ),
+            Lang::De => format!(
+                "{lines}\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; der Client startet mit ihr neu."
+            ),
+        }
+    }
+
+    /// No newer release: what `update --check` said (escaped).
+    pub fn up_to_date(self, lines: &str) -> String {
+        match self {
+            Lang::En => format!("No update: {lines}"),
+            Lang::De => format!("Keine Aktualisierung: {lines}"),
+        }
+    }
+
+    /// What `update` said (escaped).
+    pub fn updated(self, lines: &str) -> String {
+        match self {
+            Lang::En => format!("Pithagoras Sync is updated.\n\n{lines}"),
+            Lang::De => format!("Pithagoras Sync ist aktualisiert.\n\n{lines}"),
+        }
+    }
+
+    pub fn update_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Updating failed: {e}"),
+            Lang::De => format!("Die Aktualisierung ist fehlgeschlagen: {e}"),
         }
     }
 
@@ -1030,7 +1068,16 @@ mod tests {
 
     #[test]
     fn every_menu_label_has_both_languages() {
-        for key in ["pair", "sudo", "log", "uninstall", "set", "off", "forget"] {
+        for key in [
+            "pair",
+            "sudo",
+            "update",
+            "log",
+            "uninstall",
+            "set",
+            "off",
+            "forget",
+        ] {
             assert_ne!(Lang::En.label(key), "?");
             assert_ne!(Lang::De.label(key), "?");
         }

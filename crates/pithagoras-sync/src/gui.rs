@@ -111,6 +111,15 @@ pub struct SudoState {
     pub password: bool,
 }
 
+/// What `update --check` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateOffer {
+    /// The newer release's version; `None` when there is none.
+    pub version: Option<String>,
+    /// What the command says about it.
+    pub lines: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Did what the owner asked.
@@ -159,6 +168,13 @@ pub trait Host {
     /// `uninstall`, or `uninstall --purge`; returns the program, which stays,
     /// and the notes of its steps.
     async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String>;
+    /// Whether this build can update itself (it has the release key).
+    fn can_update(&self) -> bool;
+    /// `update --check`: the newer version on offer (`None`: up to date) and
+    /// what the command says about it.
+    async fn update_check(&self) -> Result<UpdateOffer, String>;
+    /// `update`, only to `version`: what the command says.
+    async fn update(&self, version: &str) -> Result<Vec<String>, String>;
     /// Whether sudo access can be set up here (Linux, not as root).
     fn sudo_available(&self) -> bool;
     /// As `sudo status` finds it.
@@ -660,6 +676,9 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     if h.sudo_available() {
         keys.push("sudo");
     }
+    if h.can_update() {
+        keys.push("update");
+    }
     keys.extend(["log", "uninstall"]);
     let items: Vec<(&'static str, &str)> = keys.iter().map(|k| (*k, t.label(k))).collect();
     let buttons = Buttons {
@@ -678,6 +697,9 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             Some("sudo") => {
                 sudo_menu(d, h, t).await;
             }
+            Some("update") => {
+                update(d, h, t).await;
+            }
             Some("log") => {
                 if let Err(e) = h.open_log() {
                     let place = t.log_place(&h.log_place());
@@ -691,6 +713,43 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             }
             Some("uninstall") => return uninstall(d, h, t).await,
             Some(_) => return Outcome::Done,
+        }
+    }
+}
+
+/// `update`: what `update --check` finds, and on a Yes the update to that
+/// version. The release is checked as the command checks it (signed by the
+/// key built in, no older release served again).
+async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    let offer = match h.update_check().await {
+        Ok(o) => o,
+        Err(e) => {
+            d.error(&t.update_failed(&shown(&e)));
+            return Outcome::Failed;
+        }
+    };
+    let lines = shown_lines(&offer.lines.join("\n"));
+    let Some(version) = offer.version else {
+        d.info(&t.up_to_date(&lines));
+        return Outcome::Done;
+    };
+    if !d.question(&t.update_question(&shown(&version), &lines)) {
+        return Outcome::Cancelled;
+    }
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
+    match h.update(&version).await {
+        Ok(lines) => {
+            d.info(&t.updated(&shown_lines(&lines.join("\n"))));
+            Outcome::Done
+        }
+        Err(e) => {
+            d.error(&t.update_failed(&shown(&e)));
+            Outcome::Failed
         }
     }
 }
@@ -1142,6 +1201,24 @@ impl Host for RealHost {
         Ok((program, notes))
     }
 
+    fn can_update(&self) -> bool {
+        crate::update::PUBLIC_KEY.is_some()
+    }
+
+    async fn update_check(&self) -> Result<UpdateOffer, String> {
+        let u = crate::cli::update(&self.dirs, true, None, None).await?;
+        Ok(UpdateOffer {
+            version: u.available,
+            lines: u.lines,
+        })
+    }
+
+    async fn update(&self, version: &str) -> Result<Vec<String>, String> {
+        crate::cli::update(&self.dirs, false, None, Some(version))
+            .await
+            .map(|u| u.lines)
+    }
+
     fn sudo_available(&self) -> bool {
         cfg!(target_os = "linux") && !crate::cli::is_root()
     }
@@ -1272,6 +1349,10 @@ mod tests {
         log: LogPlace,
         /// What opening the log fails with.
         log_fails: Option<&'static str>,
+        /// This build has the release key.
+        updates: bool,
+        /// The release `update --check` offers; `None`: up to date.
+        release: Option<&'static str>,
         did: Mutex<Vec<String>>,
     }
 
@@ -1302,6 +1383,8 @@ mod tests {
                 system_unit: false,
                 log: LogPlace::Journal("pithagoras-sync.service"),
                 log_fails: None,
+                updates: true,
+                release: None,
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -1415,6 +1498,31 @@ mod tests {
                 "/home/alice/.local/bin/pithagoras-sync".into(),
                 self.uninstall_notes.clone(),
             ))
+        }
+        fn can_update(&self) -> bool {
+            self.updates
+        }
+        async fn update_check(&self) -> Result<UpdateOffer, String> {
+            self.step("update check")?;
+            let line = match self.release {
+                Some(v) => {
+                    format!("Version {v} is available, released 2026-10-08 (this is 0.0.2).")
+                }
+                None => {
+                    "Up to date (this is 0.0.2; the newest release was made 2026-10-07).".into()
+                }
+            };
+            Ok(UpdateOffer {
+                version: self.release.map(String::from),
+                lines: vec![line],
+            })
+        }
+        async fn update(&self, version: &str) -> Result<Vec<String>, String> {
+            self.step(&format!("update {version}"))?;
+            Ok(vec![
+                format!("Updated /home/alice/.local/bin/pithagoras-sync to {version}."),
+                "The running client restarts with it\x1b[2K.".into(),
+            ])
         }
         fn sudo_available(&self) -> bool {
             self.sudo
@@ -1907,6 +2015,13 @@ mod tests {
         let (_, seen) = run(&h, &["pick:pair", "cancel", "cancel"], None).await;
         assert!(seen[1].starts_with("entry [Pair]:"), "{seen:?}");
         assert!(h.did().is_empty());
+        // Update, then no: checked, nothing installed.
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            ..paired()
+        };
+        run(&h, &["pick:update", "no"], None).await;
+        assert_eq!(h.did(), ["update check"]);
         // Sudo access: the password cancelled, forgetting refused, the menu left.
         let h = paired();
         *h.password.lock().unwrap() = Some("right pw".into());
@@ -2325,10 +2440,10 @@ mod tests {
             assert_eq!(seen.len(), 1, "{seen:?}");
             let expect = match t {
                 Lang::En => {
-                    "menu [Pair again, Sudo access, Open log, Uninstall] [Close / Open]: Pithagoras Sync is installed and paired with https://old.example.\n\nClient: running, connected\nPortal: https://portal.example as \"laptop\"\nMode: ask"
+                    "menu [Pair again, Sudo access, Update, Open log, Uninstall] [Close / Open]: Pithagoras Sync is installed and paired with https://old.example.\n\nClient: running, connected\nPortal: https://portal.example as \"laptop\"\nMode: ask"
                 }
                 Lang::De => {
-                    "menu [Neu koppeln, Sudo-Zugriff, Protokoll öffnen, Deinstallieren] [Schließen / Öffnen]: Pithagoras Sync ist installiert und mit https://old.example gekoppelt.\n\nClient: läuft, verbunden\nPortal: https://portal.example als „laptop“\nModus: ask"
+                    "menu [Neu koppeln, Sudo-Zugriff, Aktualisieren, Protokoll öffnen, Deinstallieren] [Schließen / Öffnen]: Pithagoras Sync ist installiert und mit https://old.example gekoppelt.\n\nClient: läuft, verbunden\nPortal: https://portal.example als „laptop“\nModus: ask"
                 }
             };
             assert!(seen[0].starts_with(expect), "{seen:?}");
@@ -2337,12 +2452,13 @@ mod tests {
                 "{seen:?}"
             );
         }
-        // Without sudo access to set up, no such item.
+        // Without sudo access to set up, or a release key, no such items.
         let h = FakeHost {
             sudo: false,
+            updates: false,
             ..paired()
         };
-        let (_, seen) = run(&h, &["pick:sudo"], None).await;
+        let (_, seen) = run(&h, &["pick:sudo", "pick:update"], None).await;
         assert!(
             seen[0].starts_with("menu [Pair again, Open log, Uninstall] [Close / Open]"),
             "{seen:?}"
@@ -2404,6 +2520,64 @@ mod tests {
             last.contains("\n\nNote: the menu may show Pithagoras Sync until the next login"),
             "{seen:?}"
         );
+    }
+
+    /// Update: what the check found, the version asked about, and only that
+    /// version installed after a Yes; the outcome at the top of the menu.
+    #[tokio::test]
+    async fn the_menu_updates_after_a_yes() {
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            ..paired()
+        };
+        let (o, seen) = run(&h, &["pick:update", "yes", "cancel"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 3, "{seen:#?}");
+        assert!(
+            seen[1].starts_with(
+                "question: Version 0.0.3 is available, released 2026-10-08 (this is 0.0.2).\n\nUpdate Pithagoras Sync to 0.0.3 now?"
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[2].contains("]: Pithagoras Sync is updated.\n\nUpdated /home/alice/.local/bin/pithagoras-sync to 0.0.3.\nThe running client restarts with it\\u{1b}[2K."),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["update check", "update 0.0.3"]);
+        // Up to date: said at the top of the menu, no question.
+        let h = paired();
+        let (_, seen) = run_in(Lang::De, &h, &["pick:update", "cancel"], None).await;
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert!(
+            seen[1].contains("]: Keine Aktualisierung: Up to date (this is 0.0.2"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["update check"]);
+        // A failed check: why, and nothing else.
+        let h = FakeHost {
+            fail: Some("update check"),
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:update", "cancel"], None).await;
+        assert!(
+            seen[1].contains("]: Updating failed: update check broke"),
+            "{seen:#?}"
+        );
+        // Refused from the client's own commands, the check included.
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            own_from: Some(1),
+            ..paired()
+        };
+        run(&h, &["pick:update", "yes"], None).await;
+        assert!(h.did().is_empty(), "{:?}", h.did());
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            own_from: Some(2),
+            ..paired()
+        };
+        run(&h, &["pick:update", "yes"], None).await;
+        assert_eq!(h.did(), ["update check"]);
     }
 
     /// A held message that would make the next window's text too long gets
