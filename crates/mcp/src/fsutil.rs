@@ -6,13 +6,8 @@
 use std::io::Write;
 use std::path::Path;
 
-pub fn sha256_hex(data: &[u8]) -> String {
-    hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+/// The sha256 of `data` in lowercase hex (the file tools' own).
+pub use sync_ops::fsops::sha256_hex;
 
 /// Whether `s` is a sha256 in lowercase hex.
 pub fn is_sha256(s: &str) -> bool {

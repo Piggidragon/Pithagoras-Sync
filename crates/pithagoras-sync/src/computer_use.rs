@@ -113,8 +113,107 @@ pub fn plan(dirs: &Dirs, doc: &Document) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Held while one process installs, updates, rolls back or removes a
+/// server: the daily look in the running client and the owner's commands take
+/// turns, so neither prunes the other's staging folder or saves its `[mcp]`
+/// record over the other's. Let go when dropped (and when the process ends).
+pub struct InstallLock {
+    _file: std::fs::File,
+}
+
+/// How long a second install waits for the first.
+const INSTALL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Takes the install lock, waiting while another process holds it.
+pub async fn lock_installs(
+    dirs: &Dirs,
+    say: &mut (dyn FnMut(String) + Send),
+) -> Result<InstallLock, String> {
+    let mcp = dirs.mcp_dir();
+    sync_mcp::fsutil::private_dirs(&mcp, &mcp)?;
+    let path = mcp.join(".install.lock");
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = o
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let deadline = std::time::Instant::now() + INSTALL_LOCK_WAIT;
+    let mut said = false;
+    loop {
+        if try_lock(&file).map_err(|e| format!("{}: {e}", path.display()))? {
+            return Ok(InstallLock { _file: file });
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(
+                "another computer-use install or update has not finished for 30 minutes; try again later".into(),
+            );
+        }
+        if !said {
+            say("another computer-use install or update runs; waiting for it".into());
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// An exclusive lock on `file` if nobody holds one: `Ok(false)` when another
+/// open of it does.
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, open for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        // SAFETY: an all-zero OVERLAPPED is valid (offset 0, no event).
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle belongs to `file`, open for the call; one byte
+        // at offset 0 is locked.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut ov,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Ok(false)
+        } else {
+            Err(e)
+        }
+    }
+}
+
 /// Installs (or reinstalls) `pin` and records it; the previous version stays
-/// for one rollback, older ones go.
+/// for one rollback, older ones go. The caller holds the install lock.
 pub async fn install_pin(
     dirs: &Dirs,
     pin: &ServerPin,
@@ -175,6 +274,7 @@ pub async fn install_now(
     dirs: &Dirs,
     say: &mut (dyn FnMut(String) + Send),
 ) -> Result<String, String> {
+    let _lock = lock_installs(dirs, say).await?;
     let store = store(dirs);
     // A newer signed document first, where there is one; without the network
     // the pins at hand do.
@@ -199,7 +299,8 @@ pub async fn install_now(
 /// `computer-use uninstall` (and `uninstall`), first step: the record goes,
 /// so the running client lets go of the servers once it reloads. Returns
 /// the servers to remove (`remove_files`), a folder without a record (an
-/// install stopped halfway) among them.
+/// install stopped halfway) among them. The caller holds the install lock
+/// for both steps.
 pub fn forget_all(dirs: &Dirs) -> Result<Vec<String>, String> {
     let mut cfg = DeviceConfig::load(&dirs.config_file())?;
     let mut names: Vec<String> = cfg.mcp.keys().cloned().collect();
@@ -246,7 +347,7 @@ pub async fn remove_files(dirs: &Dirs, names: &[String]) -> Result<(), String> {
 
 /// `computer-use rollback`: the version before, if it is still there and
 /// unchanged. Updates leave it alone from then on (`held`) until the owner
-/// installs again.
+/// installs again. The caller holds the install lock.
 pub fn rollback(dirs: &Dirs) -> Result<String, String> {
     let mut cfg = DeviceConfig::load(&dirs.config_file())?;
     let (name, rec) = cfg
@@ -299,10 +400,16 @@ pub async fn update(
     say: &mut (dyn FnMut(String) + Send),
 ) -> Result<Updated, String> {
     let mut out = Updated::default();
-    let cfg = DeviceConfig::load(&dirs.config_file())?;
-    if cfg.mcp.is_empty() {
+    if DeviceConfig::load(&dirs.config_file())?.mcp.is_empty() {
         return Ok(out);
     }
+    // `--check` changes nothing; an update waits for another one, then reads
+    // the record as that one left it.
+    let _lock = match check {
+        true => None,
+        false => Some(lock_installs(dirs, say).await?),
+    };
+    let cfg = DeviceConfig::load(&dirs.config_file())?;
     let store = store(dirs);
     let mut peeked = None;
     if store.key.is_none() {
@@ -519,6 +626,42 @@ pub fn consent_text(cfg: &DeviceConfig, now_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dirs(root: &Path) -> Dirs {
+        Dirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            runtime: root.join("run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn installs_take_turns() {
+        let t = tempfile::tempdir().unwrap();
+        let dirs = temp_dirs(t.path());
+        let held = lock_installs(&dirs, &mut |_| {}).await.unwrap();
+        // Another install (here: the owner's) waits for the one that runs.
+        let other = dirs.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let install = tokio::spawn(async move {
+            let _ = install_now(&other, &mut move |l| {
+                let _ = tx.send(l);
+            })
+            .await;
+        });
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.contains("waiting"), "{first}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!install.is_finished());
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), install)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn the_daily_look_respects_its_setting() {

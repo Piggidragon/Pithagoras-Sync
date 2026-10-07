@@ -146,21 +146,31 @@ impl ConfigStore {
         Ok(settings::document(&cfg))
     }
 
-    /// `policy.set`: only with `portal_policy = write`. Based on the file as it is
-    /// now, so a change the owner just made is not overwritten unseen (the
-    /// portal's `if_version` then conflicts). Each changed setting is audited.
+    /// `policy.set`: only with `portal_policy = write`. Checked against the
+    /// file as it is now, so a change the owner just made is not overwritten
+    /// unseen (the portal's `if_version` then conflicts), and against the
+    /// settings the client runs by, which alone take the change: what else
+    /// the file holds (edits typed while computer use was active, say) never
+    /// goes live through a portal message, and a device-only setting changed
+    /// only in the file stays as the client runs it. Each changed setting is
+    /// audited.
     pub fn set_from_portal(&self, params: PolicySetParams) -> Result<PolicyDocument, RpcError> {
         // One change at a time, from the file onwards.
         static SETTING: Mutex<()> = Mutex::new(());
         let _one = SETTING.lock().unwrap();
         let current = self.load().map_err(|e| RpcError::new(code::IO, e))?;
-        let (next, changes) = settings::apply_from_portal(&current, params, system_clock()())
-            .map_err(|e| match e {
-                SetError::Denied(m) => RpcError::denied(m),
-                SetError::Conflict(m) => RpcError::new(code::CONFLICT, m),
-                SetError::Invalid(m) => RpcError::new(code::INVALID_PARAMS, m),
-            })?;
-        next.save(&self.file)
+        let now = system_clock()();
+        let refused = |e| match e {
+            SetError::Denied(m) => RpcError::denied(m),
+            SetError::Conflict(m) => RpcError::new(code::CONFLICT, m),
+            SetError::Invalid(m) => RpcError::new(code::INVALID_PARAMS, m),
+        };
+        let (saved, _) =
+            settings::apply_from_portal(&current, params.clone(), now).map_err(refused)?;
+        let (next, changes) =
+            settings::apply_from_portal(&self.config(), params, now).map_err(refused)?;
+        saved
+            .save(&self.file)
             .map_err(|e| RpcError::new(code::IO, e))?;
         for c in &changes {
             self.engine.record(

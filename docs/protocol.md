@@ -369,10 +369,10 @@ Params:
 
 - `settings`: the whole document as `policy.get` returned it, changed. Every setting is checked as in the config file; an unknown field or a bad value is `INVALID_PARAMS`. So is a new folder whose path holds a control character, which would redraw the owner's terminal in `folder list`.
 - `if_version` (optional): the `version` the change is based on. When the settings changed on the device meanwhile, the answer is `CONFLICT` and nothing changes. Left out, the change replaces whatever is there.
-- With `portal_policy` `read` or `off`, `DENIED`. A change to a `device_only` setting is `DENIED` as a whole.
+- With `portal_policy` `read` or `off`, `DENIED`. A change to a `device_only` setting is `DENIED` as a whole. The change is checked against the config file as it is now and against the settings the client runs by: while the two differ in a `device_only` setting (the file was edited and not reloaded), every `policy.set` is `DENIED`, so an edit of the file never goes live through the portal.
 - The device keeps Full mode's end time itself: switching to Full dates it from now (`policy.full.until_ms` in the document is ignored).
 
-Result: the new PolicyDocument. The device saves the config file, applies it at once and audits each changed setting with its old and new value (`"by the portal: true -> false"`); `policy.changed` follows.
+Result: the new PolicyDocument. The device saves the change into the config file, applies it at once to the settings it runs by (taking nothing else from the file) and audits each changed setting with its old and new value (`"by the portal: true -> false"`); `policy.changed` follows.
 
 A portal with write access can widen everything the document holds, Full mode included. That is the owner's choice when they set `write`; the default is `read`.
 

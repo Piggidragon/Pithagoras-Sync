@@ -1490,16 +1490,55 @@ async fn a_queued_call_does_not_outlast_the_consent() {
     e.authorize_screen(&screen_call("c1"), screen_req("{}"))
         .await
         .unwrap();
-    e.screen_still_allowed(&screen_call("c1"), "cu.x").unwrap();
+    e.screen_still_allowed(&screen_call("c1"), "cu.x", ScreenGrant::Allowed)
+        .unwrap();
     e.reload(consent(Consent::Off, None, now), Profile::Desktop);
     let r = e
-        .screen_still_allowed(&screen_call("c1"), "cu.x")
+        .screen_still_allowed(&screen_call("c1"), "cu.x", ScreenGrant::Allowed)
         .unwrap_err();
     assert_eq!(r.reason, Some(mcp_reason::CONSENT_OFF));
     e.reload(consent(Consent::Allow, Some(10), now), Profile::Desktop);
     e.pause();
     let r = e
-        .screen_still_allowed(&screen_call("c1"), "cu.x")
+        .screen_still_allowed(&screen_call("c1"), "cu.x", ScreenGrant::Allowed)
         .unwrap_err();
     assert_eq!(r.reason, Some(mcp_reason::PAUSED));
+}
+
+#[tokio::test]
+async fn a_queued_call_allowed_by_allow_waits_for_ask_after_a_narrowing() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let now = f.clock.load(Ordering::SeqCst);
+    let yes = scripted(Answer::ForChat);
+    let e = f.engine(
+        consent(Consent::Allow, Some(10), now),
+        Profile::Desktop,
+        yes.clone(),
+    );
+    let g = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(g, ScreenGrant::Allowed);
+    // The owner narrows to ask while the call waits for the server.
+    e.reload(consent(Consent::Ask, None, now), Profile::Desktop);
+    let r = e
+        .screen_still_allowed(&screen_call("c1"), "cu.x", g)
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_DENIED));
+    // An answer the owner gave after the narrowing holds.
+    let g = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(g, ScreenGrant::Chat);
+    e.screen_still_allowed(&screen_call("c1"), "cu.x", g)
+        .unwrap();
+    e.screen_still_allowed(&screen_call("c2"), "cu.x", ScreenGrant::Once)
+        .unwrap();
+    assert!(
+        e.screen_still_allowed(&screen_call("c2"), "cu.x", ScreenGrant::Chat)
+            .is_err()
+    );
 }

@@ -9,6 +9,8 @@ The computer-use servers move without a new client: the owner publishes a new si
 3. The running client switches to it once no call is in flight and no chat waits on a consent question; until then the old one serves. An older version that cannot be removed yet (Windows: still running) stays until the next update. If the new version's allow-list lacks a tool the old one had, the portal hears of it through `mcp.changed` and the tool is refused from then on.
 4. A failure leaves the old version running and is shown in `computer-use status` (the daily look) or by the command. A server the owner rolled back (`computer-use rollback`) is left alone until they install again.
 
+Installs, updates, rollbacks and uninstalls take turns (a lock file in the servers' folder): the daily look and the owner's commands never work on a server's folders or its record at the same time; the second one says it waits.
+
 Consent, the allow-list rules and the settings are never touched by an update. The hard deny-list in the client beats any document.
 
 ## Making a document

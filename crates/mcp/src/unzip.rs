@@ -56,10 +56,20 @@ pub fn safe_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The files of a zip archive (folders are implied by the names). Refuses
-/// links, encrypted entries, zip64, other compression methods, bad CRCs and
-/// anything over the limits.
-pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
+/// One file of an archive as its directory lists it, checked, not unpacked.
+struct Listed {
+    name: String,
+    method: u16,
+    crc: u32,
+    size: u64,
+    /// The compressed bytes.
+    raw: std::ops::Range<usize>,
+}
+
+/// The files of a zip archive (folders are implied by the names), checked
+/// before any is unpacked: refuses links, encrypted entries, zip64, other
+/// compression methods and anything over the limits.
+fn list(data: &[u8]) -> Result<Vec<Listed>, String> {
     // The end of central directory record, searched from the back (it may be
     // followed by a comment of up to 64 KiB).
     let min = data.len().saturating_sub(22 + 65_535);
@@ -94,7 +104,7 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
         let method = u16_at(data, at + 10)?;
         let crc = u32_at(data, at + 16)?;
         let csize = u32_at(data, at + 20)? as usize;
-        let usize_ = u32_at(data, at + 24)? as u64;
+        let size = u32_at(data, at + 24)? as u64;
         let name_len = u16_at(data, at + 28)? as usize;
         let extra_len = u16_at(data, at + 30)? as usize;
         let comment_len = u16_at(data, at + 32)? as usize;
@@ -121,11 +131,14 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
         if !seen.insert(name.to_lowercase()) {
             return Err(format!("{name} is in the zip file twice"));
         }
-        total += usize_;
+        total += size;
         if total > MAX_UNPACKED {
             return Err(format!(
                 "the zip file unpacks to more than {MAX_UNPACKED} bytes"
             ));
+        }
+        if !matches!(method, 0 | 8) {
+            return Err(format!("{name}: compression method {method} is not taken"));
         }
         if u32_at(data, local)? != 0x0403_4b50 {
             return Err(format!("{name}: its local header is missing"));
@@ -133,28 +146,74 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
         let lname = u16_at(data, local + 26)? as usize;
         let lextra = u16_at(data, local + 28)? as usize;
         let start = local + 30 + lname + lextra;
-        let raw = data
-            .get(start..start.checked_add(csize).ok_or("bad size")?)
-            .ok_or("the zip file is cut short")?;
-        let content = match method {
-            0 => raw.to_vec(),
-            8 => {
-                crate::inflate::inflate(raw, usize_ as usize).map_err(|e| format!("{name}: {e}"))?
-            }
-            m => return Err(format!("{name}: compression method {m} is not taken")),
-        };
-        if content.len() as u64 != usize_ {
-            return Err(format!("{name}: its size does not match"));
+        let end = start.checked_add(csize).ok_or("bad size")?;
+        if end > data.len() {
+            return Err("the zip file is cut short".into());
         }
-        if crc32(&content) != crc {
-            return Err(format!("{name}: its checksum does not match"));
-        }
-        out.push(Entry {
+        out.push(Listed {
             name,
-            data: content,
+            method,
+            crc,
+            size,
+            raw: start..end,
         });
     }
     Ok(out)
+}
+
+/// One listed file's content, unpacked and checked against its size and CRC.
+fn unpack_one(data: &[u8], e: &Listed) -> Result<Vec<u8>, String> {
+    let raw = &data[e.raw.clone()];
+    let content = match e.method {
+        0 => raw.to_vec(),
+        _ => crate::inflate::inflate(raw, e.size as usize)
+            .map_err(|err| format!("{}: {err}", e.name))?,
+    };
+    if content.len() as u64 != e.size {
+        return Err(format!("{}: its size does not match", e.name));
+    }
+    if crc32(&content) != e.crc {
+        return Err(format!("{}: its checksum does not match", e.name));
+    }
+    Ok(content)
+}
+
+/// The files of a zip archive, unpacked into memory (small archives, tests).
+/// Refuses links, encrypted entries, zip64, other compression methods, bad
+/// CRCs and anything over the limits.
+pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
+    list(data)?
+        .iter()
+        .map(|e| {
+            Ok(Entry {
+                name: e.name.clone(),
+                data: unpack_one(data, e)?,
+            })
+        })
+        .collect()
+}
+
+/// Unpacks a zip archive below `dir` one file at a time, each under the name
+/// `rename` gives it (`None`: left out). Every name, renamed too, is checked
+/// before anything is written; a file whose size or CRC is wrong stops it
+/// halfway (the caller unpacks into a staging folder it then removes).
+pub fn unpack(
+    data: &[u8],
+    dir: &Path,
+    rename: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let mut files = Vec::new();
+    for e in list(data)? {
+        if let Some(name) = rename(&e.name) {
+            safe_name(&name)?;
+            files.push((name, e));
+        }
+    }
+    for (name, e) in &files {
+        let content = unpack_one(data, e)?;
+        write_one(dir, name, &content)?;
+    }
+    Ok(())
 }
 
 /// Writes `entries` below `dir`, which must not exist yet beyond what this
@@ -163,29 +222,39 @@ pub fn entries(data: &[u8]) -> Result<Vec<Entry>, String> {
 pub fn write_all(dir: &Path, entries: &[Entry]) -> Result<(), String> {
     for e in entries {
         safe_name(&e.name)?;
-        let path: PathBuf = e.name.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
-        if let Some(parent) = path.parent() {
-            crate::fsutil::private_dirs(dir, parent)?;
-        }
-        crate::fsutil::write_new(&path, &e.data, false)?;
+    }
+    for e in entries {
+        write_one(dir, &e.name, &e.data)?;
     }
     Ok(())
 }
 
+fn write_one(dir: &Path, name: &str, data: &[u8]) -> Result<(), String> {
+    let path: PathBuf = name.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
+    if let Some(parent) = path.parent() {
+        crate::fsutil::private_dirs(dir, parent)?;
+    }
+    crate::fsutil::write_new(&path, data, false)
+}
+
 /// CRC-32 (IEEE), as zip uses it.
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, t) in table.iter_mut().enumerate() {
-        let mut c = i as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                0xedb8_8320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (i, t) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *t = c;
         }
-        *t = c;
-    }
+        table
+    });
     let mut crc = 0xffff_ffffu32;
     for &b in data {
         crc = table[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
@@ -296,6 +365,26 @@ mod tests {
             data: vec![],
         }];
         assert!(write_all(&dir, &bad).is_err());
+        assert!(!t.path().join("escape").exists());
+    }
+
+    #[test]
+    fn unpacks_one_file_at_a_time_after_checking_every_name() {
+        let t = tempfile::tempdir().unwrap();
+        let z = stored_zip(&[("a/b.txt", b"x"), ("skip", b"-"), ("c", b"y")]);
+        let dir = t.path().join("out");
+        unpack(&z, &dir, |n| (n != "skip").then(|| n.to_string())).unwrap();
+        assert_eq!(std::fs::read(dir.join("a/b.txt")).unwrap(), b"x");
+        assert_eq!(std::fs::read(dir.join("c")).unwrap(), b"y");
+        assert!(!dir.join("skip").exists());
+        // A renamed name that leaves the folder stops it before the first write.
+        let dir = t.path().join("out2");
+        let r = unpack(&z, &dir, |n| match n {
+            "c" => Some("../escape".into()),
+            n => Some(n.to_string()),
+        });
+        assert!(r.is_err());
+        assert!(!dir.join("a/b.txt").exists());
         assert!(!t.path().join("escape").exists());
     }
 

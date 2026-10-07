@@ -191,15 +191,9 @@ pub struct Service {
     stop: watch::Sender<u64>,
 }
 
-/// An FNV-1a hash of the list, as the settings' version is made.
+/// The list's version, made as the settings' version is.
 fn list_version(servers: &[McpServerInfo]) -> String {
-    let text = serde_json::to_string(servers).unwrap_or_default();
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+    sync_policy::settings::version(&serde_json::to_value(servers).unwrap_or_default())
 }
 
 fn server_err(reason: &str, message: impl Into<String>) -> RpcError {
@@ -686,7 +680,8 @@ impl Service {
             tool: "computer_use",
             pi_tool: None,
         };
-        self.engine
+        let grant = self
+            .engine
             .authorize_screen(
                 &call,
                 ScreenRequest {
@@ -700,10 +695,24 @@ impl Service {
         let mut slot = s.slot.lock().await;
         // Waiting in the queue does not outlast the consent: switched off,
         // run out, paused or outside the hours meanwhile, the call is refused.
-        self.engine.screen_still_allowed(&call, &target)?;
+        self.engine.screen_still_allowed(&call, &target, grant)?;
         // From here the call may act on the screen.
         let _acting = Acting::new(self);
-        self.ensure_started(&s, &mut slot, stop).await?;
+        // From here on every way out is in the audit log too, after the
+        // consent's own record.
+        let audited = |decision: &str, e: RpcError| {
+            self.engine.record(
+                Some(&p.ctx.chat),
+                "computer_use",
+                &target,
+                decision,
+                Some(e.message.clone()),
+            );
+            e
+        };
+        self.ensure_started(&s, &mut slot, stop)
+            .await
+            .map_err(|e| audited("failed", e))?;
         if s.pin.is_input(&p.tool)
             && let Err(e) = self.focus_check(&s, &mut slot).await
         {
@@ -721,15 +730,17 @@ impl Service {
         }
         // The last moment before the input: a `panic` meanwhile wins.
         if self.engine.is_paused() {
-            return Err(paused());
+            return Err(audited("denied", paused()));
         }
         self.indicate(&s.name, &p.ctx.chat);
         // From here the chat sees what is on the screen: untrusted content.
         self.engine.mark_tainted(&p.ctx.chat);
-        let c = slot
-            .client
-            .as_mut()
-            .ok_or_else(|| server_err(why::NOT_RUNNING, "the server is not running"))?;
+        let c = slot.client.as_mut().ok_or_else(|| {
+            audited(
+                "failed",
+                server_err(why::NOT_RUNNING, "the server is not running"),
+            )
+        })?;
         let raw = match c.call(&p.tool, &p.args).await {
             Ok(r) => r,
             Err(e) => {

@@ -220,18 +220,14 @@ where
             }
             FileKind::Zip | FileKind::Wheel => {
                 say(format!("unpack {}", f.path));
-                let mut entries = crate::unzip::entries(&data)?;
-                if f.kind == FileKind::Wheel {
-                    entries = entries
-                        .into_iter()
-                        .filter_map(|mut e| {
-                            e.name = wheel_target(&e.name)?;
-                            Some(e)
-                        })
-                        .collect();
-                }
                 fsutil::private_dirs(mcp, &target)?;
-                crate::unzip::write_all(&target, &entries)?;
+                let wheel = f.kind == FileKind::Wheel;
+                // One file at a time: the archive and one unpacked file in
+                // memory, not every file of it.
+                crate::unzip::unpack(&data, &target, |name| match wheel {
+                    true => wheel_target(name),
+                    false => Some(name.to_string()),
+                })?;
             }
         }
     }

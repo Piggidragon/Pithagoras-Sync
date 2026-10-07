@@ -407,7 +407,11 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
                 _ = int.recv() => return,
                 _ = daemon.restart.notified() => return,
                 _ = hup.recv() => {
-                    if let Err(e) = daemon.reload().await {
+                    // As the control socket's reload: the agent could have
+                    // typed both the file and the signal.
+                    if daemon.mcp.active() {
+                        warn!("reload refused: {}", crate::owner::COMPUTER_USE_ACTIVE);
+                    } else if let Err(e) = daemon.reload().await {
                         warn!("reload failed, keeping the old config: {e}");
                     }
                 }
@@ -1067,6 +1071,11 @@ async fn handle_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         Ok(req) if from_own_command && !req.allowed_from_own_commands() => Reply::err(
             "commands the client runs for the portal cannot change, unlock or reload it, answer its approvals or set its secrets",
         ),
+        // A probe would start or ping the server in use: the status then
+        // says how it is without one.
+        Ok(Request::McpStatus { probe: true }) if d.mcp.active() => {
+            d.handle(Request::McpStatus { probe: false }).await
+        }
         // The agent may be typing into a terminal of the owner's: what
         // comes in then could be its own answer.
         Ok(req) if d.mcp.active() && !req.allowed_while_computer_use() => {

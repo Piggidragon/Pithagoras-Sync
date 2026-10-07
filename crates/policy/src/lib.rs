@@ -29,6 +29,6 @@ pub use config::{
 };
 pub use engine::{
     Call, Clock, Confine, Engine, EngineOptions, Event, LandlockRules, Permit, Refusal, Request,
-    ScreenRefusal, ScreenRequest, system_clock,
+    ScreenGrant, ScreenRefusal, ScreenRequest, system_clock,
 };
 pub use queue::{AnswerError, ApprovalEvent, ApprovalQueue};

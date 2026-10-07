@@ -1950,6 +1950,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             if !print {
                 apply_plan(&plan)?;
                 if dirs_have_mcp(&dirs) {
+                    let _lock =
+                        crate::computer_use::lock_installs(&dirs, &mut |l| println!("{l}")).await?;
                     let names = crate::computer_use::forget_all(&dirs)?;
                     crate::computer_use::remove_files(&dirs, &names).await?;
                 }
@@ -2049,6 +2051,10 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
         }
         ComputerUseCmd::Uninstall => {
             owner::not_from_own_command(dirs).await?;
+            let _lock = match dirs_have_mcp(dirs) {
+                true => Some(cu::lock_installs(dirs, &mut |l| println!("{l}")).await?),
+                false => None,
+            };
             // The record first: the running client lets go of the server.
             let removed = cu::forget_all(dirs)?;
             reload_running(dirs).await;
@@ -2071,6 +2077,7 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
         }
         ComputerUseCmd::Rollback => {
             owner_edit(dirs).await?;
+            let _lock = cu::lock_installs(dirs, &mut |l| println!("{l}")).await?;
             let r = cu::rollback(dirs)?;
             println!("Computer use: back to {r}.");
             reload_running(dirs).await;
@@ -2146,25 +2153,37 @@ async fn computer_use_status(dirs: &Dirs, json: bool) -> Result<ExitCode, String
     use crate::computer_use as cu;
     let cfg = load_config(dirs)?;
     let doc = cu::store(dirs).current();
-    let running = match control::send(&dirs.socket(), Request::McpStatus { probe: true }).await {
-        Ok(Some(r)) if r.ok => r.mcp,
-        _ => None,
-    };
+    // Ok(None): no client runs; Err: it runs and said no.
+    let running: Result<Option<_>, String> =
+        match control::send(&dirs.socket(), Request::McpStatus { probe: true }).await {
+            Ok(Some(r)) if r.ok => Ok(r.mcp),
+            Ok(Some(r)) => Err(r.error.unwrap_or_default()),
+            _ => Ok(None),
+        };
     let pinned = cu::pinned(&doc);
     let installed = cfg.mcp.iter().next();
-    let files = installed.map(|(n, r)| {
-        sync_mcp::install::verify(&dirs.mcp_dir(), n, &r.folder, &r.sha256).map(|_| ())
-    });
-    let setup = cu::installed(dirs, &cfg)
-        .map(|(_, dir, pin)| cu::setup_state(&dir, &pin))
-        .unwrap_or_default();
+    // The folder is hashed once; the setup state needs it checked too.
+    let checked =
+        installed.map(|(n, r)| sync_mcp::install::verify(&dirs.mcp_dir(), n, &r.folder, &r.sha256));
+    let files = checked
+        .as_ref()
+        .map(|c| c.as_ref().map(|_| ()).map_err(Clone::clone));
+    let setup = match (installed, &checked) {
+        (Some((n, r)), Some(Ok(dir))) => {
+            sync_mcp::service::effective_pin(n, sync_mcp::os(), &r.folder, &doc, dir)
+                .map(|pin| cu::setup_state(dir, &pin))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
     if json {
         let v = serde_json::json!({
             "consent": cu::consent_text(&cfg, now_ms()),
             "installed": installed.map(|(n, r)| serde_json::json!({"name": n, "version": r.version, "serial": r.serial, "previous": r.previous.as_ref().map(|p| &p.version)})),
             "files": files.as_ref().map(|f| f.clone().err().unwrap_or_else(|| "checked".into())),
             "pinned": pinned.map(|p| serde_json::json!({"name": p.name, "version": p.version, "serial": doc.serial, "unpinned": p.unpinned(sync_mcp::arch())})),
-            "running": running,
+            "running": running.as_ref().ok(),
+            "refused": running.as_ref().err(),
             "setup": setup,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -2206,8 +2225,9 @@ async fn computer_use_status(dirs: &Dirs, json: bool) -> Result<ExitCode, String
         }
     }
     match &running {
-        None => println!("Server: the client is not running, so nothing runs the server"),
-        Some(m) => {
+        Ok(None) => println!("Server: the client is not running, so nothing runs the server"),
+        Err(e) => println!("Server: the client did not say: {e}"),
+        Ok(Some(m)) => {
             for s in &m.servers {
                 let state = match (&s.error, s.running, &s.last_error) {
                     (Some(e), _, _) => format!("unavailable: {e}"),

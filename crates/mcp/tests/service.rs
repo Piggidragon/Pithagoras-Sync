@@ -438,6 +438,13 @@ async fn a_changed_server_is_not_started() {
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!((e.code, reason(&e)), (code::SERVER, Some(why::CHANGED)));
     assert!(f.record().is_empty());
+    // The audit log says why, after the consent's record.
+    let audit = std::fs::read_to_string(f.root.join("audit.jsonl")).unwrap();
+    let last = audit.lines().last().unwrap();
+    assert!(
+        last.contains("\"decision\":\"failed\"") && last.contains("changed"),
+        "{audit}"
+    );
     // From then on it is listed as unavailable, without tools.
     let l = f.svc.list();
     assert_eq!(l.servers[0].state, "unavailable");

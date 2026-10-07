@@ -38,6 +38,25 @@ pub fn argv(argv: &[String], dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Most bytes of a setup command's output kept; the rest is read and dropped.
+const MAX_OUTPUT: u64 = 1 << 20;
+
+/// Reads a pipe to its end on a thread of its own, so a command that writes
+/// much never blocks on a full pipe; sends the first `MAX_OUTPUT` bytes.
+fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut kept = Vec::new();
+        if let Some(mut r) = r {
+            let _ = (&mut r).take(MAX_OUTPUT).read_to_end(&mut kept);
+            let _ = std::io::copy(&mut r, &mut std::io::sink());
+        }
+        let _ = tx.send(kept);
+    });
+    rx
+}
+
 fn run_argv(argv: &[String]) -> Result<String, String> {
     let (program, args) = argv.split_first().ok_or("an empty command")?;
     let mut cmd = std::process::Command::new(program);
@@ -52,27 +71,33 @@ fn run_argv(argv: &[String]) -> Result<String, String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{program}: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            break st;
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(format!("{program} did not finish within 60s"));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    };
+    // Something the command left running may hold the pipes open: then its
+    // output does not end, and is taken as empty (the reader drops the rest).
+    let wait = Duration::from_secs(5);
+    let out = stdout.recv_timeout(wait).unwrap_or_default();
+    let err = stderr.recv_timeout(wait).unwrap_or_default();
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err);
         return Err(format!(
-            "{program} failed ({}): {}",
-            out.status,
+            "{program} failed ({status}): {}",
             sync_policy::approve::visible(err.trim())
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
 
 /// Whether the step is done; `None` when it has no check.
@@ -117,5 +142,23 @@ mod tests {
         assert_eq!(check(&step, t.path()), Some(Ok(false)));
         apply(&step, t.path()).unwrap();
         assert_eq!(check(&step, t.path()), Some(Ok(true)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_writes_much_still_finishes() {
+        // More than a pipe holds, on both outputs.
+        let argv: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; echo done",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let started = std::time::Instant::now();
+        let out = run_argv(&argv).unwrap();
+        assert!(out.ends_with("done"));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

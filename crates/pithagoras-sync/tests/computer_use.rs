@@ -464,11 +464,29 @@ async fn while_computer_use_is_active_the_owners_side_takes_nothing() {
             .unwrap();
         assert!(line.contains("computer use is active"), "{line}");
     }
+    // Nor a reload by signal of a file typed meanwhile.
+    let before = Env::mode_line(&env.ok(&["status"]).await);
+    let file = env.home.join(".config/pithagoras-sync/config.toml");
+    let mut cfg = sync_policy::DeviceConfig::load(&file).unwrap();
+    cfg.policy.mode = sync_policy::Mode::Full;
+    cfg.save(&file).unwrap();
+    // SAFETY: plain kill(2) on our own child.
+    unsafe { libc::kill(daemon.id().unwrap() as i32, libc::SIGHUP) };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(Env::mode_line(&env.ok(&["status"]).await), before);
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    assert!(log.contains("reload refused"), "{log}");
     // What only takes away still works.
     let (_, out) = env.run(&["deny", "99"]).await;
     assert!(out.contains("no approval 99"), "{out}");
     let status = env.ok(&["status"]).await;
     assert!(status.contains("Computer use:"), "{status}");
+    // The server's status says how it is, without a probe of the server in use.
+    let cu = env.ok(&["computer-use", "status"]).await;
+    assert!(
+        cu.contains("Server: fake 1.0.0") && cu.contains("In use: chat c1"),
+        "{cu}"
+    );
     env.ok(&["computer-use", "off"]).await;
     let e = call(&dl, "c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), "consent_off");

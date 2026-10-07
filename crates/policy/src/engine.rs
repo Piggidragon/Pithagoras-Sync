@@ -167,6 +167,18 @@ impl From<ScreenRefusal> for RpcError {
     }
 }
 
+/// How a computer-use call was allowed (`authorize_screen`), for the check
+/// after it waited for its turn (`screen_still_allowed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenGrant {
+    /// `allow` was in force.
+    Allowed,
+    /// The chat's "for this chat" answer.
+    Chat,
+    /// The owner answered this call's own question.
+    Once,
+}
+
 /// Why computer use asks, in every question it raises.
 pub const SCREEN_REASON: &str = "computer use asks (policy.computer_use.consent = ask): it is as strong as Full mode, since the agent can see your screen and click and type anything you can, a terminal included";
 
@@ -685,7 +697,7 @@ impl Engine {
         &self,
         call: &Call<'_>,
         req: ScreenRequest<'_>,
-    ) -> Result<(), ScreenRefusal> {
+    ) -> Result<ScreenGrant, ScreenRefusal> {
         use sync_proto::mcp_reason as why;
         let target = format!("{}.{} {}", req.server, req.tool, req.shown);
         let record = |decision: &str, reason: Option<String>| {
@@ -737,25 +749,16 @@ impl Engine {
             }
             crate::config::Consent::Allow => {
                 record("allowed", Some("computer use is allowed for a time".into()));
-                return Ok(());
+                return Ok(ScreenGrant::Allowed);
             }
             crate::config::Consent::Ask => {}
         }
-        let given = {
-            let mut chats = self.chats.lock().unwrap();
-            chats.get_mut(call.chat).is_some_and(|c| {
-                c.used_ms = now;
-                c.approved
-                    .get(&Scope::Screen)
-                    .is_some_and(|until| until.is_none_or(|u| now < u))
-            })
-        };
-        if given {
+        if self.screen_given(call.chat, now, true) {
             record(
                 "allowed",
                 Some("computer use was allowed for this chat".into()),
             );
-            return Ok(());
+            return Ok(ScreenGrant::Chat);
         }
         if !self.approver.can_prompt() {
             return Err(deny(
@@ -815,19 +818,40 @@ impl Engine {
                     .approved
                     .insert(Scope::Screen, until);
                 record("approved", Some("computer use, for this chat".into()));
-                Ok(())
+                Ok(ScreenGrant::Chat)
             }
             Answer::Once | Answer::ForTime(_) => {
                 record("approved", Some("computer use, once".into()));
-                Ok(())
+                Ok(ScreenGrant::Once)
             }
         }
     }
 
-    /// Whether a computer-use call allowed earlier may still run now, after it
-    /// waited for its turn: not paused, within the hours, the consent not
-    /// switched off or run out meanwhile.
-    pub fn screen_still_allowed(&self, call: &Call<'_>, target: &str) -> Result<(), ScreenRefusal> {
+    /// Whether the chat holds a "for this chat" answer for computer use now
+    /// (`touch`: and counts as used).
+    fn screen_given(&self, chat: &str, now: i64, touch: bool) -> bool {
+        let mut chats = self.chats.lock().unwrap();
+        chats.get_mut(chat).is_some_and(|c| {
+            if touch {
+                c.used_ms = now;
+            }
+            c.approved
+                .get(&Scope::Screen)
+                .is_some_and(|until| until.is_none_or(|u| now < u))
+        })
+    }
+
+    /// Whether a computer-use call allowed earlier (as `grant` says) may still
+    /// run now, after it waited for its turn: not paused, within the hours,
+    /// the consent not switched off or run out meanwhile, and not narrowed
+    /// from `allow` to `ask` (or its chat's answer taken back) unless the
+    /// owner answered this very call.
+    pub fn screen_still_allowed(
+        &self,
+        call: &Call<'_>,
+        target: &str,
+        grant: ScreenGrant,
+    ) -> Result<(), ScreenRefusal> {
         use sync_proto::mcp_reason as why;
         let refuse = |reason: &'static str, message: &str| {
             self.record_in(
@@ -855,13 +879,21 @@ impl Engine {
                 "outside the hours this device works for the portal",
             );
         }
-        if snap.policy.computer_use.effective(now) == crate::config::Consent::Off {
-            return refuse(
+        match snap.policy.computer_use.effective(now) {
+            crate::config::Consent::Off => refuse(
                 why::CONSENT_OFF,
                 "computer use was switched off while the call waited",
-            );
+            ),
+            crate::config::Consent::Allow => Ok(()),
+            crate::config::Consent::Ask => match grant {
+                ScreenGrant::Once => Ok(()),
+                _ if self.screen_given(call.chat, now, false) => Ok(()),
+                _ => refuse(
+                    why::CONSENT_DENIED,
+                    "computer use was switched to ask while the call waited, and this chat has no answer for it; send the call again to be asked",
+                ),
+            },
         }
-        Ok(())
     }
 
     /// For grep and find, after the search root passed `authorize`: whether a path
