@@ -1738,7 +1738,7 @@ fn desktop_installed(data: &Path) -> bool {
     data.join("applications")
         .join(install::DESKTOP_FILE)
         .exists()
-        || install::icon_path(data).exists()
+        || install::icon_paths(data).iter().any(|p| p.exists())
 }
 
 pub(crate) fn install_plan(

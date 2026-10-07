@@ -1025,7 +1025,11 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     let env = Env::new();
     let path = fake_systemd(&env);
     let log = env.root.join("systemctl.log");
-    for prog in ["update-desktop-database", "xdg-mime"] {
+    for prog in [
+        "update-desktop-database",
+        "xdg-mime",
+        "gtk-update-icon-cache",
+    ] {
         let p = env.root.join("fakebin").join(prog);
         std::fs::write(
             &p,
@@ -1045,6 +1049,8 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     };
     let entry = data.join("applications/pithagoras-sync.desktop");
     let icon = data.join("icons/hicolor/scalable/apps/pithagoras-sync.svg");
+    // The raster sizes beside it, where GNOME and KDE look first.
+    let png = data.join("icons/hicolor/256x256/apps/pithagoras-sync.png");
     // Over ssh (no display) nothing of the desktop's.
     let out = run(&["install", "--print"], false).output().await.unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -1083,7 +1089,17 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
         "{desktop}"
     );
     assert!(std::fs::read_to_string(&icon).unwrap().starts_with("<svg"));
+    assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
     let calls = std::fs::read_to_string(&log).unwrap();
+    // The icon cache of the user's hicolor folder, so the menu shows the
+    // icon without a new login.
+    assert!(
+        calls.contains(&format!(
+            "gtk-update-icon-cache -f -t {}",
+            data.join("icons/hicolor").display()
+        )),
+        "{calls}"
+    );
     assert!(
         calls.contains(&format!(
             "update-desktop-database {}",
@@ -1113,7 +1129,7 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     assert!(entry.exists());
     let out = run(&["uninstall"], false).output().await.unwrap();
     assert!(out.status.success());
-    assert!(!entry.exists() && !icon.exists());
+    assert!(!entry.exists() && !icon.exists() && !png.exists());
 
     // Left without the unit, `--purge` still finds them.
     let out = run(&["install"], true).output().await.unwrap();
@@ -1141,8 +1157,9 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
 /// A stand-in `zenity` (and `kdialog`) in `fakebin`: it writes each dialog's
 /// arguments, one per line and a `----` line after them, to `dialogs.log`, its
 /// environment to `dialogs.env`, and answers with the next line of
-/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). Returns
-/// the PATH to run with.
+/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). It
+/// says it is zenity 4.0.1 when asked (`--version`, no dialog). Returns the
+/// PATH to run with.
 fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
     use std::os::unix::fs::PermissionsExt;
     let bin = env.root.join("fakebin");
@@ -1161,7 +1178,7 @@ fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 4.0.1; exit 0; }}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
                 log = log.display(),
                 envlog = envlog.display(),
                 open = open.display(),

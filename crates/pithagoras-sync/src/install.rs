@@ -34,6 +34,23 @@ pub const SCHEME: &str = "pithagoras-sync";
 pub const DESKTOP_FILE: &str = "pithagoras-sync.desktop";
 /// The icon, built into the program (the release is one file).
 pub const ICON: &[u8] = include_bytes!("../../../assets/pithagoras-sync.svg");
+/// The icon's name in the icon theme: the desktop entry and the windows name it.
+pub const ICON_NAME: &str = "pithagoras-sync";
+/// The icon in the raster sizes desktops look for first, made from the SVG
+/// (`assets/`): a lone scalable SVG in a user's `hicolor` folder is not always
+/// picked up.
+pub const ICON_PNGS: [(u32, &[u8]); 4] = [
+    (48, include_bytes!("../../../assets/pithagoras-sync-48.png")),
+    (64, include_bytes!("../../../assets/pithagoras-sync-64.png")),
+    (
+        128,
+        include_bytes!("../../../assets/pithagoras-sync-128.png"),
+    ),
+    (
+        256,
+        include_bytes!("../../../assets/pithagoras-sync-256.png"),
+    ),
+];
 /// The link handler's key under `HKEY_CURRENT_USER`.
 pub const WINDOWS_CLASS_KEY: &str = r"Software\Classes\pithagoras-sync";
 const DESCRIPTION: &str = "Pithagoras Sync: lets a Pithagoras portal's agent reach this computer";
@@ -207,21 +224,62 @@ MimeType=x-scheme-handler/{SCHEME};
     ))
 }
 
+/// The user's `hicolor` icon folder below the data home.
+fn hicolor(data_home: &Path) -> PathBuf {
+    data_home.join("icons/hicolor")
+}
+
 /// The icon's path below the data home.
 pub fn icon_path(data_home: &Path) -> PathBuf {
-    data_home.join("icons/hicolor/scalable/apps/pithagoras-sync.svg")
+    hicolor(data_home).join("scalable/apps/pithagoras-sync.svg")
+}
+
+/// The raster icon of `size` pixels below the data home.
+pub fn png_icon_path(data_home: &Path, size: u32) -> PathBuf {
+    hicolor(data_home).join(format!("{size}x{size}/apps/pithagoras-sync.png"))
+}
+
+/// Every icon file `install` writes below the data home.
+pub fn icon_paths(data_home: &Path) -> Vec<PathBuf> {
+    let mut v = vec![icon_path(data_home)];
+    v.extend(ICON_PNGS.iter().map(|(s, _)| png_icon_path(data_home, *s)));
+    v
+}
+
+/// Brings the icon cache of the user's `hicolor` folder up to date (`-t`: the
+/// folder has no `index.theme` of its own), so the menu and the windows find
+/// the icon without a new login.
+fn icon_cache_update(data_home: &Path, hint: &str) -> Action {
+    Action::Try {
+        argv: argv(&[
+            "gtk-update-icon-cache",
+            "-f",
+            "-t",
+            &hicolor(data_home).to_string_lossy(),
+        ]),
+        hint: hint.into(),
+    }
 }
 
 /// The desktop entry, the icon and the link handler for the program `install`
 /// put in place. The two tools are best effort: one that is missing is a note.
 pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, String> {
     let apps = data_home.join("applications");
-    Ok(vec![
-        Action::Write {
-            path: icon_path(data_home),
-            content: ICON.to_vec(),
-            mode: 0o644,
-        },
+    let mut plan = vec![Action::Write {
+        path: icon_path(data_home),
+        content: ICON.to_vec(),
+        mode: 0o644,
+    }];
+    plan.extend(ICON_PNGS.iter().map(|(size, png)| Action::Write {
+        path: png_icon_path(data_home, *size),
+        content: png.to_vec(),
+        mode: 0o644,
+    }));
+    plan.push(icon_cache_update(
+        data_home,
+        "the menu may show Pithagoras Sync with a generic icon until the next login",
+    ));
+    plan.extend([
         Action::Write {
             path: apps.join(DESKTOP_FILE),
             content: desktop_entry(program)?.into_bytes(),
@@ -240,7 +298,8 @@ pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, Str
             ]),
             hint: "pairing links may not open Pithagoras Sync; paste the link into it instead (Pithagoras Sync in the menu)".into(),
         },
-    ])
+    ]);
+    Ok(plan)
 }
 
 /// Undoes `desktop_plan`. The `x-scheme-handler` line `xdg-mime` wrote to
@@ -248,18 +307,25 @@ pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, Str
 /// once the entry is gone.
 pub fn desktop_uninstall_plan(data_home: &Path) -> Vec<Action> {
     let apps = data_home.join("applications");
-    vec![
-        Action::Remove {
-            path: apps.join(DESKTOP_FILE),
-        },
-        Action::Remove {
-            path: icon_path(data_home),
-        },
+    let mut plan = vec![Action::Remove {
+        path: apps.join(DESKTOP_FILE),
+    }];
+    plan.extend(
+        icon_paths(data_home)
+            .into_iter()
+            .map(|path| Action::Remove { path }),
+    );
+    plan.extend([
+        icon_cache_update(
+            data_home,
+            "the icon cache may list Pithagoras Sync's icon until it is rebuilt",
+        ),
         Action::Try {
             argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
             hint: "the menu may show Pithagoras Sync until the next login".into(),
         },
-    ]
+    ]);
+    plan
 }
 
 /// The `pithagoras-sync://` handler on Windows, for the program at `exe`:
@@ -985,10 +1051,27 @@ mod tests {
             desktop_entry(program).unwrap()
         );
         assert_eq!(std::fs::read(&icon).unwrap(), ICON);
+        // The raster sizes next to the SVG, where GTK and KDE look first.
+        for (size, png) in ICON_PNGS {
+            let p = r.join(format!(
+                "home/someone/.local/share/icons/hicolor/{size}x{size}/apps/pithagoras-sync.png"
+            ));
+            assert_eq!(std::fs::read(&p).unwrap(), png);
+            assert!(png.starts_with(b"\x89PNG"));
+            // The width in the PNG header is the folder's size.
+            assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), size);
+        }
         let ran = fake.ran.lock().unwrap().clone();
+        let cache = argv(&[
+            "gtk-update-icon-cache",
+            "-f",
+            "-t",
+            "/home/someone/.local/share/icons/hicolor",
+        ]);
         assert_eq!(
             ran,
             [
+                cache.clone(),
                 argv(&[
                     "update-desktop-database",
                     "/home/someone/.local/share/applications"
@@ -1009,8 +1092,24 @@ mod tests {
         let hints = apply(&desktop_plan(data, program).unwrap(), r, &missing).unwrap();
         assert_eq!(hints.len(), 1);
         assert!(hints[0].contains("paste the link"), "{hints:?}");
-        apply(&desktop_uninstall_plan(data), r, &Fake::default()).unwrap();
+        // Without gtk-update-icon-cache the icon is still written.
+        let no_cache = Fake {
+            answers: vec![(
+                "gtk-update-icon-cache -f".into(),
+                Err("gtk-update-icon-cache: not found".into()),
+            )],
+            ..Fake::default()
+        };
+        let hints = apply(&desktop_plan(data, program).unwrap(), r, &no_cache).unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("generic icon"), "{hints:?}");
+        let uninstall = Fake::default();
+        apply(&desktop_uninstall_plan(data), r, &uninstall).unwrap();
         assert!(!entry.exists() && !icon.exists());
+        for p in icon_paths(data) {
+            assert!(!crate::actions::rooted(r, &p).exists(), "{}", p.display());
+        }
+        assert!(uninstall.ran.lock().unwrap().contains(&cache));
         // The plans as `--print` lists them.
         let listed: Vec<String> = desktop_plan(data, program)
             .unwrap()
@@ -1023,6 +1122,18 @@ mod tests {
                 .any(|l| l.ends_with("applications/pithagoras-sync.desktop"))
         );
         assert!(listed.iter().any(|l| l.contains("xdg-mime default")));
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.ends_with("hicolor/256x256/apps/pithagoras-sync.png")),
+            "{listed:?}"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.contains("gtk-update-icon-cache -f -t")),
+            "{listed:?}"
+        );
     }
 
     /// Ending a logon task that does not run (on every first install) is no

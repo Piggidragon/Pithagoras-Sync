@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use sync_policy::approve::visible;
 use sync_policy::secret::Secret;
 
+pub use crate::install::ICON_NAME;
+
 pub const TITLE: &str = "Pithagoras Sync";
 
 /// The longest text a dialog shows.
@@ -98,9 +100,10 @@ fn qt(s: &str) -> String {
 }
 
 impl Helper {
-    /// The program's arguments for `ask`. Every value is one argument; zenity's
-    /// take the `--name=value` form, so none can be read as an option.
-    pub fn args(&self, ask: &Ask) -> Vec<String> {
+    /// The program's arguments for `ask`, with the program's icon (`icon`)
+    /// where the dialog shows one. Every value is one argument; zenity's take
+    /// the `--name=value` form, so none can be read as an option.
+    pub fn args(&self, ask: &Ask, icon: bool) -> Vec<String> {
         let clipped = |t: &str| clip(t, MAX_TEXT);
         match self {
             Helper::Zenity(_) => {
@@ -115,6 +118,11 @@ impl Helper {
                             }
                             .into(),
                         );
+                        // zenity 4 shows it in these three; its forms, lists
+                        // and entries take the option but show no icon.
+                        if icon {
+                            a.push(format!("--icon={ICON_NAME}"));
+                        }
                         a.push("--no-markup".into());
                         a.push("--width=480".into());
                         a.push(format!("--text={}", clipped(t)));
@@ -152,6 +160,10 @@ impl Helper {
             }
             Helper::Kdialog(_) => {
                 let mut a = vec!["--title".to_string(), TITLE.to_string()];
+                // The window's icon, in every kdialog dialog.
+                if icon {
+                    a.extend(["--icon".to_string(), ICON_NAME.to_string()]);
+                }
                 let text = |t: &str| qt(&clipped(t));
                 match ask {
                     Ask::Info(t) => a.extend(["--msgbox".into(), text(t)]),
@@ -380,16 +392,60 @@ fn installed_locales(path: &std::ffi::OsStr) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether the dialog program takes the icon option: kdialog's `--icon` is as
+/// old as kdialog; zenity's `--icon` came with zenity 4 (3 would refuse it and
+/// show no window at all, so a question would read as No).
+fn takes_icon(helper: &Helper, version: Option<&str>) -> bool {
+    match helper {
+        Helper::Kdialog(_) => true,
+        Helper::Zenity(_) => version
+            .and_then(|v| v.trim().split('.').next()?.parse::<u32>().ok())
+            .is_some_and(|major| major >= 4),
+    }
+}
+
+/// Whether `install` put the icon below the data home: before that (the
+/// downloaded file's first windows) zenity would draw a missing image in
+/// place of its own icon.
+fn icon_there(data_home: &Path) -> bool {
+    crate::install::icon_paths(data_home)
+        .iter()
+        .any(|p| p.is_file())
+}
+
+/// `zenity --version`, run as the dialogs are, or `None`.
+fn zenity_version(prog: &Path) -> Option<String> {
+    let mut cmd = std::process::Command::new(prog);
+    cmd.arg("--version")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for v in DIALOG_ENV {
+        if let Some(x) = std::env::var_os(v) {
+            cmd.env(v, x);
+        }
+    }
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let v = String::from_utf8_lossy(&out.stdout);
+    Some(v.chars().take(32).collect())
+}
+
 /// The desktop's dialog program.
 pub struct Native {
     helper: Helper,
     /// Locale variables set over the session's (`locale_fix`).
     locale: Vec<(&'static str, String)>,
+    /// Whether it is given the program's icon (`takes_icon`, `icon_there`).
+    icon: bool,
 }
 
 impl Native {
-    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>) -> Native {
-        Native { helper, locale }
+    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>, icon: bool) -> Native {
+        Native {
+            helper,
+            locale,
+            icon,
+        }
     }
 
     /// The dialog program of this session, if there is a display and one.
@@ -401,7 +457,13 @@ impl Native {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let helper = find_helper(&path, &desktop, &system_program)?;
         let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
-        Some(Native::new(helper, locale))
+        let version = match &helper {
+            Helper::Zenity(p) => zenity_version(p),
+            Helper::Kdialog(_) => None,
+        };
+        let data = sync_ops::info::home().map(|h| crate::cli::data_home(&h));
+        let icon = takes_icon(&helper, version.as_deref()) && data.is_some_and(|d| icon_there(&d));
+        Some(Native::new(helper, locale, icon))
     }
 
     /// Runs the program; its exit code and up to `MAX_ANSWER` bytes of its
@@ -409,7 +471,7 @@ impl Native {
     fn run(&self, ask: &Ask) -> (Option<i32>, Option<String>) {
         use std::io::Read;
         let mut cmd = std::process::Command::new(self.helper.program());
-        cmd.args(self.helper.args(ask))
+        cmd.args(self.helper.args(ask, self.icon))
             .env_clear()
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -516,10 +578,11 @@ mod win {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
-        MB_SETFOREGROUND, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
+        IDOK, IDYES, MB_ICONERROR, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_USERICON, MB_YESNO,
+        MB_YESNOCANCEL, MESSAGEBOX_STYLE, MSGBOXPARAMSW, MessageBoxIndirectW,
     };
 
     use sync_policy::win::wide;
@@ -530,17 +593,33 @@ mod win {
     const CF_UNICODETEXT: u32 = 13;
     const IDNO: i32 = 7;
 
+    /// The resource id of the program's icon (`build.rs`).
+    const ICON_ID: usize = 1;
+
+    /// A box with the program's icon (`MB_USERICON`) unless `style` names a
+    /// stock one (an error's). Without the icon resource (a build that has
+    /// none) Windows shows the box without an icon.
     fn message(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
         let t = wide(&clip(text, MAX_TEXT));
         let title = wide(TITLE);
-        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let own = style & MB_ICONERROR == 0;
+        // SAFETY: both strings are NUL-terminated and outlive the call; the
+        // module handle of the program itself needs no release; the icon is
+        // named by its resource id (MAKEINTRESOURCE).
         unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                t.as_ptr(),
-                title.as_ptr(),
-                style | MB_SETFOREGROUND,
-            )
+            let params = MSGBOXPARAMSW {
+                cbSize: std::mem::size_of::<MSGBOXPARAMSW>() as u32,
+                hwndOwner: std::ptr::null_mut(),
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                lpszText: t.as_ptr(),
+                lpszCaption: title.as_ptr(),
+                dwStyle: style | MB_SETFOREGROUND | if own { MB_USERICON } else { 0 },
+                lpszIcon: ICON_ID as *const u16,
+                dwContextHelpId: 0,
+                lpfnMsgBoxCallback: None,
+                dwLanguageId: 0,
+            };
+            MessageBoxIndirectW(&params)
         }
     }
 
@@ -581,7 +660,7 @@ mod win {
 
     impl Dialogs for WinDialogs {
         fn info(&self, text: &str) {
-            message(text, MB_OK | MB_ICONINFORMATION);
+            message(text, MB_OK);
         }
 
         fn error(&self, text: &str) {
@@ -589,12 +668,12 @@ mod win {
         }
 
         fn question(&self, text: &str) -> bool {
-            message(text, MB_YESNO | MB_ICONQUESTION) == IDYES
+            message(text, MB_YESNO) == IDYES
         }
 
         fn entry(&self, text: &str) -> Option<String> {
             let t = format!("{text}\n\n{}", self.0.clipboard_hint());
-            if message(&t, MB_OKCANCEL | MB_ICONQUESTION) != IDOK {
+            if message(&t, MB_OKCANCEL) != IDOK {
                 return None;
             }
             // OK with no text in the clipboard (empty, or a picture) is an
@@ -609,7 +688,7 @@ mod win {
         fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
             for (i, (key, label)) in items.iter().enumerate() {
                 let t = self.0.menu_step(text, label, i + 1 == items.len());
-                match message(&t, MB_YESNOCANCEL | MB_ICONQUESTION) {
+                match message(&t, MB_YESNOCANCEL) {
                     IDYES => return Some(key),
                     IDNO => continue,
                     _ => return None,
@@ -711,7 +790,7 @@ mod tests {
     #[test]
     fn zenity_gets_plain_text_one_argument_each() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"));
+        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"), false);
         assert_eq!(
             a,
             [
@@ -723,16 +802,16 @@ mod tests {
             ]
         );
         // Texts that zenity reads as markup are escaped.
-        let a = z.args(&Ask::Entry("a <i>b</i> & c"));
+        let a = z.args(&Ask::Entry("a <i>b</i> & c"), false);
         assert_eq!(a.last().unwrap(), "--text=a &lt;i&gt;b&lt;/i&gt; &amp; c");
         // A password is not shown as it is typed.
-        let a = z.args(&Ask::Password("pw <x>"));
+        let a = z.args(&Ask::Password("pw <x>"), false);
         assert_eq!(&a[1..3], ["--entry", "--hide-text"]);
         assert_eq!(a.last().unwrap(), "--text=pw &lt;x&gt;");
-        let a = z.args(&Ask::Menu(
-            "Paired with <x>",
-            &[("status", "Status"), ("quit", "Quit")],
-        ));
+        let a = z.args(
+            &Ask::Menu("Paired with <x>", &[("status", "Status"), ("quit", "Quit")]),
+            false,
+        );
         assert!(a.contains(&"--print-column=1".to_string()), "{a:?}");
         assert!(
             a.contains(&"--text=Paired with &lt;x&gt;".to_string()),
@@ -741,7 +820,7 @@ mod tests {
         assert_eq!(&a[a.len() - 4..], ["status", "Status", "quit", "Quit"]);
         // Every option is one `--name=value` argument: no text is a separate
         // argument zenity could take for an option.
-        let a = z.args(&Ask::Info("--help"));
+        let a = z.args(&Ask::Info("--help"), false);
         assert!(a.iter().all(|x| x.starts_with("--")), "{a:?}");
         assert_eq!(a.last().unwrap(), "--text=--help");
     }
@@ -749,7 +828,7 @@ mod tests {
     #[test]
     fn kdialog_text_cannot_carry_markup() {
         let k = Helper::Kdialog("/usr/bin/kdialog".into());
-        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"));
+        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"), false);
         assert_eq!(
             a,
             [
@@ -759,20 +838,52 @@ mod tests {
                 "<qt>&lt;img src=x&gt; &amp; &quot;q&quot;<br>line 2</qt>"
             ]
         );
-        let a = k.args(&Ask::Entry("Paste the link"));
+        let a = k.args(&Ask::Entry("Paste the link"), false);
         assert_eq!(&a[2..], ["--inputbox", "<qt>Paste the link</qt>", ""]);
-        let a = k.args(&Ask::Password("Passwort für <b>"));
+        let a = k.args(&Ask::Password("Passwort für <b>"), false);
         assert_eq!(&a[2..], ["--password", "<qt>Passwort für &lt;b&gt;</qt>"]);
-        let a = k.args(&Ask::Menu("m", &[("log", "Open log")]));
+        let a = k.args(&Ask::Menu("m", &[("log", "Open log")]), false);
         assert_eq!(&a[2..], ["--menu", "<qt>m</qt>", "log", "Open log"]);
         // A text that starts with a dash is still inside `<qt>`.
-        assert!(k.args(&Ask::Error("-x"))[3].starts_with("<qt>"));
+        assert!(k.args(&Ask::Error("-x"), false)[3].starts_with("<qt>"));
+    }
+
+    /// The program's icon where the dialog shows one; never for a zenity
+    /// older than 4, which knows no `--icon` and would show no window.
+    #[test]
+    fn the_dialogs_carry_the_programs_icon() {
+        let z = Helper::Zenity("/usr/bin/zenity".into());
+        for ask in [Ask::Question("q"), Ask::Info("i"), Ask::Error("e")] {
+            let a = z.args(&ask, true);
+            assert_eq!(a[2], "--icon=pithagoras-sync", "{a:?}");
+            assert!(!z.args(&ask, false).iter().any(|x| x.starts_with("--icon")));
+        }
+        for ask in [Ask::Entry("e"), Ask::Password("p"), Ask::Menu("m", &[])] {
+            let a = z.args(&ask, true);
+            assert!(!a.iter().any(|x| x.starts_with("--icon")), "{a:?}");
+        }
+        let k = Helper::Kdialog("/usr/bin/kdialog".into());
+        let a = k.args(&Ask::Password("p"), true);
+        assert_eq!(&a[2..5], ["--icon", "pithagoras-sync", "--password"]);
+        assert!(takes_icon(&k, None));
+        assert!(takes_icon(&z, Some("4.0.1\n")));
+        assert!(takes_icon(&z, Some("4.1")));
+        assert!(!takes_icon(&z, Some("3.44.0\n")));
+        assert!(!takes_icon(&z, Some("")));
+        assert!(!takes_icon(&z, None));
+        // Only once the icon is installed.
+        let t = tempfile::tempdir().unwrap();
+        assert!(!icon_there(t.path()));
+        let png = crate::install::png_icon_path(t.path(), 48);
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&png, crate::install::ICON_PNGS[0].1).unwrap();
+        assert!(icon_there(t.path()));
     }
 
     #[test]
     fn a_long_text_is_cut_before_it_reaches_the_dialog() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)));
+        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)), false);
         assert!(a.last().unwrap().chars().count() < MAX_TEXT + 10);
     }
 
