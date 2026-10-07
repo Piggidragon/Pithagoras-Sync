@@ -10,6 +10,8 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(sync_ops::SHIM_ARG.as_ref()) {
         std::process::exit(sync_ops::shim_main());
     }
+    // This program's path, read before an update can replace the file.
+    let _ = pithagoras_sync::cli::this_program();
     // A pairing link alone is what a browser hands over: the graphical flow
     // takes it (after asking), and no link is read as a command.
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();

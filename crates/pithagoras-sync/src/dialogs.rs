@@ -85,7 +85,7 @@ pub struct Form<'a> {
 /// What came back from a form: a value for each field it had.
 #[derive(Debug, Default)]
 pub struct Filled {
-    pub entry: Option<String>,
+    pub entry: Option<Secret>,
     pub password: Option<Secret>,
 }
 
@@ -113,8 +113,10 @@ pub trait Dialogs {
     fn error(&self, text: &str);
     /// Yes or No. A closed window, or a dialog that could not be shown, is No.
     fn question(&self, text: &str) -> bool;
-    /// One line typed or pasted in; `None` when cancelled.
-    fn entry(&self, text: &str, buttons: Buttons) -> Option<String>;
+    /// One line typed or pasted in; `None` when cancelled. Zeroed once
+    /// dropped: on Windows it is the clipboard's text, which may be anything
+    /// the owner copied (a password).
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret>;
     /// One line typed in without showing it; `None` when cancelled.
     fn password(&self, text: &str) -> Option<Secret>;
     /// One of `items` (key, label), by its key; `None` when cancelled or
@@ -303,7 +305,7 @@ impl Helper {
                     a.extend(["--icon".to_string(), ICON_NAME.to_string()]);
                 }
                 let text = |t: &str| qt(&clipped(t));
-                if let Ask::Entry(_, b) | Ask::Menu(_, _, b) | Ask::Form(_, _, b) = ask {
+                if let Ask::Entry(_, b) | Ask::Menu(_, _, b) = ask {
                     a.extend([
                         "--ok-label".into(),
                         b.ok.to_string(),
@@ -315,11 +317,10 @@ impl Helper {
                     Ask::Info(t) => a.extend(["--msgbox".into(), text(t)]),
                     Ask::Error(t) => a.extend(["--error".into(), text(t)]),
                     Ask::Question(t) => a.extend(["--yesno".into(), text(t)]),
-                    // kdialog has no form: its entry stands in for one (the
-                    // flow asks a password in a window of its own there).
-                    Ask::Entry(t, _) | Ask::Form(t, _, _) => {
-                        a.extend(["--inputbox".into(), text(t), String::new()])
-                    }
+                    Ask::Entry(t, _) => a.extend(["--inputbox".into(), text(t), String::new()]),
+                    // No forms: `Native::form` asks field by field, the
+                    // password in its own box. An input box would show it.
+                    Ask::Form(..) => unreachable!("kdialog has no forms"),
                     Ask::Password(t) => a.extend(["--password".into(), text(t)]),
                     Ask::Menu(t, items, _) => {
                         a.extend(["--menu".into(), text(t)]);
@@ -565,9 +566,18 @@ fn icon_there(data_home: &Path) -> bool {
 
 /// `zenity --version`, run as the dialogs are, or `None`.
 fn zenity_version(prog: &Path) -> Option<String> {
+    let mut cmd = dialog_command(prog);
+    cmd.arg("--version");
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let v = String::from_utf8_lossy(&out.stdout);
+    Some(v.chars().take(32).collect())
+}
+
+/// `prog` as every dialog program runs: in the cleaned environment
+/// (`DIALOG_ENV`), with no input and its errors dropped.
+fn dialog_command(prog: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(prog);
-    cmd.arg("--version")
-        .env_clear()
+    cmd.env_clear()
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     for v in DIALOG_ENV {
@@ -575,9 +585,7 @@ fn zenity_version(prog: &Path) -> Option<String> {
             cmd.env(v, x);
         }
     }
-    let out = cmd.output().ok().filter(|o| o.status.success())?;
-    let v = String::from_utf8_lossy(&out.stdout);
-    Some(v.chars().take(32).collect())
+    cmd
 }
 
 /// The desktop's dialog program.
@@ -620,17 +628,9 @@ impl Native {
     /// output (`None` when there was more, or it could not run).
     fn run(&self, ask: &Ask) -> (Option<i32>, Option<String>) {
         use std::io::Read;
-        let mut cmd = std::process::Command::new(self.helper.program());
+        let mut cmd = dialog_command(self.helper.program());
         cmd.args(self.helper.args(ask, self.icon))
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        for v in DIALOG_ENV {
-            if let Some(x) = std::env::var_os(v) {
-                cmd.env(v, x);
-            }
-        }
+            .stdout(std::process::Stdio::piped());
         for (k, v) in &self.locale {
             cmd.env(k, v);
         }
@@ -681,12 +681,12 @@ pub fn split_form(mut out: String, form: Form) -> Filled {
         (true, true) => {
             let (entry, pw) = text.split_once(FORM_SEPARATOR).unwrap_or((text, ""));
             Filled {
-                entry: Some(entry.to_string()),
+                entry: Some(Secret::new(entry.to_string())),
                 password: Some(Secret::new(pw.to_string())),
             }
         }
         (true, false) => Filled {
-            entry: Some(text.to_string()),
+            entry: Some(Secret::new(text.to_string())),
             password: None,
         },
         (false, true) => Filled {
@@ -720,9 +720,18 @@ impl Dialogs for Native {
         self.run(&Ask::Question(text)).0 == Some(0)
     }
 
-    fn entry(&self, text: &str, buttons: Buttons) -> Option<String> {
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
         match self.run(&Ask::Entry(text, buttons)) {
-            (Some(0), Some(t)) => Some(t.trim_end_matches(['\n', '\r']).to_string()),
+            (Some(0), Some(mut t)) => {
+                while t.ends_with(['\n', '\r']) {
+                    t.pop();
+                }
+                Some(Secret::new(t))
+            }
+            (_, Some(t)) => {
+                drop(Secret::new(t));
+                None
+            }
             _ => None,
         }
     }
@@ -887,18 +896,14 @@ mod win {
             message(text, MB_YESNO) == IDYES
         }
 
-        fn entry(&self, text: &str, _buttons: super::Buttons) -> Option<String> {
+        fn entry(&self, text: &str, _buttons: super::Buttons) -> Option<Secret> {
             let t = format!("{text}\n\n{}", self.0.clipboard_hint());
             if message(&t, MB_OKCANCEL) != IDOK {
                 return None;
             }
             // OK with no text in the clipboard (empty, or a picture) is an
             // answer too: the flow says so and asks again.
-            Some(
-                clipboard()
-                    .map(|c| c.expose().trim().to_string())
-                    .unwrap_or_default(),
-            )
+            Some(clipboard().unwrap_or_else(|| Secret::new(String::new())))
         }
 
         fn password(&self, _text: &str) -> Option<Secret> {
@@ -1006,10 +1011,10 @@ impl Dialogs for Fake {
         self.next("question", text) == "yes"
     }
 
-    fn entry(&self, text: &str, buttons: Buttons) -> Option<String> {
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
         self.next(&format!("entry [{}]", buttons.ok), text)
             .strip_prefix("text:")
-            .map(str::to_string)
+            .map(|t| Secret::new(t.to_string()))
     }
 
     fn password(&self, text: &str) -> Option<Secret> {
@@ -1213,6 +1218,8 @@ mod tests {
             assert!(!a.iter().any(|x| x.starts_with("--icon")), "{a:?}");
         }
         let k = Helper::Kdialog("/usr/bin/kdialog".into());
+        let form = std::panic::catch_unwind(|| k.args(&Ask::Form("f", Form::default(), B), false));
+        assert!(form.is_err(), "kdialog has no forms");
         let a = k.args(&Ask::Password("p"), true);
         assert_eq!(&a[2..5], ["--icon", "pithagoras-sync", "--password"]);
         assert!(takes_icon(&k, None));
@@ -1340,7 +1347,7 @@ mod tests {
     fn the_fake_answers_in_order_and_cancels_when_out_of_answers() {
         let f = Fake::with(&["yes", "text:abc", "pick:log"]);
         assert!(f.question("q"));
-        assert_eq!(f.entry("e", B).as_deref(), Some("abc"));
+        assert_eq!(f.entry("e", B).as_ref().map(Secret::expose), Some("abc"));
         assert_eq!(f.menu("m", &[("log", "Open log")], B), Some("log"));
         assert!(!f.question("again"));
         assert_eq!(f.seen().len(), 4);
@@ -1414,10 +1421,13 @@ mod tests {
             "pithagoras-sync://pair?x|y\u{1f}pw|with\u{1f}more \n".into(),
             both,
         );
-        assert_eq!(f.entry.as_deref(), Some("pithagoras-sync://pair?x|y"));
+        assert_eq!(
+            f.entry.as_ref().map(Secret::expose),
+            Some("pithagoras-sync://pair?x|y")
+        );
         assert_eq!(f.password.unwrap().expose(), "pw|with\u{1f}more ");
         let f = split_form("\u{1f}secret\n".into(), both);
-        assert_eq!(f.entry.as_deref(), Some(""));
+        assert_eq!(f.entry.as_ref().map(Secret::expose), Some(""));
         assert_eq!(f.password.unwrap().expose(), "secret");
         let f = split_form("only a link\n".into(), both);
         assert_eq!(f.password.unwrap().expose(), "");
@@ -1432,7 +1442,13 @@ mod tests {
             entry: Some("l"),
             password: None,
         };
-        assert_eq!(split_form("x\n".into(), link).entry.as_deref(), Some("x"));
+        assert_eq!(
+            split_form("x\n".into(), link)
+                .entry
+                .as_ref()
+                .map(Secret::expose),
+            Some("x")
+        );
     }
 
     /// kdialog has no form: one window per field, the password hidden.
@@ -1444,7 +1460,7 @@ mod tests {
             password: Some("p"),
         };
         let filled = f.form("t", both, B).unwrap();
-        assert_eq!(filled.entry.as_deref(), Some("link"));
+        assert_eq!(filled.entry.as_ref().map(Secret::expose), Some("link"));
         assert_eq!(filled.password.unwrap().expose(), "secret");
         assert!(f.seen()[0].starts_with("entry"), "{:?}", f.seen());
         assert!(f.seen()[1].starts_with("password"), "{:?}", f.seen());

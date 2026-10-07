@@ -25,7 +25,7 @@ use sync_policy::secret::Secret;
 use sync_policy::{Dirs, Mode};
 use sync_proto::methods::FolderInfo;
 
-use crate::cli::{Asked, Kept, Update};
+use crate::cli::{Asked, Changed, Kept, Update};
 use crate::dialogs::{
     Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines,
 };
@@ -199,6 +199,20 @@ fn parse(t: Lang, link: &str) -> Result<PairUri, String> {
     Ok(u)
 }
 
+/// `parse` for a text that may be anything the owner copied (Windows'
+/// clipboard). One that is no pairing link at all gets no description
+/// (`None`), since that would quote it; the one made is zeroed.
+fn parse_copied(t: Lang, text: &str) -> Option<Result<PairUri, String>> {
+    if text.len() > MAX_ANSWER {
+        return None;
+    }
+    if let Err(e) = PairUri::parse(text) {
+        drop(Secret::new(e));
+        return None;
+    }
+    Some(parse(t, text))
+}
+
 /// The owner check, with its refusal shown.
 async fn owner_ok(d: &dyn Dialogs, h: &impl Host, t: Lang) -> bool {
     match h.owner_check().await {
@@ -283,7 +297,7 @@ impl Dialogs for Later<'_> {
         self.d.question(text)
     }
 
-    fn entry(&self, text: &str, buttons: Buttons) -> Option<String> {
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
         self.d.entry(&self.with_held(text), buttons)
     }
 
@@ -355,7 +369,11 @@ async fn install(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<PairUri>)
     let (user, path) = (shown(&user), path.map(|p| shown(&p)));
     // The clipboard's text is taken only as a link that parses; anything
     // else in it is dropped unseen, and zeroed.
-    let link = link.or_else(|| d.at_hand().and_then(|c| parse(t, c.expose().trim()).ok()));
+    let link = link.or_else(|| {
+        d.at_hand()
+            .and_then(|c| parse_copied(t, c.expose().trim()))
+            .and_then(Result::ok)
+    });
     if let Some(u) = link {
         let portal = shown(&u.portal.to_string());
         let name = shown(&h.device_name());
@@ -393,7 +411,15 @@ async fn install(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<PairUri>)
         if !notes.is_empty() {
             d.info(&t.notes(&notes));
         }
-        return ask_link(d, h, t, false).await;
+        // It is installed by now: closing the link window leaves it so,
+        // not paired, and says that.
+        return match ask_link(d, h, t, false).await {
+            Outcome::Cancelled => {
+                d.info(t.installed_not_paired());
+                Outcome::Done
+            }
+            o => o,
+        };
     }
     ask_link(d, h, t, true).await
 }
@@ -435,20 +461,13 @@ async fn ask_link(d: &dyn Dialogs, h: &impl Host, t: Lang, install: bool) -> Out
         entry: Some(t.link_label()),
         password: account.as_ref().map(|_| t.password_label()),
     };
-    let buttons = Buttons {
-        ok: if install {
-            t.install_and_pair_button()
-        } else {
-            t.pair_button()
-        },
-        cancel: t.cancel_button(),
-    };
+    let buttons = pair_buttons(t, install);
     loop {
         let Some(filled) = d.form(&text, form, buttons) else {
             return Outcome::Cancelled;
         };
-        let link = filled.entry.unwrap_or_default();
-        let link = link.trim();
+        let link = filled.entry.unwrap_or_else(|| Secret::new(String::new()));
+        let link = link.expose().trim();
         if link.is_empty() {
             if install {
                 return install_only(d, h, t).await;
@@ -456,10 +475,30 @@ async fn ask_link(d: &dyn Dialogs, h: &impl Host, t: Lang, install: bool) -> Out
             d.error(t.no_link());
             continue;
         }
-        match parse(t, link) {
+        // Windows reads the link from the clipboard, which may hold
+        // anything: a text that is no link is not shown.
+        let parsed = if d.style() == Style::Boxes {
+            parse_copied(t, link).unwrap_or_else(|| Err(t.clipboard_no_link().into()))
+        } else {
+            parse(t, link)
+        };
+        match parsed {
             Ok(u) => return confirm_and_pair(d, h, t, &u, install, filled.password).await,
             Err(e) => d.error(&e),
         }
+    }
+}
+
+/// The buttons of the windows that ask for the link or the login password:
+/// the same label on the first form and the ones that come back.
+fn pair_buttons(t: Lang, install: bool) -> Buttons<'static> {
+    Buttons {
+        ok: if install {
+            t.install_and_pair_button()
+        } else {
+            t.pair_button()
+        },
+        cancel: t.cancel_button(),
     }
 }
 
@@ -587,14 +626,7 @@ async fn owner_password(
                     entry: None,
                     password: Some(t.password_label()),
                 };
-                let buttons = Buttons {
-                    ok: if install {
-                        t.install_and_pair_button()
-                    } else {
-                        t.pair_button()
-                    },
-                    cancel: t.cancel_button(),
-                };
+                let buttons = pair_buttons(t, install);
                 match d.form(&text, form, buttons).and_then(|f| f.password) {
                     Some(pw) => pw,
                     None => return Outcome::Cancelled,
@@ -766,6 +798,14 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
             return Outcome::Failed;
         }
     };
+    if let Some(c) = &done.changed {
+        d.error(&match c {
+            Changed::Other { asked, offered } => t.release_changed(&shown(asked), &shown(offered)),
+            Changed::Gone(v) => t.release_gone(&shown(v)),
+            Changed::Offered(v) => t.release_offered(&shown(v)),
+        });
+        return Outcome::Failed;
+    }
     let (error, text) = match (&done.installed, &done.stale_client) {
         (Some(v), _) => (false, t.updated(&shown(v), done.restarted)),
         (None, _) if done.restarted => (false, t.client_restarted(&current).to_string()),
@@ -1095,7 +1135,7 @@ impl Host for RealHost {
     }
 
     async fn install(&self) -> Result<Vec<String>, String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = crate::cli::this_program()?;
         let plan = crate::cli::install_plan(false, None, true, &exe)?;
         crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)
     }
@@ -1239,11 +1279,11 @@ impl Host for RealHost {
     }
 
     async fn update_check(&self) -> Result<Update, String> {
-        crate::cli::update(&self.dirs, true, None, Asked::Anything).await
+        crate::cli::update(&self.dirs, true, None, Asked::Anything, &mut |_| {}).await
     }
 
     async fn update(&self, asked: Asked<'_>) -> Result<Update, String> {
-        crate::cli::update(&self.dirs, false, None, asked).await
+        crate::cli::update(&self.dirs, false, None, asked, &mut |_| {}).await
     }
 
     fn sudo_available(&self) -> bool {
@@ -1384,6 +1424,8 @@ mod tests {
         stale_client: Option<&'static str>,
         /// The client does not take the request to restart.
         no_restart: bool,
+        /// What changed on offer between the question and the Yes.
+        changed: Option<Changed>,
         did: Mutex<Vec<String>>,
     }
 
@@ -1418,6 +1460,7 @@ mod tests {
                 release: None,
                 stale_client: None,
                 no_restart: false,
+                changed: None,
                 did: Mutex::new(Vec::new()),
             }
         }
@@ -1433,7 +1476,7 @@ mod tests {
                 stale_client: self.stale_client.map(String::from),
                 installed: None,
                 restarted: false,
-                lines: Vec::new(),
+                changed: None,
                 notes: Vec::new(),
             }
         }
@@ -1555,6 +1598,12 @@ mod tests {
         }
         async fn update(&self, asked: Asked<'_>) -> Result<Update, String> {
             let found = self.found();
+            if let Some(c) = &self.changed {
+                return Ok(Update {
+                    changed: Some(c.clone()),
+                    ..found
+                });
+            }
             match asked {
                 Asked::Release(v) => {
                     self.step(&format!("update {v}"))?;
@@ -1949,6 +1998,35 @@ mod tests {
         }
     }
 
+    /// Windows, at the box that reads the link: a clipboard text that is no
+    /// pairing link (a password, say) is refused without being shown; a
+    /// link that is refused for its portal still says why.
+    #[tokio::test]
+    async fn windows_never_shows_a_copied_text_that_is_no_link() {
+        let h = FakeHost::default();
+        let (_, seen) = run_as(
+            Style::Boxes,
+            Lang::En,
+            &h,
+            &[
+                "yes",
+                "text:hunter2 secret",
+                "text:pithagoras-sync://pair?portal=http://192.168.1.5:3000&code=AB",
+                "cancel",
+            ],
+            None,
+            None,
+        )
+        .await;
+        assert!(seen.iter().all(|s| !s.contains("hunter2")), "{seen:#?}");
+        assert!(
+            seen[2].starts_with("entry [Pair]: The clipboard holds no pairing link"),
+            "{seen:#?}"
+        );
+        assert!(seen[3].contains("http://192.168.1.5:3000"), "{seen:#?}");
+        assert_eq!(h.did(), ["install"]);
+    }
+
     /// Windows without a link at hand: install, then the box that reads the
     /// link from the clipboard; the install's notes in that box's text.
     #[tokio::test]
@@ -1984,11 +2062,18 @@ mod tests {
             "{seen:#?}"
         );
         assert_eq!(h.did(), ["install", &pair_did()]);
-        // Cancelled at the link: installed, not paired.
+        // Cancelled at the link: installed, not paired, and said so; not
+        // "nothing changed".
         let h = FakeHost::default();
-        let (o, _) = run_as(Style::Boxes, Lang::En, &h, &["yes", "cancel"], None, None).await;
-        assert_eq!(o, Outcome::Cancelled);
+        let (o, seen) = run_as(Style::Boxes, Lang::En, &h, &["yes", "cancel"], None, None).await;
+        assert_eq!(o, Outcome::Done);
         assert_eq!(h.did(), ["install"]);
+        assert!(
+            seen.last().unwrap().starts_with(
+                "info: Pithagoras Sync is installed and starts at login. It is not paired yet"
+            ),
+            "{seen:#?}"
+        );
     }
 
     /// Opened from the portal's link before installing: one question for both
@@ -2744,6 +2829,41 @@ mod tests {
             seen[2].contains("The client did not take the request to restart"),
             "{seen:#?}"
         );
+    }
+
+    /// A release that changed between the question and the Yes is said, in
+    /// the window's language, as nothing done.
+    #[tokio::test]
+    async fn the_menu_says_what_changed_on_offer_in_its_language() {
+        let changes = [
+            (
+                Changed::Other {
+                    asked: "0.0.3".into(),
+                    offered: "0.0.4".into(),
+                },
+                "Jetzt wird Version 0.0.4 statt 0.0.3 angeboten: Es wurde nichts installiert.",
+            ),
+            (
+                Changed::Gone("0.0.3".into()),
+                "Version 0.0.3 wird nicht mehr angeboten: Es wurde nichts installiert.",
+            ),
+            (
+                Changed::Offered("0.0.4".into()),
+                "Jetzt wird Version 0.0.4 angeboten: Es wurde nichts installiert oder neu gestartet.",
+            ),
+        ];
+        for (c, de) in changes {
+            let h = FakeHost {
+                release: Some("0.0.3"),
+                changed: Some(c),
+                ..paired()
+            };
+            let (o, seen) = run_in(Lang::De, &h, &["pick:update", "yes", "cancel"], None).await;
+            assert_eq!(o, Outcome::Done);
+            assert!(seen[2].contains(de), "{seen:#?}");
+            assert!(!seen[2].contains("nothing was"), "{seen:#?}");
+            assert_eq!(h.did(), ["update check"]);
+        }
     }
 
     /// A held message that would make the next window's text too long gets

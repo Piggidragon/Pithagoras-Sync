@@ -177,7 +177,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     if dirs.paused_file().exists() {
         engine.pause();
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
+    let exe = crate::cli::this_program().map_err(|e| format!("cannot find this program: {e}"))?;
     let execs = Arc::new(Execs::new(ExecConfig {
         shim_program: exe.clone(),
         shim_args: Vec::new(),

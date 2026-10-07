@@ -98,6 +98,14 @@ impl Lang {
         )
     }
 
+    /// Windows: the clipboard's text, not shown, is no pairing link.
+    pub fn clipboard_no_link(self) -> &'static str {
+        self.pick(
+            "The clipboard holds no pairing link (what it holds is not shown). Copy the link from the portal's Devices page, then try again.",
+            "Die Zwischenablage enthält keinen Kopplungslink (was sie enthält, wird nicht angezeigt). Kopiere den Link von der Geräteseite des Portals und versuche es noch einmal.",
+        )
+    }
+
     pub fn link_too_long(self) -> &'static str {
         self.pick(
             "This is not a pairing link: it is far too long.",
@@ -618,6 +626,42 @@ impl Lang {
             "The client did not take the request to restart: restart its unit or logon task.",
             "Der Client hat die Bitte um einen Neustart nicht angenommen: Starte seine Unit oder Anmeldeaufgabe neu.",
         )
+    }
+
+    /// The Yes was to `asked`, but `offered` is on offer now.
+    pub fn release_changed(self, asked: &str, offered: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Version {offered} is on offer now instead of {asked}: nothing was installed. Choose Update again to see it."
+            ),
+            Lang::De => format!(
+                "Jetzt wird Version {offered} statt {asked} angeboten: Es wurde nichts installiert. Wähle erneut Aktualisieren, um sie zu sehen."
+            ),
+        }
+    }
+
+    /// The Yes was to `version`, which is no longer on offer.
+    pub fn release_gone(self, version: &str) -> String {
+        match self {
+            Lang::En => {
+                format!("Version {version} is no longer on offer: nothing was installed.")
+            }
+            Lang::De => {
+                format!("Version {version} wird nicht mehr angeboten: Es wurde nichts installiert.")
+            }
+        }
+    }
+
+    /// The Yes was to the client's restart, but `version` is on offer now.
+    pub fn release_offered(self, version: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Version {version} is on offer now: nothing was installed or restarted. Choose Update again to see it."
+            ),
+            Lang::De => format!(
+                "Jetzt wird Version {version} angeboten: Es wurde nichts installiert oder neu gestartet. Wähle erneut Aktualisieren, um sie zu sehen."
+            ),
+        }
     }
 
     pub fn update_failed(self, e: &str) -> String {
