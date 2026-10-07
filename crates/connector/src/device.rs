@@ -165,6 +165,7 @@ impl Device {
                 .chain(self.shares_policy().then_some(CAP_POLICY))
                 .map(str::to_string)
                 .collect(),
+            mcp_version: None,
         }
     }
 }

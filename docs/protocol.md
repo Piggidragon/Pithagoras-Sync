@@ -134,6 +134,10 @@ Text frames carry one JSON-RPC 2.0 object each. No batches.
 | -32005 | IO | Any other I/O failure, an upload that stopped early. |
 | -32006 | BUSY | A limit on calls, uploads or running commands is reached. Retry later. |
 | -32007 | BAD_PATH | A path the device refuses to interpret (section 6). |
+| -32008 | SERVER | `mcp.call`: the MCP server is not installed, does not start, crashed, or answered something the device does not take. |
+| -32009 | TIMEOUT | `mcp.call`: the server did not answer in time; the device stopped it. |
+
+Errors of `mcp.call` carry `"data": {"reason": "<reason>"}`, so the portal can tell the model or the owner what to do without reading `message` (section 7, `mcp.call`).
 
 ### Concurrency
 
@@ -153,6 +157,7 @@ Calls on behalf of a chat carry a context:
 - `tainted`: the portal guard's taint flag for that chat. The device only ever adds it to its own taint; `false` cannot clear anything.
 - `tool` (optional): the pi tool the call is for, `read`, `write`, `edit`, `bash`, `grep`, `find` or `ls`. The owner can switch each tool off (`policy.tools`, see permissions.md); a call for a tool that is off is `DENIED`. The label can only narrow: it has to fit the method (`fs.read` serves `read` and `edit`, `fs.write` serves `write` and `edit`, `fs.stat` serves every tool but `bash`, `fs.list` serves `ls`, `fs.grep` serves `grep`, `fs.find` serves `find`, `exec.start` serves `bash`), and another label is `DENIED`. Without it, a call passes when any tool its method serves is on.
 - Any other field in `ctx` is refused. There is no way to send "approved", a mode, folders or protections; those exist only on the device.
+- `mcp.call` takes the same `ctx` without `tool`: no pi tool fits computer use, so any label there is `DENIED`.
 
 ## 7. Methods, portal to device
 
@@ -173,7 +178,7 @@ Params: `{}`. Result:
   "folders": [{"path": "/home/alice/src", "access": "rw", "execute": true}],
   "folders_shell": "landlock",
   "tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
-  "mcp_tools": [],
+  "mcp_tools": [{"server": "computer-use-linux", "tool": "screenshot"}],
   "client_version": "0.1.0"
 }
 ```
@@ -185,7 +190,7 @@ Params: `{}`. Result:
 - `folders[].execute`: commands may run in that folder in Folders mode (`folder add --exec`).
 - `folders_shell`: how the shell runs in Folders mode: `landlock`, `prompt` (every command asks; also what `landlock` falls back to without kernel support) or `unconfined`.
 - `tools`: the pi tools switched on. The portal offers the device to these tools only.
-- `mcp_tools`: always empty in phase 1.
+- `mcp_tools`: computer use, the allowed tools of the installed MCP servers, as `mcp.list` lists them (its short form; empty when none is installed). The tools are listed whatever the consent says; `mcp.list` has the descriptions and schemas and the consent.
 
 ### `device.probe`
 
@@ -327,7 +332,7 @@ Params:
   - `deny`: refuse it; the waiting call answers `DENIED`.
 - `minutes`: only with `time`.
 
-`chat` and `time` are offered only in Ask mode, for a read or a write, where a whole kind of call asks. A command offers only `once` and `deny` in every mode (a standing approval of the shell would cover any command), and so does a question raised by a protected path, a pattern, taint or an elevated command.
+`chat` and `time` are offered only in Ask mode, for a read or a write, where a whole kind of call asks. The consent question of computer use (`mcp.call` with consent `ask`) offers `once`, `chat` and `deny`: `chat` covers that chat's further computer-use calls. A command offers only `once` and `deny` in every mode (a standing approval of the shell would cover any command), and so does a question raised by a protected path, a pattern, taint or an elevated command.
 
 Result: `{}`. An approval that is not waiting (answered, timed out, withdrawn, unknown) is `NOT_FOUND`; an answer not in `choices`, or wrong `minutes`, is `INVALID_PARAMS`. The first answer wins, from wherever it comes (the portal, the local `approve` and `deny`, a desktop notification); the waiting call's response follows.
 
@@ -371,9 +376,77 @@ Result: the new PolicyDocument. The device saves the config file, applies it at 
 
 A portal with write access can widen everything the document holds, Full mode included. That is the owner's choice when they set `write`; the default is `read`.
 
-### Not in phase 1
+### `mcp.list`
 
-`mcp.list` and `mcp.call` (computer use) are phase 2 and answered with `METHOD_NOT_FOUND`. `hello` does not announce them.
+Computer use (docs/computer-use.md): the agent sees the screen and moves the pointer and types on the device through an MCP server that the client installs and runs itself (`computer-use-linux` on Linux, Windows-MCP on Windows). The device is the MCP client; the portal never talks MCP to the server. Only when `hello` announced `mcp`.
+
+Params: `{}`. Result:
+
+```json
+{
+  "version": "5d1c0b2a9e8f7a61",
+  "consent": "ask",
+  "consent_expires_ms": null,
+  "servers": [
+    {
+      "name": "computer-use-linux", "version": "0.4.1", "state": "ready",
+      "tools": [
+        {"name": "screenshot", "description": "Take a screenshot ...", "input_schema": {"type": "object", "properties": {}}, "input": false},
+        {"name": "type_text", "description": "...", "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}, "input": true}
+      ]
+    }
+  ]
+}
+```
+
+- `servers`: the MCP servers installed on the device (none until the owner ran `pithagoras-sync computer-use install`), each with its pinned `version`.
+- `tools`: only the tools on the device's allow-list for that exact server version (default deny, exact names). A tool the server offers but the list does not name is never listed and never called; the portal never sees it. Descriptions and schemas are what the server listed when the device installed and tested that version (not asked again per `mcp.list`, so listing never starts a server); a description is cut at 4 KiB.
+- `input`: the tool moves the pointer or types; before each call of such a tool the device checks that no window of Pithagoras Sync is open or focused (`mcp.call`).
+- `state`: `ready`, or `unavailable` when the server's files on the device no longer match what was installed (or are gone): then `error` says why and `tools` is empty.
+- `version`: a hash of `servers`. It changes when the owner installs, removes, updates or rolls back a server, or one becomes unavailable.
+- `consent`, `consent_expires_ms`: the owner's consent in force now (`policy.computer_use.consent`: `off`, `ask` or `allow`, an `allow` that ran out reads `off`), and when an `allow` ends (Unix ms). Tools are listed whatever the consent says; with `off` their calls are refused. So the list is the same for the whole grant, and the consent only decides whether a call goes through.
+
+**The list is stable for a grant.** A tool's name, description and schema become part of the model's prompt, so the portal registers each listed tool once per grant (as `<server>_<tool>`), not per connection. When the list changes the device sends `mcp.changed` (section 9) with the new `version`, and `hello` carries the current one (`mcp_version`); the portal takes a new list at the next grant. A call for a tool the device no longer lists fails (`DENIED` with `tool_not_allowed`), so a stale registration cannot reach anything new.
+
+### `mcp.call`
+
+Params:
+
+```json
+{"server": "computer-use-linux", "tool": "screenshot", "args": {}, "ctx": {"chat": "<chat id>", "tainted": false}}
+```
+
+- `server`, `tool`: as `mcp.list` lists them, at most 64 bytes each.
+- `args`: an object, at most 64 KiB as JSON (`TOO_LARGE`), checked against the tool's `input_schema` before the server sees it: the JSON types, `required`, `enum`, array `items`, and no property the schema does not name, at any depth (`INVALID_PARAMS`, and nothing runs).
+- `ctx`: as in section 6, without `tool`.
+
+Result:
+
+```json
+{"content": [{"type": "text", "text": "..."}, {"type": "image", "mime": "image/png", "data": "<base64>"}], "is_error": false}
+```
+
+- `content`: what the tool returned, text and images only. `mime` is `image/png`, `image/jpeg` or `image/webp`; `data` is standard base64. At most 16 items, 1 MiB of text in all, 3 MiB of base64 per image, and 3.5 MiB of JSON for the whole result; a server that answers more, or another kind of content, fails the call (`SERVER`, `bad_answer`).
+- `is_error`: the tool itself reported a failure (MCP's `isError`); `content` says what.
+
+How the device decides, in this order:
+
+1. Paused (`panic`): `DENIED`, `paused`. Outside `policy.hours`: `DENIED`, `hours`.
+2. Unknown server: `SERVER`, `not_installed`. A tool that is not listed (not on the allow-list of the installed version, or not offered by the server): `DENIED`, `tool_not_allowed`. Bad `args`: `INVALID_PARAMS` or `TOO_LARGE`.
+3. The consent (`policy.computer_use.consent`, device only; the portal cannot set it in any way):
+   - `off`, or an `allow` that ran out: `DENIED`, `consent_off`.
+   - `allow`: goes through until it ends (at most 8 hours, then `off`).
+   - `ask`: once per chat, through the approval path of every other question (`approval.requested`, answered with `approval.answer` or on the device). The question has `tool: "computer_use"`, the server and tool and its arguments in `target` (typed text and keys included, control characters as visible escapes, cut), the reason that computer use is as strong as Full mode, and the choices `once`, `chat` (this chat, until its grant ends or `policy.approvals.remember_minutes` run out) and `deny`. A denial is `DENIED`, `consent_denied`; nobody answering in time is `DENIED`, `consent_timeout` (whatever `policy.approvals.on_timeout` says: an unanswered consent is never a yes).
+4. For an `input` tool: the focus check. The device asks the server for its window list and the focused window (with tools of its own that are not listed to the portal) and refuses while a window of Pithagoras Sync is open or focused, or when it cannot tell (the server did not answer, or answered something it does not understand): `DENIED`, `focus`. Input never reaches the client's own windows (its dialogs, an approval prompt).
+5. The call goes to the server. Calls to one server run one at a time, in the order they came (at most 8 waiting, else `BUSY`). The device waits at most 60 s for the answer, then stops the server (`TIMEOUT`, `timed_out`); it starts it again with the next call.
+
+Failures of the server: `SERVER` with `not_running` (it does not start, or waits out its backoff after a crash; the message says for how long), `crashed` (it ended during the call), `changed` (its files no longer match the hash recorded at install; it is not run) or `bad_answer`.
+
+**Taint.** Computer use is always tainted: what is on the screen is untrusted content. Every `mcp.call` that reached the server marks the chat as having seen untrusted content on the device (section 6), as the portal's `tainted` flag does, so with `policy.full.taint_prompts` (the default) that chat's next command and write ask even in Full mode. The portal's flag still only adds.
+
+**Indicator.** At the start of a burst of calls (none for a minute before), the device shows a desktop notification (Linux, where a notification service runs) that a chat uses the screen; `pithagoras-sync status` shows the chat and the last call. `panic` ends every running call (`DENIED`, `paused`) and stops the servers.
+
+Every decision is in the device's audit log and mirrored (`audit`, with `tool: "computer_use"`); the arguments only as the question showed them.
 
 ## 8. Binary frames
 
@@ -400,12 +473,12 @@ Backpressure: the device has a send queue of 64 frames. When the portal reads sl
 `hello`, the first frame on every connection:
 
 ```json
-{"proto": 1, "device_id": "<id>", "client_version": "0.1.0", "os": "linux", "user": "alice", "shell": "bash", "capabilities": ["fs", "grep", "find", "exec", "probe", "approvals", "policy"]}
+{"proto": 1, "device_id": "<id>", "client_version": "0.1.0", "os": "linux", "user": "alice", "shell": "bash", "capabilities": ["fs", "grep", "find", "exec", "probe", "approvals", "policy", "mcp"], "mcp_version": "5d1c0b2a9e8f7a61"}
 ```
 
 There is no answer to `hello`. A portal that does not speak `proto` closes with 4003.
 
-`capabilities` always holds `fs`, `grep`, `find`, `exec` and `probe`. `approvals`: the device asks the portal for approvals (`approval.requested`) and takes answers (`approval.answer`, `approval.list`); the client always announces it. `policy`: the device shares its settings (`policy.get`, `policy.changed`, and `policy.set` when `portal_policy` is `write`); absent when the owner set `portal_policy = "off"`.
+`capabilities` always holds `fs`, `grep`, `find`, `exec` and `probe`. `approvals`: the device asks the portal for approvals (`approval.requested`) and takes answers (`approval.answer`, `approval.list`); the client always announces it. `policy`: the device shares its settings (`policy.get`, `policy.changed`, and `policy.set` when `portal_policy` is `write`); absent when the owner set `portal_policy = "off"`. `mcp`: the device serves computer use (`mcp.list`, `mcp.call`, `mcp.changed`), announced from 0.0.3 on whether or not a server is installed; `mcp_version` is then the `version` `mcp.list` returns now.
 
 `exec.exit`, after the last `ExecOutput` frame of a stream:
 
@@ -442,7 +515,7 @@ A settings change is one event per setting: `"tool": "policy"`, the setting's na
 - `call`: the JSON-RPC id of the waiting call (`null` for a question that did not come from a portal call).
 - `tool`, `target`: the method's tool (`read`, `write`, `ls`, `exec`, ...) and the path or command, with the elevation password scrubbed out.
 - `cwd`: for a command, the folder it runs in, resolved as the device would run it (the same command means something else in another folder); absent for file calls.
-- `reasons`: why it asks (the mode, a protected path, a command pattern, taint, an always-ask rule, an elevated command).
+- `reasons`: why it asks (the mode, a protected path, a command pattern, taint, an always-ask rule, an elevated command, the consent of computer use).
 - `preview`: for a write, the first 2000 characters of the new content, or "binary content, N bytes".
 - `choices`: the answers the device takes for this call (section 7, `approval.answer`). `max_minutes`: the longest `time` answer.
 - `cut`: present and `true` when the command or path (or the folder) is longer than 64 KiB. They are then shown cut at 64 KiB, ending in `…`, and `choices` is only `deny`: nobody could read whole what they would allow. Each reason is cut at 4 KiB.
@@ -457,6 +530,14 @@ A settings change is one event per setting: `"tool": "policy"`, the setting's na
 `by` is `portal` (an `approval.answer`), `device` (the local CLI), `notification` (a desktop notification), `timeout`, `pause` (`panic` denied it) or `withdrawn` (the call ended first, for instance because the portal's chat stopped it). `answer` is what the call got: `deny` for `pause` and `withdrawn`, and for `timeout` `deny` or, with `on_timeout = "allow"`, `once`.
 
 `policy.changed`: the device's settings changed, by the owner on the device or through `policy.set`. Params: the new PolicyDocument (section 7, `policy.get`). Sent only while `portal_policy` is `read` or `write`.
+
+`mcp.changed`: what `mcp.list` returns changed (a server installed, removed, updated, rolled back or unavailable), or the consent did (the owner changed it, or an `allow` ran out). Only with `mcp` in `hello`.
+
+```json
+{"version": "5d1c0b2a9e8f7a61", "consent": "off", "consent_expires_ms": null}
+```
+
+The portal keeps the tools it registered for running grants and takes the new list (`mcp.list`) at the next grant; a consent change needs no new list. A tool the device stopped listing is refused from then on.
 
 ### Portal to device
 
@@ -492,6 +573,10 @@ Any other notification is ignored (logged at debug level); bad params on `grant.
 | Audit record | target and reason cut at 4 KiB, chat id at 256 bytes |
 | Approval text | command or path and folder 64 KiB (longer: cut, deny only), each reason 4 KiB; `approval.list` about 3 MiB, the rest counted in `left_out` |
 | Approval timeout | 120 s (config `policy.approvals.timeout_secs`, 1 to 3600) |
+| `mcp.call` args | 64 KiB of JSON; server and tool names 64 bytes |
+| `mcp.call` result | 16 items, 1 MiB of text, 3 MiB of base64 per image, 3.5 MiB of JSON |
+| `mcp.call` wait | 60 s per call; one call at a time per server, 8 waiting |
+| `mcp.list` tool description | 4 KiB |
 | Ping / dead | 20 s / 45 s |
 | Backoff | 1 s to 60 s |
 
@@ -506,7 +591,7 @@ What the architecture left open and how phase 1 decided it. Each can still chang
 5. **Pin semantics.** The pin covers the key only: certificate name and expiry are ignored when a pin is set. Renewing the certificate with the same key keeps working; a new key needs pairing again.
 6. **The approval preview is the head of the new content, not a diff.** A diff needs the old content and a diff library; phase 1 shows the first 2000 characters. The architecture asks for a diff for writes into `.git/` and similar folders; that is a phase 1 gap.
 7. **`unpair` does not tell the portal.** It deletes the local token and portal entry; the device stays listed in the portal until removed there. There is no revoke endpoint for the device to call.
-8. **`mcp.list` and `mcp.call` are not in phase 1.** They answer `METHOD_NOT_FOUND`; `capabilities` will announce `mcp` when they exist.
+8. **`mcp.list` and `mcp.call` came with 0.0.3** (computer use, docs/computer-use.md) and `capabilities` announces `mcp`; a client before 0.0.3 answers them with `METHOD_NOT_FOUND`. The tools are listed whatever the consent says and refuse their calls without it, so the list a portal registers stays the same for a grant; `mcp.changed` and `hello.mcp_version` tell it that a new grant gets a new list.
 9. **Folder access for the dedicated user** is granted with POSIX ACLs (`setfacl`); `setup --create-user` prints the commands instead of running them, since it cannot know the folders.
 10. **New folder grants are read-only, and run no commands,** unless the owner passes `--rw` and `--exec`.
 11. **The control socket lives in the state folder** (`~/.local/state/pithagoras-sync/run/control.sock`), not in `$XDG_RUNTIME_DIR`: a system unit has no runtime dir, and the CLI in the same user's login shell has to find the same socket.

@@ -51,6 +51,45 @@ pub mod code {
     pub const BUSY: i64 = -32006;
     /// A path the device refuses to interpret: relative, a drive letter, a NUL byte.
     pub const BAD_PATH: i64 = -32007;
+    /// `mcp.call`: the MCP server is not installed, does not start, crashed, or
+    /// answered something the device does not take. `data.reason` says which.
+    pub const SERVER: i64 = -32008;
+    /// `mcp.call`: the server did not answer within the device's time limit; the
+    /// device stopped it.
+    pub const TIMEOUT: i64 = -32009;
+}
+
+/// Why an `mcp.call` failed, in the error's `data` as `{"reason": "..."}`: the
+/// portal can tell the model (or the owner) what to do without parsing `message`.
+pub mod mcp_reason {
+    /// DENIED: `policy.computer_use.consent` is `off` (or an `allow` ran out).
+    pub const CONSENT_OFF: &str = "consent_off";
+    /// DENIED: the owner answered the consent question with deny.
+    pub const CONSENT_DENIED: &str = "consent_denied";
+    /// DENIED: nobody answered the consent question in time.
+    pub const CONSENT_TIMEOUT: &str = "consent_timeout";
+    /// DENIED: the tool is not on the device's allow-list for this server version.
+    pub const TOOL_NOT_ALLOWED: &str = "tool_not_allowed";
+    /// DENIED: a window of Pithagoras Sync is open or focused, or the device
+    /// could not tell which windows are open.
+    pub const FOCUS: &str = "focus";
+    /// DENIED: the device is paused (`panic`).
+    pub const PAUSED: &str = "paused";
+    /// DENIED: outside the hours the device serves (`policy.hours`).
+    pub const HOURS: &str = "hours";
+    /// SERVER: no such server is installed on the device.
+    pub const NOT_INSTALLED: &str = "not_installed";
+    /// SERVER: the server's files no longer match what was installed.
+    pub const CHANGED: &str = "changed";
+    /// SERVER: the server is not running (it failed to start, or waits to be
+    /// started again after a crash).
+    pub const NOT_RUNNING: &str = "not_running";
+    /// SERVER: the server ended during the call.
+    pub const CRASHED: &str = "crashed";
+    /// SERVER: the server's answer broke the protocol or the device's limits.
+    pub const BAD_ANSWER: &str = "bad_answer";
+    /// TIMEOUT: the call took longer than the device waits.
+    pub const TIMED_OUT: &str = "timed_out";
 }
 
 /// A JSON-RPC error object.
@@ -73,6 +112,17 @@ impl RpcError {
 
     pub fn denied(reason: impl Into<String>) -> Self {
         RpcError::new(code::DENIED, reason)
+    }
+
+    /// With `data: {"reason": <reason>}` (`mcp_reason`).
+    pub fn with_reason(mut self, reason: &str) -> Self {
+        self.data = Some(serde_json::json!({ "reason": reason }));
+        self
+    }
+
+    /// The `data.reason` of an error made with `with_reason`.
+    pub fn reason(&self) -> Option<&str> {
+        self.data.as_ref()?.get("reason")?.as_str()
     }
 }
 
@@ -196,7 +246,8 @@ pub fn error_without_id(error: &RpcError) -> String {
     serde_json::json!({"jsonrpc": "2.0", "id": null, "error": error}).to_string()
 }
 
-/// A notification from the device (`hello`, `exec.exit`, `audit`, `approval.waiting`).
+/// A notification from the device (`hello`, `exec.exit`, `audit`, `approval.requested`,
+/// `mcp.changed`).
 pub fn notification(method: &str, params: impl Serialize) -> String {
     serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string()
 }
