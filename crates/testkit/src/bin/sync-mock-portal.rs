@@ -8,6 +8,8 @@
 //! exec <cwd> <command...>     run a command, answering approvals per `approve`
 //! approve once|deny|none      how `exec` answers approvals (default: none)
 //! call <method> <json>        call any method on the device
+//! mcp-list                    computer use: the device's servers and tools
+//! mcp-call <server> <tool> [json]  call one, answering approvals per `approve`
 //! read <path>                 fs.read, print the content
 //! close                       close the link (the device reconnects)
 //! closed [secs]               wait until the device's link ended, print the code
@@ -82,6 +84,24 @@ async fn main() {
                 let params: Value = serde_json::from_str(params).unwrap_or(json!({}));
                 println!("{:?}", d.call(method, params).await);
             }
+            "mcp-list" => match &dl {
+                Some(d) => match d.mcp_list().await {
+                    Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+                    Err(e) => println!("error {} {}", e.code, e.message),
+                },
+                None => println!("no device"),
+            },
+            "mcp-call" => {
+                let Some(d) = &dl else {
+                    println!("no device");
+                    continue;
+                };
+                let mut parts = rest.splitn(3, ' ');
+                let (server, tool) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let args: Value =
+                    serde_json::from_str(parts.next().unwrap_or("{}")).unwrap_or(json!({}));
+                mcp_call(d, server, tool, args, &approve).await;
+            }
             "read" => {
                 let Some(d) = &dl else {
                     println!("no device");
@@ -155,5 +175,44 @@ async fn exec(d: &DeviceLink, stream: u32, cwd: &str, command: &str, approve: &s
             println!("exit {exit}");
         }
         None => println!("no exit"),
+    }
+}
+
+async fn mcp_call(d: &DeviceLink, server: &str, tool: &str, args: Value, approve: &str) {
+    let pending = d
+        .start_call(
+            "mcp.call",
+            json!({"server": server, "tool": tool, "args": args, "ctx": {"chat": "manual"}}),
+        )
+        .await;
+    tokio::pin!(pending);
+    let r = loop {
+        tokio::select! {
+            r = &mut pending => break r.unwrap_or(Err(sync_proto::RpcError::new(0, "closed"))),
+            Some(a) = d.notification("approval.requested", Duration::from_secs(600)) => {
+                println!("approval {} {:?}: {}", a["id"], a["reasons"], a["target"]);
+                if approve != "none" {
+                    let r = d.call("approval.answer", json!({"id": a["id"], "answer": approve})).await;
+                    println!("answered {approve}: {r:?}");
+                }
+            }
+        }
+    };
+    match r {
+        Ok(v) => {
+            // Images by their size: the data is long and of no use here.
+            for c in v["content"].as_array().into_iter().flatten() {
+                match c["type"].as_str() {
+                    Some("image") => println!(
+                        "image {} ({} bytes of base64)",
+                        c["mime"],
+                        c["data"].as_str().map_or(0, str::len)
+                    ),
+                    _ => println!("text {}", c["text"]),
+                }
+            }
+            println!("is_error {}", v["is_error"]);
+        }
+        Err(e) => println!("refused {} {} {:?}", e.code, e.message, e.data),
     }
 }

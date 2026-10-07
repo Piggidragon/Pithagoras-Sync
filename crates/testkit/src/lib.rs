@@ -562,6 +562,26 @@ impl DeviceLink {
         }
     }
 
+    /// `mcp.list`, as the portal asks it once per grant.
+    pub async fn mcp_list(&self) -> Result<Value, RpcError> {
+        self.call("mcp.list", json!({})).await
+    }
+
+    /// `mcp.call` of `tool` of `server` for `chat`.
+    pub async fn mcp_call(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+        chat: &str,
+    ) -> Result<Value, RpcError> {
+        self.call(
+            "mcp.call",
+            json!({"server": server, "tool": tool, "args": args, "ctx": {"chat": chat}}),
+        )
+        .await
+    }
+
     /// Starts a call without waiting; the answer goes to the returned receiver.
     pub async fn start_call(
         &self,

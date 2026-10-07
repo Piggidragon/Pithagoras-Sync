@@ -7,6 +7,8 @@
 //! sync-release verify --public <public key> <file>
 //! sync-release manifest --version <x.y.z> [--released <unix secs>] [--base-url <url>] --out <file> <binary>=<target>...
 //! sync-release sums --out <file> <file>...
+//! sync-release mcp --input <servers.json> [--previous <mcp.json>] [--serial <n>] --out <mcp.json>
+//! sync-release mcp-verify --public <public key> <mcp.json>
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -20,7 +22,9 @@ const USAGE: &str = "usage:
   sync-release sign (--key <key file> | --key-env <VAR>) <file>
   sync-release verify --public <public key> <file>
   sync-release manifest --version <x.y.z> [--released <unix secs>] [--base-url <url>] --out <file> <binary>=<target>...
-  sync-release sums --out <file> <file>...";
+  sync-release sums --out <file> <file>...
+  sync-release mcp --input <servers.json> [--previous <mcp.json>] [--serial <n>] --out <mcp.json>
+  sync-release mcp-verify --public <public key> <mcp.json>";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,6 +178,50 @@ fn run(args: &[String]) -> Result<(), String> {
                 Path::new(out),
                 &manifest(version, released, opt(&opts, "base-url"), &binaries)?,
             )?;
+        }
+        "mcp" => {
+            let (opts, rest) = options(args, &["input", "previous", "serial", "out"])?;
+            let (Some(input), Some(out), []) =
+                (opt(&opts, "input"), opt(&opts, "out"), rest.as_slice())
+            else {
+                return Err(USAGE.into());
+            };
+            let previous = opt(&opts, "previous")
+                .map(|p| sync_release::mcp::serial_of(&read(Path::new(p))?))
+                .transpose()?;
+            let serial = opt(&opts, "serial")
+                .map(|s| {
+                    s.parse::<u64>()
+                        .map_err(|_| format!("--serial {s:?} is not a number"))
+                })
+                .transpose()?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let doc = rt.block_on(sync_release::mcp::build(
+                &read(Path::new(input))?,
+                previous,
+                serial,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_millis() as i64,
+                &mut |l| eprintln!("{l}"),
+            ))?;
+            write(Path::new(out), &doc)?;
+            eprintln!(
+                "Wrote {out}. Sign it with `sync-release sign`, then check it with `sync-release mcp-verify` (docs/mcp-updates.md)."
+            );
+        }
+        "mcp-verify" => {
+            let (opts, rest) = options(args, &["public"])?;
+            let ([file], Some(public)) = (rest.as_slice(), opt(&opts, "public")) else {
+                return Err(USAGE.into());
+            };
+            let data = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+            let sig = read(Path::new(&format!("{file}.minisig")))?;
+            println!("{}", sync_release::mcp::verify(&data, &sig, public)?);
         }
         "sums" => {
             let (opts, rest) = options(args, &["out"])?;

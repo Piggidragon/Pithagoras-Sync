@@ -1389,7 +1389,11 @@ dependencies = [
  "minisign-verify",
  "ring",
  "serde_json",
+ "sync-connector",
+ "sync-mcp",
+ "sync-testkit",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 //! `pithagoras-sync update` checks the signature against the public key compiled
 //! into the client, then each binary against the manifest (`docs/releasing.md`).
 
+pub mod mcp;
 pub mod minisign;
 
 use std::path::Path;
