@@ -326,8 +326,7 @@ pub fn is_root() -> bool {
 }
 
 /// Restarts the system unit when its process runs the file that was at `exe`
-/// before (`replaced`: this update just replaced it), and says what happened.
-/// Restarts the system unit that runs `exe`; what it says about that.
+/// before (`replaced`: this update just replaced it); what it says about that.
 fn restart_unit(exe: &Path, replaced: bool, restarting: Option<u32>) -> Option<String> {
     #[cfg(target_os = "linux")]
     let look = |pid| crate::update::what_runs(pid, exe);
@@ -336,44 +335,107 @@ fn restart_unit(exe: &Path, replaced: bool, restarting: Option<u32>) -> Option<S
     crate::update::restart_system_unit(&actions::System, exe, replaced, restarting, look)
 }
 
-/// The release on offer is the one the window asked the owner about
-/// (`expect`), or the update stops: a Yes was given to that version only.
-fn the_version_asked_about(offered: &str, expect: Option<&str>) -> Result<(), String> {
-    match expect {
-        Some(v) if v != offered => Err(format!(
-            "the release on offer is now {offered} instead of {v}: nothing was installed"
+/// This program's file. Linux names the file of a running program that was
+/// replaced since it started (an update, from a window that stayed open)
+/// "<path> (deleted)"; the path it started from is meant, which holds the new
+/// file now.
+pub fn this_program() -> Result<PathBuf, String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    Ok(undeleted(me, |p| std::fs::symlink_metadata(p).is_ok()))
+}
+
+/// `p` without the " (deleted)" Linux adds to a replaced program's file,
+/// where no file has the name with it.
+fn undeleted(p: PathBuf, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if exists(&p) {
+        return p;
+    }
+    match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    }
+}
+
+/// What a window's Yes to `update` was given to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked<'a> {
+    /// No window: the command line, which takes whatever is on offer.
+    Anything,
+    /// This release and no other.
+    Release(&'a str),
+    /// No release: the restart of a client that still runs the program the
+    /// file replaced.
+    Restart,
+}
+
+/// What is on offer (`offered`, `None`: nothing newer) is what the window
+/// asked the owner about, or the update stops before it changes anything.
+fn the_version_asked_about(offered: Option<&str>, asked: Asked) -> Result<(), String> {
+    match (offered, asked) {
+        (Some(o), Asked::Release(v)) if o != v => Err(format!(
+            "the release on offer is now {o} instead of {v}: nothing was installed"
+        )),
+        (None, Asked::Release(v)) => Err(format!(
+            "release {v} is no longer on offer: nothing was installed"
+        )),
+        (Some(o), Asked::Restart) => Err(format!(
+            "release {o} is on offer now: nothing was installed or restarted"
         )),
         _ => Ok(()),
     }
 }
 
-/// What `update` did or found: the version on offer (`--check`) and what it
-/// says, line by line.
+/// What `update` did or found.
 pub struct Update {
+    /// `--check`: the newer release on offer.
     pub available: Option<String>,
+    /// The version of the program an update replaces, as it was before.
+    pub current: String,
+    /// When the newest release was made (UTC).
+    pub released: String,
+    /// The version this user's client runs when it is older than `current`:
+    /// it still runs the program the file replaced.
+    pub stale_client: Option<String>,
+    /// The release this update installed.
+    pub installed: Option<String>,
+    /// Whether this user's client took the request to restart.
+    pub restarted: bool,
+    /// What the command line prints, line by line.
     pub lines: Vec<String>,
+    /// The lines the fields above do not tell: what a window adds as notes.
+    pub notes: Vec<String>,
 }
 
 /// `update` (`check`: `update --check`) with the release manifest at
-/// `manifest` (else the release channel's). `expect`: the version a window
-/// showed the owner; any other release on offer is refused.
+/// `manifest` (else the release channel's). `asked`: what a window showed the
+/// owner; anything else on offer is refused.
 pub async fn update(
     dirs: &Dirs,
     check: bool,
     manifest: Option<&str>,
-    expect: Option<&str>,
+    asked: Asked<'_>,
 ) -> Result<Update, String> {
     let mut lines = Vec::new();
+    let mut notes = Vec::new();
+    // `say!`: a line the fields of `Update` tell as well; `note!`: one they
+    // do not.
     macro_rules! say {
         ($($arg:tt)*) => {
             lines.push(format!($($arg)*))
         };
     }
+    macro_rules! note {
+        ($($arg:tt)*) => {{
+            let l = format!($($arg)*);
+            notes.push(l.clone());
+            lines.push(l);
+        }};
+    }
     owner::not_from_own_command(dirs).await?;
     let key = crate::update::PUBLIC_KEY
         .ok_or("this build has no update key; updates come with release builds")?;
     let source = manifest.unwrap_or(crate::update::DEFAULT_MANIFEST);
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me = this_program()?;
     // The copy the running client was started from, which its unit or
     // logon task starts again, not necessarily the one run here (a
     // download, while the installed copy is not on PATH).
@@ -429,14 +491,28 @@ pub async fn update(
     // may be the system unit's own (a unit for root), which then needs
     // no second restart.
     let mut restarting = None;
+    the_version_asked_about(offer.plan.as_ref().map(|p| p.version.as_str()), asked)?;
+    let stale_client = client
+        .filter(|(_, v)| crate::update::is_older(v, &current))
+        .map(|(_, v)| v.to_string());
+    let mut update = Update {
+        available: None,
+        current: current.clone(),
+        released: released.clone(),
+        stale_client: stale_client.clone(),
+        installed: None,
+        restarted: false,
+        lines: Vec::new(),
+        notes: Vec::new(),
+    };
     let Some(plan) = offer.plan else {
         // The file is current, but this user's client may still run the
         // one it replaced (`install` run again from a newer download).
-        match client.filter(|(_, v)| crate::update::is_older(v, &current)) {
+        match stale_client {
             None => {
                 say!("Up to date ({about}; the newest release was made {released}).")
             }
-            Some((_, v)) => {
+            Some(v) => {
                 say!(
                     "{} is up to date ({current}; the newest release was made {released}), but the running client is still {v}.",
                     exe.display()
@@ -448,6 +524,7 @@ pub async fn update(
                     Ok(Some(r)) if r.ok
                 ) {
                     restarting = running_pid;
+                    update.restarted = true;
                     say!(
                         "It restarts with the current program (its unit or logon task starts it again)."
                     );
@@ -458,15 +535,18 @@ pub async fn update(
         }
         // The file is current, but the unit may still run the one it
         // replaced (an update whose restart failed, or a copy by hand).
-        if unit_runs_exe && !check {
-            lines.extend(restart_unit(&exe, false, restarting));
+        if unit_runs_exe
+            && !check
+            && let Some(l) = restart_unit(&exe, false, restarting)
+        {
+            note!("{l}");
         }
         return Ok(Update {
-            available: None,
             lines,
+            notes,
+            ..update
         });
     };
-    the_version_asked_about(&plan.version, expect)?;
     if check {
         say!(
             "Version {} is available, released {released} ({about}).",
@@ -475,16 +555,19 @@ pub async fn update(
         return Ok(Update {
             available: Some(plan.version),
             lines,
+            notes,
+            ..update
         });
     }
     crate::update::install(&plan, &exe).await?;
+    update.installed = Some(plan.version.clone());
     say!("Updated {} to {}.", exe.display(), plan.version);
     // No program of this user is taken below this release from now on.
     if let Err(e) = crate::update::record(&records[1], offer.released) {
         eprintln!("pithagoras-sync: {e}");
     }
     if !crate::update::same_program(&exe, &me) {
-        say!("The one you ran, {}, is unchanged.", me.display());
+        note!("The one you ran, {}, is unchanged.", me.display());
     }
     let restarted = client.is_some()
         && matches!(
@@ -494,17 +577,20 @@ pub async fn update(
     if restarted {
         say!("The running client restarts with it (its unit or logon task starts it again).");
         restarting = running_pid;
+        update.restarted = true;
     }
     // Root's own client and the dedicated user's unit may run the same
     // file: both restart.
     if unit_runs_exe {
-        lines.extend(restart_unit(&exe, true, restarting));
+        if let Some(l) = restart_unit(&exe, true, restarting) {
+            note!("{l}");
+        }
     } else if !restarted {
-        say!(
+        note!(
             "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
         );
         if let Some(other) = crate::update::installed_copy(&me) {
-            say!(
+            note!(
                 "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
                 other.display(),
                 other.display()
@@ -512,8 +598,9 @@ pub async fn update(
         }
     }
     Ok(Update {
-        available: None,
         lines,
+        notes,
+        ..update
     })
 }
 
@@ -1672,7 +1759,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Sudo { cmd } => sudo_cmd(&dirs, cmd).await?,
         Cmd::Update { check, manifest } => {
-            let u = update(&dirs, check, manifest.as_deref(), None).await?;
+            let u = update(&dirs, check, manifest.as_deref(), Asked::Anything).await?;
             for l in u.lines {
                 println!("{l}");
             }
@@ -2822,9 +2909,40 @@ mod tests {
     /// the update runs is not installed.
     #[test]
     fn an_update_installs_only_the_version_asked_about() {
-        assert!(the_version_asked_about("0.0.3", Some("0.0.3")).is_ok());
-        assert!(the_version_asked_about("0.0.4", None).is_ok());
-        let e = the_version_asked_about("0.0.4", Some("0.0.3")).unwrap_err();
+        use super::Asked;
+        let ok = |o, a| the_version_asked_about(o, a).is_ok();
+        assert!(ok(Some("0.0.3"), Asked::Release("0.0.3")));
+        assert!(ok(Some("0.0.4"), Asked::Anything));
+        assert!(ok(None, Asked::Anything));
+        assert!(ok(None, Asked::Restart));
+        let e = the_version_asked_about(Some("0.0.4"), Asked::Release("0.0.3")).unwrap_err();
         assert!(e.contains("0.0.4 instead of 0.0.3"), "{e}");
+        // The release went (pulled, or installed meanwhile): nothing to say
+        // "updated" about.
+        let e = the_version_asked_about(None, Asked::Release("0.0.3")).unwrap_err();
+        assert!(e.contains("0.0.3 is no longer on offer"), "{e}");
+        // A Yes to a restart installs no release that came meanwhile.
+        let e = the_version_asked_about(Some("0.0.4"), Asked::Restart).unwrap_err();
+        assert!(e.contains("0.0.4 is on offer now"), "{e}");
+    }
+
+    /// A program replaced while it runs (an update from a window that stayed
+    /// open) is its old path, which Linux shows with " (deleted)".
+    #[test]
+    fn a_replaced_program_is_the_path_it_started_from() {
+        use super::undeleted;
+        use std::path::{Path, PathBuf};
+        let p = |s: &str| PathBuf::from(s);
+        let none = |_: &Path| false;
+        assert_eq!(
+            undeleted(p("/home/u/.local/bin/pithagoras-sync (deleted)"), none),
+            p("/home/u/.local/bin/pithagoras-sync")
+        );
+        // A file that has that name is that file.
+        assert_eq!(
+            undeleted(p("/opt/x (deleted)"), |_: &Path| true),
+            p("/opt/x (deleted)")
+        );
+        assert_eq!(undeleted(p("/opt/x"), none), p("/opt/x"));
     }
 }

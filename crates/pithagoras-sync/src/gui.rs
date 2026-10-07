@@ -25,7 +25,7 @@ use sync_policy::secret::Secret;
 use sync_policy::{Dirs, Mode};
 use sync_proto::methods::FolderInfo;
 
-use crate::cli::Kept;
+use crate::cli::{Asked, Kept, Update};
 use crate::dialogs::{
     Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines,
 };
@@ -111,15 +111,6 @@ pub struct SudoState {
     pub password: bool,
 }
 
-/// What `update --check` found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdateOffer {
-    /// The newer release's version; `None` when there is none.
-    pub version: Option<String>,
-    /// What the command says about it.
-    pub lines: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Did what the owner asked.
@@ -170,11 +161,10 @@ pub trait Host {
     async fn uninstall(&self, purge: bool) -> Result<(String, Vec<String>), String>;
     /// Whether this build can update itself (it has the release key).
     fn can_update(&self) -> bool;
-    /// `update --check`: the newer version on offer (`None`: up to date) and
-    /// what the command says about it.
-    async fn update_check(&self) -> Result<UpdateOffer, String>;
-    /// `update`, only to `version`: what the command says.
-    async fn update(&self, version: &str) -> Result<Vec<String>, String>;
+    /// `update --check`: what it found.
+    async fn update_check(&self) -> Result<Update, String>;
+    /// `update`, of only what the owner was asked about: what it did.
+    async fn update(&self, asked: Asked<'_>) -> Result<Update, String>;
     /// Whether sudo access can be set up here (Linux, not as root).
     fn sudo_available(&self) -> bool;
     /// As `sudo status` finds it.
@@ -736,33 +726,64 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
-    let offer = match h.update_check().await {
-        Ok(o) => o,
+    let found = match h.update_check().await {
+        Ok(u) => u,
         Err(e) => {
             d.error(&t.update_failed(&shown(&e)));
             return Outcome::Failed;
         }
     };
-    let lines = shown_lines(&offer.lines.join("\n"));
-    let Some(version) = offer.version else {
-        d.info(&t.up_to_date(&lines));
-        return Outcome::Done;
+    let current = shown(&found.current);
+    let released = shown(&found.released);
+    let version = found.available.as_deref().map(shown);
+    let asked = match (&version, &found.stale_client) {
+        (Some(v), _) => {
+            if !d.question(&t.update_question(v, &released, &current)) {
+                return Outcome::Cancelled;
+            }
+            Asked::Release(found.available.as_deref().unwrap_or_default())
+        }
+        // The file is current, but the client still runs the one it
+        // replaced: a restart is what is left to do.
+        (None, Some(old)) => {
+            if !d.question(&t.restart_question(&current, &released, &shown(old))) {
+                return Outcome::Cancelled;
+            }
+            Asked::Restart
+        }
+        (None, None) => {
+            d.info(&t.up_to_date(&current, &released));
+            return Outcome::Done;
+        }
     };
-    if !d.question(&t.update_question(&shown(&version), &lines)) {
-        return Outcome::Cancelled;
-    }
     if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
-    match h.update(&version).await {
-        Ok(lines) => {
-            d.info(&t.updated(&shown_lines(&lines.join("\n"))));
-            Outcome::Done
-        }
+    let done = match h.update(asked).await {
+        Ok(u) => u,
         Err(e) => {
             d.error(&t.update_failed(&shown(&e)));
-            Outcome::Failed
+            return Outcome::Failed;
         }
+    };
+    let (error, text) = match (&done.installed, &done.stale_client) {
+        (Some(v), _) => (false, t.updated(&shown(v), done.restarted)),
+        (None, _) if done.restarted => (false, t.client_restarted(&current).to_string()),
+        // The client restarted meanwhile: nothing is left to do.
+        (None, None) => (false, t.up_to_date(&current, &released)),
+        (None, Some(_)) => (true, t.client_not_restarted().to_string()),
+    };
+    let mut text = text;
+    if !done.notes.is_empty() {
+        let notes: Vec<String> = done.notes.iter().map(|n| shown(n)).collect();
+        text = format!("{text}\n\n{}", t.notes(&notes));
+    }
+    if error {
+        d.error(&text);
+        Outcome::Failed
+    } else {
+        d.info(&text);
+        Outcome::Done
     }
 }
 
@@ -1199,7 +1220,7 @@ impl Host for RealHost {
         if let Some(e) = self.uninstall_refused() {
             return Err(e);
         }
-        let program = std::env::current_exe()
+        let program = crate::cli::this_program()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let notes = if purge {
@@ -1217,18 +1238,12 @@ impl Host for RealHost {
         crate::update::PUBLIC_KEY.is_some()
     }
 
-    async fn update_check(&self) -> Result<UpdateOffer, String> {
-        let u = crate::cli::update(&self.dirs, true, None, None).await?;
-        Ok(UpdateOffer {
-            version: u.available,
-            lines: u.lines,
-        })
+    async fn update_check(&self) -> Result<Update, String> {
+        crate::cli::update(&self.dirs, true, None, Asked::Anything).await
     }
 
-    async fn update(&self, version: &str) -> Result<Vec<String>, String> {
-        crate::cli::update(&self.dirs, false, None, Some(version))
-            .await
-            .map(|u| u.lines)
+    async fn update(&self, asked: Asked<'_>) -> Result<Update, String> {
+        crate::cli::update(&self.dirs, false, None, asked).await
     }
 
     fn sudo_available(&self) -> bool {
@@ -1365,6 +1380,10 @@ mod tests {
         updates: bool,
         /// The release `update --check` offers; `None`: up to date.
         release: Option<&'static str>,
+        /// The running client's version, older than the program's file.
+        stale_client: Option<&'static str>,
+        /// The client does not take the request to restart.
+        no_restart: bool,
         did: Mutex<Vec<String>>,
     }
 
@@ -1397,12 +1416,28 @@ mod tests {
                 log_fails: None,
                 updates: true,
                 release: None,
+                stale_client: None,
+                no_restart: false,
                 did: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl FakeHost {
+        /// What `update --check` finds.
+        fn found(&self) -> Update {
+            Update {
+                available: self.release.map(String::from),
+                current: "0.0.2".into(),
+                released: "2026-10-08 10:00 UTC".into(),
+                stale_client: self.stale_client.map(String::from),
+                installed: None,
+                restarted: false,
+                lines: Vec::new(),
+                notes: Vec::new(),
+            }
+        }
+
         fn did(&self) -> Vec<String> {
             self.did.lock().unwrap().clone()
         }
@@ -1514,27 +1549,31 @@ mod tests {
         fn can_update(&self) -> bool {
             self.updates
         }
-        async fn update_check(&self) -> Result<UpdateOffer, String> {
+        async fn update_check(&self) -> Result<Update, String> {
             self.step("update check")?;
-            let line = match self.release {
-                Some(v) => {
-                    format!("Version {v} is available, released 2026-10-08 (this is 0.0.2).")
-                }
-                None => {
-                    "Up to date (this is 0.0.2; the newest release was made 2026-10-07).".into()
-                }
-            };
-            Ok(UpdateOffer {
-                version: self.release.map(String::from),
-                lines: vec![line],
-            })
+            Ok(self.found())
         }
-        async fn update(&self, version: &str) -> Result<Vec<String>, String> {
-            self.step(&format!("update {version}"))?;
-            Ok(vec![
-                format!("Updated /home/alice/.local/bin/pithagoras-sync to {version}."),
-                "The running client restarts with it\x1b[2K.".into(),
-            ])
+        async fn update(&self, asked: Asked<'_>) -> Result<Update, String> {
+            let found = self.found();
+            match asked {
+                Asked::Release(v) => {
+                    self.step(&format!("update {v}"))?;
+                    Ok(Update {
+                        installed: Some(v.into()),
+                        restarted: !self.no_restart,
+                        notes: vec!["The one you ran, /tmp/x\x1b[2K, is unchanged.".into()],
+                        ..found
+                    })
+                }
+                Asked::Restart => {
+                    self.step("restart")?;
+                    Ok(Update {
+                        restarted: !self.no_restart,
+                        ..found
+                    })
+                }
+                Asked::Anything => panic!("the window asks about one release"),
+            }
         }
         fn sudo_available(&self) -> bool {
             self.sudo
@@ -2606,21 +2645,36 @@ mod tests {
         assert_eq!(seen.len(), 3, "{seen:#?}");
         assert!(
             seen[1].starts_with(
-                "question: Version 0.0.3 is available, released 2026-10-08 (this is 0.0.2).\n\nUpdate Pithagoras Sync to 0.0.3 now?"
+                "question: Version 0.0.3 of Pithagoras Sync is available, released 2026-10-08 10:00 UTC; this computer has 0.0.2.\n\nUpdate Pithagoras Sync to 0.0.3 now?"
             ),
             "{seen:#?}"
         );
+        // The notes as the command line says them, escaped.
         assert!(
-            seen[2].contains("]: Pithagoras Sync is updated.\n\nUpdated /home/alice/.local/bin/pithagoras-sync to 0.0.3.\nThe running client restarts with it\\u{1b}[2K."),
+            seen[2].contains("]: Pithagoras Sync is updated to 0.0.3. The client restarts with it.\n\nNote: The one you ran, /tmp/x\\u{1b}[2K, is unchanged."),
             "{seen:#?}"
         );
         assert_eq!(h.did(), ["update check", "update 0.0.3"]);
+        // In German, all of it but the notes.
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            ..paired()
+        };
+        let (_, seen) = run_in(Lang::De, &h, &["pick:update", "yes", "cancel"], None).await;
+        assert!(
+            seen[1].starts_with("question: Version 0.0.3 von Pithagoras Sync ist verfügbar, veröffentlicht am 2026-10-08 10:00 UTC; dieser Computer hat 0.0.2."),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[2].contains("]: Pithagoras Sync ist auf 0.0.3 aktualisiert. Der Client startet mit dieser Version neu.\n\nHinweis: The one you ran"),
+            "{seen:#?}"
+        );
         // Up to date: said at the top of the menu, no question.
         let h = paired();
         let (_, seen) = run_in(Lang::De, &h, &["pick:update", "cancel"], None).await;
         assert_eq!(seen.len(), 2, "{seen:#?}");
         assert!(
-            seen[1].contains("]: Keine Aktualisierung: Up to date (this is 0.0.2"),
+            seen[1].contains("]: Pithagoras Sync ist aktuell (0.0.2; die neueste Version wurde am 2026-10-08 10:00 UTC veröffentlicht).\n\n"),
             "{seen:#?}"
         );
         assert_eq!(h.did(), ["update check"]);
@@ -2649,6 +2703,47 @@ mod tests {
         };
         run(&h, &["pick:update", "yes"], None).await;
         assert_eq!(h.did(), ["update check"]);
+    }
+
+    /// The program is current but the client still runs the one it replaced:
+    /// the window offers the restart `update` would do, and does only that.
+    #[tokio::test]
+    async fn the_menu_restarts_a_client_that_runs_the_replaced_program() {
+        let h = FakeHost {
+            stale_client: Some("0.0.1"),
+            ..paired()
+        };
+        let (o, seen) = run(&h, &["pick:update", "yes", "cancel"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(
+            seen[1].starts_with(
+                "question: Pithagoras Sync is up to date (0.0.2; the newest release was made 2026-10-08 10:00 UTC), but the running client is still 0.0.1.\n\nRestart the client with 0.0.2 now?"
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[2].contains("]: The client restarts with 0.0.2.\n\n"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["update check", "restart"]);
+        // No: nothing.
+        let h = FakeHost {
+            stale_client: Some("0.0.1"),
+            ..paired()
+        };
+        run(&h, &["pick:update", "no", "cancel"], None).await;
+        assert_eq!(h.did(), ["update check"]);
+        // Refused: said as an error.
+        let h = FakeHost {
+            stale_client: Some("0.0.1"),
+            no_restart: true,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:update", "yes", "cancel"], None).await;
+        assert!(
+            seen[2].contains("The client did not take the request to restart"),
+            "{seen:#?}"
+        );
     }
 
     /// A held message that would make the next window's text too long gets

@@ -553,32 +553,71 @@ impl Lang {
 
     // Update.
 
-    /// `lines` are what `update --check` said (escaped).
-    pub fn update_question(self, version: &str, lines: &str) -> String {
+    /// A newer release (`version`), made `released`; this computer has
+    /// `current`.
+    pub fn update_question(self, version: &str, released: &str, current: &str) -> String {
         match self {
             Lang::En => format!(
-                "{lines}\n\nUpdate Pithagoras Sync to {version} now? The release is signed; the client restarts with it."
+                "Version {version} of Pithagoras Sync is available, released {released}; this computer has {current}.\n\nUpdate Pithagoras Sync to {version} now? The release is signed; the client restarts with it."
             ),
             Lang::De => format!(
-                "{lines}\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; der Client startet mit ihr neu."
+                "Version {version} von Pithagoras Sync ist verfügbar, veröffentlicht am {released}; dieser Computer hat {current}.\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; der Client startet mit ihr neu."
             ),
         }
     }
 
-    /// No newer release: what `update --check` said (escaped).
-    pub fn up_to_date(self, lines: &str) -> String {
+    /// The program is current, but the client still runs `old`, the program
+    /// the file replaced.
+    pub fn restart_question(self, current: &str, released: &str, old: &str) -> String {
         match self {
-            Lang::En => format!("No update: {lines}"),
-            Lang::De => format!("Keine Aktualisierung: {lines}"),
+            Lang::En => format!(
+                "Pithagoras Sync is up to date ({current}; the newest release was made {released}), but the running client is still {old}.\n\nRestart the client with {current} now?"
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync ist aktuell ({current}; die neueste Version wurde am {released} veröffentlicht), aber der laufende Client ist noch {old}.\n\nDen Client jetzt mit {current} neu starten?"
+            ),
         }
     }
 
-    /// What `update` said (escaped).
-    pub fn updated(self, lines: &str) -> String {
+    /// No newer release.
+    pub fn up_to_date(self, current: &str, released: &str) -> String {
         match self {
-            Lang::En => format!("Pithagoras Sync is updated.\n\n{lines}"),
-            Lang::De => format!("Pithagoras Sync ist aktualisiert.\n\n{lines}"),
+            Lang::En => format!(
+                "Pithagoras Sync is up to date ({current}; the newest release was made {released})."
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync ist aktuell ({current}; die neueste Version wurde am {released} veröffentlicht)."
+            ),
         }
+    }
+
+    /// `version` is installed; `restarted`: the client took the request to
+    /// restart with it.
+    pub fn updated(self, version: &str, restarted: bool) -> String {
+        match (self, restarted) {
+            (Lang::En, true) => {
+                format!("Pithagoras Sync is updated to {version}. The client restarts with it.")
+            }
+            (Lang::En, false) => format!("Pithagoras Sync is updated to {version}."),
+            (Lang::De, true) => format!(
+                "Pithagoras Sync ist auf {version} aktualisiert. Der Client startet mit dieser Version neu."
+            ),
+            (Lang::De, false) => format!("Pithagoras Sync ist auf {version} aktualisiert."),
+        }
+    }
+
+    pub fn client_restarted(self, current: &str) -> String {
+        match self {
+            Lang::En => format!("The client restarts with {current}."),
+            Lang::De => format!("Der Client startet mit {current} neu."),
+        }
+    }
+
+    pub fn client_not_restarted(self) -> &'static str {
+        self.pick(
+            "The client did not take the request to restart: restart its unit or logon task.",
+            "Der Client hat die Bitte um einen Neustart nicht angenommen: Starte seine Unit oder Anmeldeaufgabe neu.",
+        )
     }
 
     pub fn update_failed(self, e: &str) -> String {
