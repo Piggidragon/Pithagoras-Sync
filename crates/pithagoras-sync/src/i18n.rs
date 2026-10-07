@@ -420,6 +420,18 @@ impl Lang {
         )
     }
 
+    /// `su` refused `n` passwords: the flow ends.
+    pub fn owner_password_tries(self, n: u32) -> String {
+        match self {
+            Lang::En => format!(
+                "su did not accept the password {n} times. Nothing changed; open Pithagoras Sync again to try again."
+            ),
+            Lang::De => format!(
+                "su hat das Passwort {n}-mal nicht angenommen. Es wurde nichts geändert; öffne Pithagoras Sync erneut, um es noch einmal zu versuchen."
+            ),
+        }
+    }
+
     pub fn owner_password_failed(self, e: &str) -> String {
         match self {
             Lang::En => format!(

@@ -563,12 +563,16 @@ async fn pair_after_yes(
     }
 }
 
+/// How many passwords `su` may refuse in one flow, as sudo allows by default.
+const OWNER_PASSWORD_TRIES: u32 = 3;
+
 /// The user's password, checked with `su`: on a desktop the command line asks
 /// for it in a terminal before `pair`, and a command of the agent that clicks
 /// through the windows does not know it. `typed`: the one from the form, if
-/// it had a field for it. One `su` refused is asked for again, with why at
-/// the top: zenity's form again, the link kept (shown as parsed), or the
-/// password window.
+/// it had a field for it. A password `su` refused is asked for again, with
+/// why at the top: zenity's form again, the link kept (shown as parsed), or
+/// the password window; after `OWNER_PASSWORD_TRIES` refusals the flow ends,
+/// so a program that drives the window cannot guess on in it.
 async fn owner_password(
     d: &dyn Dialogs,
     h: &impl Host,
@@ -579,6 +583,7 @@ async fn owner_password(
 ) -> Outcome {
     let account = shown(&h.account());
     let mut typed = typed;
+    let mut refused = 0;
     loop {
         let pw = match typed.take() {
             Some(pw) => pw,
@@ -616,7 +621,14 @@ async fn owner_password(
         }
         match h.owner_password(&pw).await {
             Ok(true) => return Outcome::Done,
-            Ok(false) => d.error(t.owner_password_wrong()),
+            Ok(false) => {
+                refused += 1;
+                if refused >= OWNER_PASSWORD_TRIES {
+                    d.error(&t.owner_password_tries(OWNER_PASSWORD_TRIES));
+                    return Outcome::Failed;
+                }
+                d.error(t.owner_password_wrong());
+            }
             Err(e) => {
                 d.error(&t.owner_password_failed(&shown(&e)));
                 return Outcome::Failed;
@@ -2235,6 +2247,65 @@ mod tests {
         let en = q(Lang::En, &h).await;
         assert!(en.contains("and pair it with"), "{en}");
         assert!(en.contains("full mode, with no expiry"), "{en}");
+    }
+
+    /// su refusing `OWNER_PASSWORD_TRIES` passwords ends the flow: a program
+    /// that drives the window cannot go on guessing in it.
+    #[tokio::test]
+    async fn the_login_password_is_asked_for_three_times_at_most() {
+        // zenity's form, and the password window.
+        let h = desktop(FakeHost::default());
+        let first = format!("form:{LINK}|guess 1");
+        let (o, seen) = zenity(
+            &h,
+            &[
+                &first,
+                "yes",
+                "form:guess 2",
+                "form:guess 3",
+                "form:my login",
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(h.did(), ["owner password"; 3]);
+        assert_eq!(
+            seen.last().unwrap(),
+            "error: su did not accept the password 3 times. Nothing changed; open Pithagoras Sync again to try again."
+        );
+        assert_eq!(seen.len(), 5, "{seen:#?}");
+        assert_eq!(h.paired(), None);
+        let h = desktop(installed());
+        let (o, seen) = run(
+            &h,
+            &[
+                "yes",
+                "pw:guess 1",
+                "pw:guess 2",
+                "pw:guess 3",
+                "pw:my login",
+            ],
+            Some(LINK),
+        )
+        .await;
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(h.did(), ["owner password"; 3]);
+        assert!(
+            seen.last()
+                .unwrap()
+                .starts_with("error: su did not accept the password 3 times")
+        );
+        assert_eq!(h.paired(), None);
+        // An empty password is no try: su never saw it.
+        let h = desktop(installed());
+        let (o, _) = run(
+            &h,
+            &["yes", "pw:", "pw:guess 1", "pw:guess 2", "pw:my login"],
+            Some(LINK),
+        )
+        .await;
+        assert_eq!(o, Outcome::Done);
     }
 
     #[tokio::test]

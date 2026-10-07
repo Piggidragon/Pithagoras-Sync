@@ -1301,7 +1301,7 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
     .await;
     looks_installed(&env);
     let answer = format!("0|{PW}");
-    let path = fake_dialogs(&env, &["0|", &answer]);
+    let path = fake_dialogs(&env, &["0|", &answer, &answer, &answer]);
     let out = env
         .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
         .env("PATH", &path)
@@ -1311,7 +1311,6 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
-    assert_eq!(shown.len(), 3, "{shown:#?}");
     assert!(shown[0].contains("--question"), "{shown:#?}");
     // zenity's form, after the question, for the password alone: the link
     // is the one confirmed.
@@ -1322,12 +1321,30 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
             && flat(&shown[1]).contains("needs your login password ("),
         "{shown:#?}"
     );
-    // su refused it: the form again, saying so (then cancelled); or su could
-    // not check it at all: the error.
-    assert!(
-        flat(&shown[2]).contains("su did not accept this password") || shown[2].contains("--error"),
-        "{shown:#?}"
-    );
+    // su refused it: the form again, saying so, until it refused three; or
+    // su could not check it at all (no su here): that error, and no retry.
+    if shown[2].contains("--error") {
+        assert_eq!(shown.len(), 3, "{shown:#?}");
+        assert!(
+            flat(&shown[2]).contains("Your password could not be checked"),
+            "{shown:#?}"
+        );
+    } else {
+        assert_eq!(shown.len(), 5, "{shown:#?}");
+        for again in &shown[2..4] {
+            assert!(
+                again.contains("--forms")
+                    && again.contains("--add-password=Login password")
+                    && flat(again).contains("su did not accept this password"),
+                "{shown:#?}"
+            );
+        }
+        assert!(
+            shown[4].contains("--error")
+                && flat(&shown[4]).contains("su did not accept the password 3 times"),
+            "{shown:#?}"
+        );
+    }
     assert!(!env.config().exists());
     assert!(!env.home.join(".config/pithagoras-sync/token").exists());
     assert_eq!(
