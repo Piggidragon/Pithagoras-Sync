@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use sync_policy::approve::visible;
 use sync_policy::secret::Secret;
 
+pub use crate::install::ICON_NAME;
+
 pub const TITLE: &str = "Pithagoras Sync";
 
 /// The longest text a dialog shows.
@@ -53,17 +55,98 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// `text`, then `ask` below it, in one box of at most `MAX_TEXT` characters:
+/// `text` is cut to make room, so the question the box's buttons answer is
+/// never what is cut (Windows, whose boxes add it to the text).
+#[cfg(any(windows, test))]
+pub(crate) fn with_question(text: &str, ask: &str) -> String {
+    let room = MAX_TEXT.saturating_sub(ask.chars().count() + 3);
+    format!("{}\n\n{ask}", clip(text, room))
+}
+
+/// How much one window of the dialog program can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    /// zenity: a form with an entry and a hidden field in one window.
+    Forms,
+    /// kdialog: one entry per window.
+    Entries,
+    /// Windows: message boxes only; a text comes from the clipboard.
+    Boxes,
+}
+
+/// The labels of a window's OK and Cancel buttons (zenity and kdialog;
+/// Windows labels its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Buttons<'a> {
+    pub ok: &'a str,
+    pub cancel: &'a str,
+}
+
+/// The fields of a form, by their labels: an entry (the pairing link) and a
+/// hidden field (the login password), in that order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Form<'a> {
+    pub entry: Option<&'a str>,
+    pub password: Option<&'a str>,
+}
+
+/// What came back from a form: a value for each field it had.
+#[derive(Debug, Default)]
+pub struct Filled {
+    pub entry: Option<Secret>,
+    pub password: Option<Secret>,
+}
+
+/// A form as dialogs without forms ask it: a window per field, the entry
+/// first. Cancelled in one, the form is.
+pub fn form_per_field<D: Dialogs + ?Sized>(
+    d: &D,
+    text: &str,
+    form: Form,
+    buttons: Buttons,
+) -> Option<Filled> {
+    let mut filled = Filled::default();
+    if form.entry.is_some() {
+        filled.entry = Some(d.entry(text, buttons)?);
+    }
+    if form.password.is_some() {
+        filled.password = Some(d.password(text)?);
+    }
+    Some(filled)
+}
+
 pub trait Dialogs {
+    fn style(&self) -> Style;
     fn info(&self, text: &str);
     fn error(&self, text: &str);
     /// Yes or No. A closed window, or a dialog that could not be shown, is No.
     fn question(&self, text: &str) -> bool;
-    /// One line typed or pasted in; `None` when cancelled.
-    fn entry(&self, text: &str) -> Option<String>;
+    /// One line typed or pasted in; `None` when cancelled. Zeroed once
+    /// dropped: on Windows it is the clipboard's text, which may be anything
+    /// the owner copied (a password).
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret>;
     /// One line typed in without showing it; `None` when cancelled.
     fn password(&self, text: &str) -> Option<Secret>;
-    /// One of `items` (key, label), by its key; `None` when cancelled.
-    fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str>;
+    /// One of `items` (key, label), by its key; `None` when cancelled or
+    /// closed.
+    fn menu(
+        &self,
+        text: &str,
+        items: &[(&'static str, &str)],
+        buttons: Buttons,
+    ) -> Option<&'static str>;
+    /// The fields of `form` in one window (`Style::Forms`); `None` when
+    /// cancelled. Elsewhere one window per field.
+    fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
+        form_per_field(self, text, form, buttons)
+    }
+    /// A text the owner has at hand without being asked for it: the
+    /// clipboard's on Windows. The flow takes it only as a pairing link that
+    /// parses, and drops anything else unseen.
+    fn at_hand(&self) -> Option<Secret> {
+        None
+    }
 }
 
 /// What one dialog asks.
@@ -72,9 +155,58 @@ pub enum Ask<'a> {
     Info(&'a str),
     Error(&'a str),
     Question(&'a str),
-    Entry(&'a str),
+    Entry(&'a str, Buttons<'a>),
     Password(&'a str),
-    Menu(&'a str, &'a [(&'static str, &'a str)]),
+    Menu(&'a str, &'a [(&'static str, &'a str)], Buttons<'a>),
+    Form(&'a str, Form<'a>, Buttons<'a>),
+}
+
+/// What separates the fields of zenity's form in its output: a character no
+/// pairing link holds and the password check refuses, unlike zenity's `|`.
+pub const FORM_SEPARATOR: char = '\u{1f}';
+
+/// How many characters a line of a form's or a list's text holds: zenity 4
+/// does not wrap either (the form's is its frame's title), so the window
+/// would grow as wide as the longest line.
+const FORM_LINE: usize = 72;
+
+/// `text` broken into lines of at most `width` characters at spaces; a longer
+/// word gets a line of its own, cut only past twice `width`.
+fn wrapped(text: &str, width: usize) -> String {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let mut word: Vec<char> = word.chars().collect();
+            loop {
+                let len = line.chars().count();
+                let sep = usize::from(len > 0);
+                if len + sep + word.len() <= width {
+                    if sep == 1 {
+                        line.push(' ');
+                    }
+                    line.extend(word.iter());
+                    break;
+                }
+                if len > 0 {
+                    out.push(std::mem::take(&mut line));
+                    continue;
+                }
+                // A word longer than a line (a URL, a path) gets a line of
+                // its own, whole, so a host is never read in two pieces; only
+                // one too long for that is cut.
+                if word.len() <= 2 * width {
+                    out.push(word.iter().collect());
+                    break;
+                }
+                let rest = word.split_off(2 * width);
+                out.push(word.iter().collect());
+                word = rest;
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,9 +230,20 @@ fn qt(s: &str) -> String {
 }
 
 impl Helper {
-    /// The program's arguments for `ask`. Every value is one argument; zenity's
-    /// take the `--name=value` form, so none can be read as an option.
-    pub fn args(&self, ask: &Ask) -> Vec<String> {
+    /// The program's arguments for `ask`, with the program's icon (`icon`)
+    /// where the dialog shows one. Every value is one argument; zenity's take
+    /// the `--name=value` form, so none can be read as an option.
+    /// Whether a window of `ask` shows the icon option: every kdialog one;
+    /// zenity 4 shows it in questions, information and errors, and takes it
+    /// but shows nothing in its forms, lists and entries.
+    fn shows_icon(&self, ask: &Ask) -> bool {
+        match self {
+            Helper::Kdialog(_) => true,
+            Helper::Zenity(_) => matches!(ask, Ask::Info(_) | Ask::Error(_) | Ask::Question(_)),
+        }
+    }
+
+    pub fn args(&self, ask: &Ask, icon: bool) -> Vec<String> {
         let clipped = |t: &str| clip(t, MAX_TEXT);
         match self {
             Helper::Zenity(_) => {
@@ -115,11 +258,16 @@ impl Helper {
                             }
                             .into(),
                         );
+                        // zenity 4 shows it in these three; its forms, lists
+                        // and entries take the option but show no icon.
+                        if icon {
+                            a.push(format!("--icon={ICON_NAME}"));
+                        }
                         a.push("--no-markup".into());
                         a.push("--width=480".into());
                         a.push(format!("--text={}", clipped(t)));
                     }
-                    Ask::Entry(t) | Ask::Password(t) => {
+                    Ask::Entry(t, _) | Ask::Password(t) => {
                         a.push("--entry".into());
                         if matches!(ask, Ask::Password(_)) {
                             a.push("--hide-text".into());
@@ -127,7 +275,7 @@ impl Helper {
                         a.push("--width=560".into());
                         a.push(format!("--text={}", pango(&clipped(t))));
                     }
-                    Ask::Menu(t, items) => {
+                    Ask::Menu(t, _, _) => {
                         a.extend(
                             [
                                 "--list",
@@ -136,30 +284,70 @@ impl Helper {
                                 "--column=choice",
                                 "--hide-column=1",
                                 "--print-column=1",
-                                "--width=480",
-                                "--height=400",
+                                "--width=560",
+                                "--height=520",
                             ]
                             .map(String::from),
                         );
-                        a.push(format!("--text={}", pango(&clipped(t))));
-                        for (k, l) in *items {
-                            a.push(k.to_string());
-                            a.push(l.to_string());
+                        // As the form's, the list's text is not wrapped.
+                        a.push(format!(
+                            "--text={}",
+                            pango(&wrapped(&clipped(t), FORM_LINE))
+                        ));
+                    }
+                    Ask::Form(t, form, _) => {
+                        a.push("--forms".into());
+                        a.push(format!(
+                            "--text={}",
+                            pango(&wrapped(&clipped(t), FORM_LINE))
+                        ));
+                        if let Some(l) = form.entry {
+                            a.push(format!("--add-entry={l}"));
                         }
+                        if let Some(l) = form.password {
+                            a.push(format!("--add-password={l}"));
+                        }
+                        a.push(format!("--separator={FORM_SEPARATOR}"));
+                    }
+                }
+                if let Ask::Entry(_, b) | Ask::Menu(_, _, b) | Ask::Form(_, _, b) = ask {
+                    a.push(format!("--ok-label={}", b.ok));
+                    a.push(format!("--cancel-label={}", b.cancel));
+                }
+                // The rows last: each is a value, not an option.
+                if let Ask::Menu(_, items, _) = ask {
+                    for (k, l) in *items {
+                        a.push(k.to_string());
+                        a.push(l.to_string());
                     }
                 }
                 a
             }
             Helper::Kdialog(_) => {
                 let mut a = vec!["--title".to_string(), TITLE.to_string()];
+                // The window's icon, in every kdialog dialog.
+                if icon {
+                    a.extend(["--icon".to_string(), ICON_NAME.to_string()]);
+                }
                 let text = |t: &str| qt(&clipped(t));
+                if let Ask::Entry(_, b) | Ask::Menu(_, _, b) = ask {
+                    a.extend([
+                        "--ok-label".into(),
+                        b.ok.to_string(),
+                        "--cancel-label".into(),
+                        b.cancel.to_string(),
+                    ]);
+                }
                 match ask {
                     Ask::Info(t) => a.extend(["--msgbox".into(), text(t)]),
                     Ask::Error(t) => a.extend(["--error".into(), text(t)]),
                     Ask::Question(t) => a.extend(["--yesno".into(), text(t)]),
-                    Ask::Entry(t) => a.extend(["--inputbox".into(), text(t), String::new()]),
+                    Ask::Entry(t, _) => a.extend(["--inputbox".into(), text(t), String::new()]),
+                    // No forms: `Native::form` asks field by field, the
+                    // password in its own box. An input box would show it.
+                    Ask::Form(..) => unreachable!("kdialog has no forms"),
                     Ask::Password(t) => a.extend(["--password".into(), text(t)]),
-                    Ask::Menu(t, items) => {
+                    Ask::Menu(t, items, _) => {
                         a.extend(["--menu".into(), text(t)]);
                         for (k, l) in *items {
                             a.push(k.to_string());
@@ -380,16 +568,102 @@ fn installed_locales(path: &std::ffi::OsStr) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether the dialog program takes the icon option: kdialog's `--icon` is as
+/// old as kdialog; zenity's `--icon` came with zenity 4 (3 would refuse it and
+/// show no window at all, so a question would read as No).
+fn takes_icon(helper: &Helper, version: Option<&str>) -> bool {
+    match helper {
+        Helper::Kdialog(_) => true,
+        Helper::Zenity(_) => version
+            .and_then(|v| v.trim().split('.').next()?.parse::<u32>().ok())
+            .is_some_and(|major| major >= 4),
+    }
+}
+
+/// Whether `install` put the icon below the data home: before that (the
+/// downloaded file's first windows) zenity would draw a missing image in
+/// place of its own icon.
+fn icon_there(data_home: &Path) -> bool {
+    crate::install::icon_paths(data_home)
+        .iter()
+        .any(|p| p.is_file())
+}
+
+/// `zenity --version`, run as the dialogs are, or `None`.
+fn zenity_version(prog: &Path) -> Option<String> {
+    let mut cmd = dialog_command(prog);
+    cmd.arg("--version");
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let v = String::from_utf8_lossy(&out.stdout);
+    Some(v.chars().take(32).collect())
+}
+
+/// `prog` as every dialog program runs: in the cleaned environment
+/// (`DIALOG_ENV`), with no input and its errors dropped.
+fn dialog_command(prog: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(prog);
+    cmd.env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for v in DIALOG_ENV {
+        if let Some(x) = std::env::var_os(v) {
+            cmd.env(v, x);
+        }
+    }
+    cmd
+}
+
 /// The desktop's dialog program.
 pub struct Native {
     helper: Helper,
     /// Locale variables set over the session's (`locale_fix`).
     locale: Vec<(&'static str, String)>,
+    /// Whether `install` put the icon in place (`icon_there`).
+    icon_there: bool,
+    /// Whether the program takes the icon option (`takes_icon`): zenity is
+    /// asked its version once, the first time a window would show the icon.
+    takes_icon: std::cell::OnceCell<bool>,
 }
 
 impl Native {
-    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>) -> Native {
-        Native { helper, locale }
+    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>, icon_there: bool) -> Native {
+        Native {
+            helper,
+            locale,
+            icon_there,
+            takes_icon: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `ask` gets the program's icon.
+    fn icon(&self, ask: &Ask) -> bool {
+        self.icon_there
+            && self.helper.shows_icon(ask)
+            && *self.takes_icon.get_or_init(|| {
+                let version = match &self.helper {
+                    Helper::Zenity(p) => zenity_version(p),
+                    Helper::Kdialog(_) => None,
+                };
+                takes_icon(&self.helper, version.as_deref())
+            })
+    }
+
+    /// The answer of an entry or password window: the line end cut off in
+    /// place, the rest never copied; a cancelled one's output zeroed.
+    fn secret_answer(&self, ask: &Ask) -> Option<Secret> {
+        match self.run(ask) {
+            (Some(0), Some(mut t)) => {
+                while t.ends_with(['\n', '\r']) {
+                    t.pop();
+                }
+                Some(Secret::new(t))
+            }
+            (_, Some(t)) => {
+                drop(Secret::new(t));
+                None
+            }
+            _ => None,
+        }
     }
 
     /// The dialog program of this session, if there is a display and one.
@@ -401,24 +675,24 @@ impl Native {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let helper = find_helper(&path, &desktop, &system_program)?;
         let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
-        Some(Native::new(helper, locale))
+        let data = sync_ops::info::home().map(|h| crate::cli::data_home(&h));
+        let icon = data.is_some_and(|d| icon_there(&d));
+        Some(Native::new(helper, locale, icon))
     }
 
     /// Runs the program; its exit code and up to `MAX_ANSWER` bytes of its
-    /// output (`None` when there was more, or it could not run).
+    /// output; for a form twice that, its separator and the line end, since
+    /// its link and its password each may take that much (`None` when there
+    /// was more, or it could not run).
     fn run(&self, ask: &Ask) -> (Option<i32>, Option<String>) {
         use std::io::Read;
-        let mut cmd = std::process::Command::new(self.helper.program());
-        cmd.args(self.helper.args(ask))
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        for v in DIALOG_ENV {
-            if let Some(x) = std::env::var_os(v) {
-                cmd.env(v, x);
-            }
-        }
+        let max = match ask {
+            Ask::Form(..) => 2 * MAX_ANSWER + FORM_SEPARATOR.len_utf8() + 1,
+            _ => MAX_ANSWER,
+        };
+        let mut cmd = dialog_command(self.helper.program());
+        cmd.args(self.helper.args(ask, self.icon(ask)))
+            .stdout(std::process::Stdio::piped());
         for (k, v) in &self.locale {
             cmd.env(k, v);
         }
@@ -427,18 +701,15 @@ impl Native {
         };
         // Room for all of it from the start: a buffer grown on the way would
         // leave copies of a password behind.
-        let mut out = Vec::with_capacity(MAX_ANSWER + 1);
+        let mut out = Vec::with_capacity(max + 1);
         let read = child.stdout.take().map(|mut s| {
-            let ok = (&mut s)
-                .take(MAX_ANSWER as u64 + 1)
-                .read_to_end(&mut out)
-                .is_ok();
+            let ok = (&mut s).take(max as u64 + 1).read_to_end(&mut out).is_ok();
             // The rest unread, the program would wait on a full pipe forever.
             let _ = std::io::copy(&mut s, &mut std::io::sink());
             ok
         });
         let status = child.wait().ok().and_then(|s| s.code());
-        let text = if read == Some(true) && out.len() <= MAX_ANSWER {
+        let text = if read == Some(true) && out.len() <= max {
             match String::from_utf8(std::mem::take(&mut out)) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -454,7 +725,48 @@ impl Native {
     }
 }
 
+/// zenity's answer to `form`: the fields' values in order, separated by
+/// `FORM_SEPARATOR`, and a line end. The entry comes first and is cut at the
+/// first separator, so whatever follows is the password's, a separator in it
+/// included (the password check then refuses it). The password is copied
+/// once into its `Secret`, and every byte of `out` is zeroed.
+pub fn split_form(mut out: String, form: Form) -> Filled {
+    let mut end = out.len();
+    while out[..end].ends_with(['\n', '\r']) {
+        end -= 1;
+    }
+    let text = &out[..end];
+    let filled = match (form.entry.is_some(), form.password.is_some()) {
+        (true, true) => {
+            let (entry, pw) = text.split_once(FORM_SEPARATOR).unwrap_or((text, ""));
+            Filled {
+                entry: Some(Secret::new(entry.to_string())),
+                password: Some(Secret::new(pw.to_string())),
+            }
+        }
+        (true, false) => Filled {
+            entry: Some(Secret::new(text.to_string())),
+            password: None,
+        },
+        (false, true) => Filled {
+            entry: None,
+            password: Some(Secret::new(text.to_string())),
+        },
+        (false, false) => Filled::default(),
+    };
+    // SAFETY: zero bytes keep the string valid UTF-8.
+    unsafe { out.as_bytes_mut() }.fill(0);
+    filled
+}
+
 impl Dialogs for Native {
+    fn style(&self) -> Style {
+        match self.helper {
+            Helper::Zenity(_) => Style::Forms,
+            Helper::Kdialog(_) => Style::Entries,
+        }
+    }
+
     fn info(&self, text: &str) {
         self.run(&Ask::Info(text));
     }
@@ -467,36 +779,40 @@ impl Dialogs for Native {
         self.run(&Ask::Question(text)).0 == Some(0)
     }
 
-    fn entry(&self, text: &str) -> Option<String> {
-        match self.run(&Ask::Entry(text)) {
-            (Some(0), Some(t)) => Some(t.trim_end_matches(['\n', '\r']).to_string()),
-            _ => None,
-        }
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
+        self.secret_answer(&Ask::Entry(text, buttons))
     }
 
     fn password(&self, text: &str) -> Option<Secret> {
-        match self.run(&Ask::Password(text)) {
-            (Some(0), Some(mut t)) => {
-                // Only the line end goes; the rest is never copied.
-                while t.ends_with(['\n', '\r']) {
-                    t.pop();
-                }
-                Some(Secret::new(t))
-            }
-            (_, Some(t)) => {
-                drop(Secret::new(t));
-                None
-            }
-            _ => None,
-        }
+        self.secret_answer(&Ask::Password(text))
     }
 
-    fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
-        match self.run(&Ask::Menu(text, items)) {
+    fn menu(
+        &self,
+        text: &str,
+        items: &[(&'static str, &str)],
+        buttons: Buttons,
+    ) -> Option<&'static str> {
+        match self.run(&Ask::Menu(text, items, buttons)) {
             (Some(0), Some(t)) => {
                 // zenity may print the key twice, separated by `|`.
                 let key = t.trim().split('|').next().unwrap_or_default().to_string();
                 items.iter().map(|(k, _)| *k).find(|k| *k == key)
+            }
+            _ => None,
+        }
+    }
+
+    fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
+        if let Helper::Kdialog(_) = self.helper {
+            // No forms.
+            return form_per_field(self, text, form, buttons);
+        }
+        match self.run(&Ask::Form(text, form, buttons)) {
+            (Some(0), Some(t)) => Some(split_form(t, form)),
+            (_, Some(t)) => {
+                drop(Secret::new(t));
+                None
             }
             _ => None,
         }
@@ -516,37 +832,53 @@ mod win {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
-        MB_SETFOREGROUND, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
+        IDOK, IDYES, MB_ICONERROR, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_USERICON, MB_YESNO,
+        MB_YESNOCANCEL, MESSAGEBOX_STYLE, MSGBOXPARAMSW, MessageBoxIndirectW,
     };
 
     use sync_policy::win::wide;
 
-    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip};
+    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip, with_question};
 
     /// The clipboard's text format.
     const CF_UNICODETEXT: u32 = 13;
     const IDNO: i32 = 7;
 
+    use crate::icon_id::ICON_ID;
+
+    /// A box with the program's icon (`MB_USERICON`) unless `style` names a
+    /// stock one (an error's). Without the icon resource (a build that has
+    /// none) Windows shows the box without an icon.
     fn message(text: &str, style: MESSAGEBOX_STYLE) -> i32 {
         let t = wide(&clip(text, MAX_TEXT));
         let title = wide(TITLE);
-        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let own = style & MB_ICONERROR == 0;
+        // SAFETY: both strings are NUL-terminated and outlive the call; the
+        // module handle of the program itself needs no release; the icon is
+        // named by its resource id (MAKEINTRESOURCE).
         unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                t.as_ptr(),
-                title.as_ptr(),
-                style | MB_SETFOREGROUND,
-            )
+            let params = MSGBOXPARAMSW {
+                cbSize: std::mem::size_of::<MSGBOXPARAMSW>() as u32,
+                hwndOwner: std::ptr::null_mut(),
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                lpszText: t.as_ptr(),
+                lpszCaption: title.as_ptr(),
+                dwStyle: style | MB_SETFOREGROUND | if own { MB_USERICON } else { 0 },
+                lpszIcon: ICON_ID as usize as *const u16,
+                dwContextHelpId: 0,
+                lpfnMsgBoxCallback: None,
+                dwLanguageId: 0,
+            };
+            MessageBoxIndirectW(&params)
         }
     }
 
     /// The clipboard's text, if it holds some: at most `MAX_ANSWER` units and
     /// one more, so a longer text is still too long for the link's check.
-    fn clipboard() -> Option<String> {
+    fn clipboard() -> Option<Secret> {
         // SAFETY: the clipboard is opened and closed here; the data is read
         // under GlobalLock, up to its NUL, never past the block's size or
         // MAX_ANSWER units.
@@ -560,7 +892,8 @@ mod win {
                 let p = GlobalLock(h) as *const u16;
                 if !p.is_null() {
                     let size = GlobalSize(h) / 2;
-                    let mut units = Vec::new();
+                    // Sized up front, so no copy is left behind by growing.
+                    let mut units = Vec::with_capacity(size.min(MAX_ANSWER + 1));
                     let mut i = 0;
                     while i <= MAX_ANSWER && i < size {
                         let u = *p.add(i);
@@ -571,7 +904,7 @@ mod win {
                         i += 1;
                     }
                     GlobalUnlock(h);
-                    text = Some(String::from_utf16_lossy(&units));
+                    text = Some(super::utf16_secret(&mut units));
                 }
             }
             CloseClipboard();
@@ -580,8 +913,12 @@ mod win {
     }
 
     impl Dialogs for WinDialogs {
+        fn style(&self) -> super::Style {
+            super::Style::Boxes
+        }
+
         fn info(&self, text: &str) {
-            message(text, MB_OK | MB_ICONINFORMATION);
+            message(text, MB_OK);
         }
 
         fn error(&self, text: &str) {
@@ -589,27 +926,41 @@ mod win {
         }
 
         fn question(&self, text: &str) -> bool {
-            message(text, MB_YESNO | MB_ICONQUESTION) == IDYES
+            message(text, MB_YESNO) == IDYES
         }
 
-        fn entry(&self, text: &str) -> Option<String> {
-            let t = format!("{text}\n\n{}", self.0.clipboard_hint());
-            if message(&t, MB_OKCANCEL | MB_ICONQUESTION) != IDOK {
+        fn entry(&self, text: &str, _buttons: super::Buttons) -> Option<Secret> {
+            let t = with_question(text, self.0.clipboard_hint());
+            if message(&t, MB_OKCANCEL) != IDOK {
                 return None;
             }
             // OK with no text in the clipboard (empty, or a picture) is an
             // answer too: the flow says so and asks again.
-            Some(clipboard().unwrap_or_default().trim().to_string())
+            Some(clipboard().unwrap_or_else(|| Secret::new(String::new())))
         }
 
         fn password(&self, _text: &str) -> Option<Secret> {
             None
         }
 
-        fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
+        /// One Yes/No/Cancel box per item: Yes picks it, No goes on to the
+        /// next, Cancel (or No at the last) closes. The text (the status) is
+        /// in the first box only; the next ones just ask.
+        fn menu(
+            &self,
+            text: &str,
+            items: &[(&'static str, &str)],
+            _buttons: super::Buttons,
+        ) -> Option<&'static str> {
             for (i, (key, label)) in items.iter().enumerate() {
-                let t = self.0.menu_step(text, label, i + 1 == items.len());
-                match message(&t, MB_YESNOCANCEL | MB_ICONQUESTION) {
+                // The status in the first box only; the next ones just ask.
+                let ask = self.0.menu_step(label, i + 1 == items.len());
+                let t = if i == 0 {
+                    with_question(text, &ask)
+                } else {
+                    ask
+                };
+                match message(&t, MB_YESNOCANCEL) {
                     IDYES => return Some(key),
                     IDNO => continue,
                     _ => return None,
@@ -617,23 +968,51 @@ mod win {
             }
             None
         }
+
+        fn at_hand(&self) -> Option<Secret> {
+            clipboard()
+        }
     }
 }
 
+/// The text of UTF-16 `units` (the clipboard's), which are zeroed: until it
+/// parses as a pairing link it is anything the user copied, a password
+/// perhaps, so no copy of it outlives its `Secret`.
+#[cfg(any(windows, test))]
+pub(crate) fn utf16_secret(units: &mut [u16]) -> Secret {
+    // At most three bytes per unit: the string never grows (and copies).
+    let mut text = String::with_capacity(units.len() * 3);
+    text.extend(
+        char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+    );
+    units.fill(0);
+    Secret::new(text)
+}
+
 /// Scripted answers, recording what was shown (tests).
-#[derive(Default)]
 pub struct Fake {
+    pub style: Style,
     pub shown: std::sync::Mutex<Vec<String>>,
     /// Answers in order: `yes`, `no`, `cancel`, `text:<line>`, `pw:<password>`,
-    /// `pick:<key>`.
+    /// `pick:<key>`, and for a form (`Style::Forms`) `form:<entry>|<password>`,
+    /// `form:<entry>` without a password field, `form:<password>` without an
+    /// entry.
     pub answers: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// What `at_hand` gives (the clipboard on Windows).
+    pub at_hand: Option<String>,
 }
 
 impl Fake {
     pub fn with(answers: &[&str]) -> Fake {
+        Fake::styled(Style::Entries, answers)
+    }
+
+    pub fn styled(style: Style, answers: &[&str]) -> Fake {
         Fake {
+            style,
             shown: Default::default(),
             answers: std::sync::Mutex::new(answers.iter().map(|s| s.to_string()).collect()),
+            at_hand: None,
         }
     }
 
@@ -653,6 +1032,10 @@ impl Fake {
 }
 
 impl Dialogs for Fake {
+    fn style(&self) -> Style {
+        self.style
+    }
+
     fn info(&self, text: &str) {
         self.shown.lock().unwrap().push(format!("info: {text}"));
     }
@@ -665,10 +1048,10 @@ impl Dialogs for Fake {
         self.next("question", text) == "yes"
     }
 
-    fn entry(&self, text: &str) -> Option<String> {
-        self.next("entry", text)
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
+        self.next(&format!("entry [{}]", buttons.ok), text)
             .strip_prefix("text:")
-            .map(str::to_string)
+            .map(|t| Secret::new(t.to_string()))
     }
 
     fn password(&self, text: &str) -> Option<Secret> {
@@ -677,16 +1060,66 @@ impl Dialogs for Fake {
             .map(|p| Secret::new(p.to_string()))
     }
 
-    fn menu(&self, text: &str, items: &[(&'static str, &str)]) -> Option<&'static str> {
-        let a = self.next("menu", text);
+    fn menu(
+        &self,
+        text: &str,
+        items: &[(&'static str, &str)],
+        buttons: Buttons,
+    ) -> Option<&'static str> {
+        let labels: Vec<&str> = items.iter().map(|(_, l)| *l).collect();
+        let kind = format!(
+            "menu [{}] [{} / {}]",
+            labels.join(", "),
+            buttons.cancel,
+            buttons.ok
+        );
+        let a = self.next(&kind, text);
         let key = a.strip_prefix("pick:")?;
         items.iter().map(|(k, _)| *k).find(|k| *k == key)
+    }
+
+    fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
+        if self.style != Style::Forms {
+            // As the dialog programs without forms do.
+            return form_per_field(self, text, form, buttons);
+        }
+        let fields: Vec<&str> = [form.entry, form.password].into_iter().flatten().collect();
+        let kind = format!("form [{}] [{}]", fields.join(", "), buttons.ok);
+        let a = self.next(&kind, text);
+        let out = a.strip_prefix("form:")?;
+        let out = if form.entry.is_some() {
+            out.replacen('|', &FORM_SEPARATOR.to_string(), 1)
+        } else {
+            out.to_string()
+        };
+        Some(split_form(format!("{out}\n"), form))
+    }
+
+    fn at_hand(&self) -> Option<Secret> {
+        self.at_hand.clone().map(Secret::new)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const B: Buttons = Buttons {
+        ok: "Open",
+        cancel: "Close",
+    };
+
+    /// The clipboard's text (Windows) may be anything the user copied: the
+    /// units read are zeroed once they are a `Secret`.
+    #[test]
+    fn the_clipboards_text_leaves_no_copy() {
+        let mut units: Vec<u16> = "pässwört 🔑".encode_utf16().collect();
+        units.push(0xd800); // a lone surrogate
+        let s = utf16_secret(&mut units);
+        assert_eq!(s.expose(), "pässwört 🔑\u{fffd}");
+        assert!(units.iter().all(|u| *u == 0), "{units:?}");
+        assert_eq!(utf16_secret(&mut []).expose(), "");
+    }
 
     #[test]
     fn own_lines_stay_lines() {
@@ -711,7 +1144,7 @@ mod tests {
     #[test]
     fn zenity_gets_plain_text_one_argument_each() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"));
+        let a = z.args(&Ask::Question("Pair with <b>x</b> & -y --z?"), false);
         assert_eq!(
             a,
             [
@@ -723,25 +1156,47 @@ mod tests {
             ]
         );
         // Texts that zenity reads as markup are escaped.
-        let a = z.args(&Ask::Entry("a <i>b</i> & c"));
-        assert_eq!(a.last().unwrap(), "--text=a &lt;i&gt;b&lt;/i&gt; &amp; c");
+        let a = z.args(&Ask::Entry("a <i>b</i> & c", B), false);
+        assert!(
+            a.contains(&"--text=a &lt;i&gt;b&lt;/i&gt; &amp; c".to_string()),
+            "{a:?}"
+        );
+        assert_eq!(
+            &a[a.len() - 2..],
+            ["--ok-label=Open", "--cancel-label=Close"]
+        );
         // A password is not shown as it is typed.
-        let a = z.args(&Ask::Password("pw <x>"));
+        let a = z.args(&Ask::Password("pw <x>"), false);
         assert_eq!(&a[1..3], ["--entry", "--hide-text"]);
         assert_eq!(a.last().unwrap(), "--text=pw &lt;x&gt;");
-        let a = z.args(&Ask::Menu(
-            "Paired with <x>",
-            &[("status", "Status"), ("quit", "Quit")],
-        ));
+        let a = z.args(
+            &Ask::Menu(
+                "Paired with <x>",
+                &[("pair", "Pair again"), ("log", "Log")],
+                B,
+            ),
+            false,
+        );
         assert!(a.contains(&"--print-column=1".to_string()), "{a:?}");
         assert!(
             a.contains(&"--text=Paired with &lt;x&gt;".to_string()),
             "{a:?}"
         );
-        assert_eq!(&a[a.len() - 4..], ["status", "Status", "quit", "Quit"]);
+        // The buttons say what they do; the rows come last, as values.
+        assert_eq!(
+            &a[a.len() - 6..],
+            [
+                "--ok-label=Open",
+                "--cancel-label=Close",
+                "pair",
+                "Pair again",
+                "log",
+                "Log"
+            ]
+        );
         // Every option is one `--name=value` argument: no text is a separate
         // argument zenity could take for an option.
-        let a = z.args(&Ask::Info("--help"));
+        let a = z.args(&Ask::Info("--help"), false);
         assert!(a.iter().all(|x| x.starts_with("--")), "{a:?}");
         assert_eq!(a.last().unwrap(), "--text=--help");
     }
@@ -749,7 +1204,7 @@ mod tests {
     #[test]
     fn kdialog_text_cannot_carry_markup() {
         let k = Helper::Kdialog("/usr/bin/kdialog".into());
-        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"));
+        let a = k.args(&Ask::Info("<img src=x> & \"q\"\nline 2"), false);
         assert_eq!(
             a,
             [
@@ -759,20 +1214,142 @@ mod tests {
                 "<qt>&lt;img src=x&gt; &amp; &quot;q&quot;<br>line 2</qt>"
             ]
         );
-        let a = k.args(&Ask::Entry("Paste the link"));
-        assert_eq!(&a[2..], ["--inputbox", "<qt>Paste the link</qt>", ""]);
-        let a = k.args(&Ask::Password("Passwort für <b>"));
+        let a = k.args(&Ask::Entry("Paste the link", B), false);
+        assert_eq!(
+            &a[2..],
+            [
+                "--ok-label",
+                "Open",
+                "--cancel-label",
+                "Close",
+                "--inputbox",
+                "<qt>Paste the link</qt>",
+                ""
+            ]
+        );
+        let a = k.args(&Ask::Password("Passwort für <b>"), false);
         assert_eq!(&a[2..], ["--password", "<qt>Passwort für &lt;b&gt;</qt>"]);
-        let a = k.args(&Ask::Menu("m", &[("log", "Open log")]));
-        assert_eq!(&a[2..], ["--menu", "<qt>m</qt>", "log", "Open log"]);
+        let a = k.args(&Ask::Menu("m", &[("log", "Open log")], B), false);
+        assert_eq!(&a[6..], ["--menu", "<qt>m</qt>", "log", "Open log"]);
         // A text that starts with a dash is still inside `<qt>`.
-        assert!(k.args(&Ask::Error("-x"))[3].starts_with("<qt>"));
+        assert!(k.args(&Ask::Error("-x"), false)[3].starts_with("<qt>"));
+    }
+
+    /// The program's icon where the dialog shows one; never for a zenity
+    /// older than 4, which knows no `--icon` and would show no window.
+    #[test]
+    fn the_dialogs_carry_the_programs_icon() {
+        let z = Helper::Zenity("/usr/bin/zenity".into());
+        for ask in [Ask::Question("q"), Ask::Info("i"), Ask::Error("e")] {
+            let a = z.args(&ask, true);
+            assert_eq!(a[2], "--icon=pithagoras-sync", "{a:?}");
+            assert!(!z.args(&ask, false).iter().any(|x| x.starts_with("--icon")));
+        }
+        for ask in [
+            Ask::Entry("e", B),
+            Ask::Password("p"),
+            Ask::Menu("m", &[], B),
+            Ask::Form("f", Form::default(), B),
+        ] {
+            let a = z.args(&ask, true);
+            assert!(!a.iter().any(|x| x.starts_with("--icon")), "{a:?}");
+        }
+        let k = Helper::Kdialog("/usr/bin/kdialog".into());
+        let form = std::panic::catch_unwind(|| k.args(&Ask::Form("f", Form::default(), B), false));
+        assert!(form.is_err(), "kdialog has no forms");
+        let a = k.args(&Ask::Password("p"), true);
+        assert_eq!(&a[2..5], ["--icon", "pithagoras-sync", "--password"]);
+        assert!(takes_icon(&k, None));
+        assert!(takes_icon(&z, Some("4.0.1\n")));
+        assert!(takes_icon(&z, Some("4.1")));
+        assert!(!takes_icon(&z, Some("3.44.0\n")));
+        assert!(!takes_icon(&z, Some("")));
+        assert!(!takes_icon(&z, None));
+        // Only once the icon is installed.
+        let t = tempfile::tempdir().unwrap();
+        assert!(!icon_there(t.path()));
+        let png = crate::install::png_icon_path(t.path(), 48);
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&png, crate::install::ICON_PNGS[0].1).unwrap();
+        assert!(icon_there(t.path()));
+    }
+
+    /// zenity's form gives back a link and a password of the most each may
+    /// hold, rather than a cancel nobody chose.
+    #[cfg(unix)]
+    #[test]
+    fn a_form_holds_a_link_and_a_password_of_full_length() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let z = dir.path().join("zenity");
+        let link = "l".repeat(MAX_ANSWER);
+        let pw = "p".repeat(MAX_ANSWER);
+        std::fs::write(
+            &z,
+            format!("#!/bin/sh\nprintf '%s\\037%s\\n' '{link}' '{pw}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let n = Native::new(Helper::Zenity(z), Vec::new(), false);
+        let form = Form {
+            entry: Some("Link"),
+            password: Some("Password"),
+        };
+        let f = n.form("t", form, B).expect("an answer, not a cancel");
+        assert_eq!(f.entry.as_ref().map(Secret::expose), Some(link.as_str()));
+        assert_eq!(f.password.as_ref().map(Secret::expose), Some(pw.as_str()));
+    }
+
+    /// zenity is asked its version only when a window would show the icon,
+    /// and only once: not before the icon is installed, not for a form.
+    #[cfg(unix)]
+    #[test]
+    fn zenity_is_asked_its_version_only_for_an_icon() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("asked");
+        let z = dir.path().join("zenity");
+        std::fs::write(
+            &z,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo v >> '{}'; echo 4.0.1; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let asked = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let n = Native::new(Helper::Zenity(z.clone()), Vec::new(), false);
+        assert!(n.question("q"));
+        assert_eq!(asked(), 0);
+        let n = Native::new(Helper::Zenity(z), Vec::new(), true);
+        n.form("f", Form::default(), B);
+        assert_eq!(asked(), 0);
+        assert!(n.question("q"));
+        n.info("i");
+        assert_eq!(asked(), 1);
+    }
+
+    /// A box's question (Windows adds it below the text) is never what is
+    /// cut when the text is too long: the text is.
+    #[test]
+    fn the_question_of_a_box_is_never_cut() {
+        let ask = "Pair again?\n\nYes: Pair again.";
+        let t = with_question(&"s".repeat(MAX_TEXT), ask);
+        assert!(t.ends_with(ask), "{t}");
+        assert!(t.chars().count() <= MAX_TEXT + 1, "{}", t.chars().count());
+        assert_eq!(with_question("Status", ask), format!("Status\n\n{ask}"));
     }
 
     #[test]
     fn a_long_text_is_cut_before_it_reaches_the_dialog() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
-        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)));
+        let a = z.args(&Ask::Info(&"y".repeat(MAX_TEXT * 3)), false);
         assert!(a.last().unwrap().chars().count() < MAX_TEXT + 10);
     }
 
@@ -879,9 +1456,131 @@ mod tests {
     fn the_fake_answers_in_order_and_cancels_when_out_of_answers() {
         let f = Fake::with(&["yes", "text:abc", "pick:log"]);
         assert!(f.question("q"));
-        assert_eq!(f.entry("e").as_deref(), Some("abc"));
-        assert_eq!(f.menu("m", &[("log", "Open log")]), Some("log"));
+        assert_eq!(f.entry("e", B).as_ref().map(Secret::expose), Some("abc"));
+        assert_eq!(f.menu("m", &[("log", "Open log")], B), Some("log"));
         assert!(!f.question("again"));
         assert_eq!(f.seen().len(), 4);
+    }
+
+    /// zenity's form: the text as markup escaped and broken into lines (the
+    /// frame's title does not wrap), the fields by their labels, the
+    /// separator one that no link holds, and the buttons.
+    #[test]
+    fn the_form_is_one_zenity_window() {
+        let z = Helper::Zenity("/usr/bin/zenity".into());
+        let text = format!("Install for <b>a</b> & {}?", "word ".repeat(30));
+        let form = Form {
+            entry: Some("Pairing link"),
+            password: Some("Login password"),
+        };
+        let b = Buttons {
+            ok: "Install and pair",
+            cancel: "Cancel",
+        };
+        let a = z.args(&Ask::Form(&text, form, b), true);
+        assert_eq!(&a[1..2], ["--forms"]);
+        let t = a[2].strip_prefix("--text=").unwrap();
+        assert!(
+            t.starts_with("Install for &lt;b&gt;a&lt;/b&gt; &amp; word"),
+            "{t}"
+        );
+        assert!(t.lines().count() > 1, "{t}");
+        assert!(
+            t.lines().all(|l| l.chars().count() <= FORM_LINE + 20),
+            "{t}"
+        );
+        assert_eq!(
+            &a[3..],
+            [
+                "--add-entry=Pairing link",
+                "--add-password=Login password",
+                "--separator=\u{1f}",
+                "--ok-label=Install and pair",
+                "--cancel-label=Cancel"
+            ]
+        );
+        // Only the password: no entry field.
+        let only = Form {
+            entry: None,
+            password: Some("Login password"),
+        };
+        let a = z.args(&Ask::Form("t", only, b), false);
+        assert!(!a.iter().any(|x| x.starts_with("--add-entry")), "{a:?}");
+    }
+
+    #[test]
+    fn long_lines_are_broken_at_spaces_and_long_words_kept_whole() {
+        assert_eq!(wrapped("aa bb cc", 5), "aa bb\ncc");
+        assert_eq!(wrapped("a\n\nb", 5), "a\n\nb");
+        assert_eq!(wrapped("abcdefg h", 4), "abcdefg\nh");
+        // A portal URL longer than a line stays in one piece.
+        let portal = "https://portal.example.com.some-long-tenant-name.example.net/pithagoras";
+        let text = format!("The login password for pairing with {portal} as laptop");
+        assert!(
+            wrapped(&text, 72).lines().any(|l| l == portal),
+            "{}",
+            wrapped(&text, 72)
+        );
+        // Only one longer than two lines is cut, at that length.
+        let url = format!("https://{}", "x".repeat(200));
+        assert!(wrapped(&url, 72).lines().all(|l| l.chars().count() <= 144));
+        assert_eq!(wrapped(&url, 72).replace('\n', ""), url);
+    }
+
+    /// The form's answer: the link up to the first separator, the rest the
+    /// password's, whatever it holds (zenity's own `|` among it).
+    #[test]
+    fn the_forms_answer_is_split_at_the_first_separator() {
+        let both = Form {
+            entry: Some("l"),
+            password: Some("p"),
+        };
+        let f = split_form(
+            "pithagoras-sync://pair?x|y\u{1f}pw|with\u{1f}more \n".into(),
+            both,
+        );
+        assert_eq!(
+            f.entry.as_ref().map(Secret::expose),
+            Some("pithagoras-sync://pair?x|y")
+        );
+        assert_eq!(f.password.unwrap().expose(), "pw|with\u{1f}more ");
+        let f = split_form("\u{1f}secret\n".into(), both);
+        assert_eq!(f.entry.as_ref().map(Secret::expose), Some(""));
+        assert_eq!(f.password.unwrap().expose(), "secret");
+        let f = split_form("only a link\n".into(), both);
+        assert_eq!(f.password.unwrap().expose(), "");
+        let pw = Form {
+            entry: None,
+            password: Some("p"),
+        };
+        let f = split_form("a\u{1f}b\r\n".into(), pw);
+        assert!(f.entry.is_none());
+        assert_eq!(f.password.unwrap().expose(), "a\u{1f}b");
+        let link = Form {
+            entry: Some("l"),
+            password: None,
+        };
+        assert_eq!(
+            split_form("x\n".into(), link)
+                .entry
+                .as_ref()
+                .map(Secret::expose),
+            Some("x")
+        );
+    }
+
+    /// kdialog has no form: one window per field, the password hidden.
+    #[test]
+    fn without_forms_each_field_is_a_window_of_its_own() {
+        let f = Fake::with(&["text:link", "pw:secret"]);
+        let both = Form {
+            entry: Some("l"),
+            password: Some("p"),
+        };
+        let filled = f.form("t", both, B).unwrap();
+        assert_eq!(filled.entry.as_ref().map(Secret::expose), Some("link"));
+        assert_eq!(filled.password.unwrap().expose(), "secret");
+        assert!(f.seen()[0].starts_with("entry"), "{:?}", f.seen());
+        assert!(f.seen()[1].starts_with("password"), "{:?}", f.seen());
     }
 }

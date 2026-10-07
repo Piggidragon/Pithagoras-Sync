@@ -8,9 +8,10 @@ The graphical install: a person who never opens a terminal can install, pair, se
 
 ### Added
 
-- **Install by double click** on Windows 10/11, GNOME and KDE, in English and German: the downloaded file asks, installs, asks for the pairing link, pairs and shows whether it connected. `pithagoras-sync gui` starts the same flow; with no arguments, a start without a terminal does.
+- **Install by double click** on Windows 10/11, GNOME and KDE, in English and German, in few windows: on GNOME one form takes the pairing link and the login password, a second window confirms the parsed portal, a third says whether it connected; KDE asks install and link in one window; Windows asks install and pair in one box when a valid pairing link is in the clipboard. The link may be left out to install only. `pithagoras-sync gui` starts the same flow; with no arguments, a start without a terminal does.
 - **Pairing by link.** The client registers itself for `pithagoras-sync://` links (a desktop entry and an icon on Linux, the registry under `HKCU` on Windows), so a click on the portal's pairing link opens it. The link is untrusted: it is parsed strictly and nothing is paired before a question that shows the parsed portal and device name and the current mode.
-- **A menu** for an installed and paired client: status, pair again, sudo access (Linux), open the log, uninstall (with or without `--purge`).
+- **A menu** for an installed and paired client, with the status in its own text: pair again, sudo access (Linux), update (a signed release, after a Yes to its version), open the log, uninstall (with or without `--purge`). Close ends it; what an action reports shows at the top of the next window instead of a window of its own.
+- **An icon** for the menu entry and the windows: `install` writes it as SVG and in 48 to 256 pixels (and rebuilds the user's icon cache where there is one), so GNOME and KDE show it; the Windows `.exe` carries it as a resource, and its message boxes show it.
 - **Sudo access in a window** (Linux): the password goes into a hidden entry, is checked with `sudo`, and only then kept; the window can switch sudo access off and forget the password. Pairing in a window on a Linux desktop asks for the login password and checks it with `su`.
 - **The OS keyring.** `token_storage = keyring` keeps the connector token in the Secret Service (GNOME Keyring, KWallet) or, on Windows, in the Credential Manager, which is the Windows default with a fallback to the file. `policy.privilege.secret_storage = keyring` keeps the elevation password there (Linux). Neither falls back silently when you chose the keyring.
 - **`docs/install.md`** for people who are not at a terminal.
@@ -24,7 +25,7 @@ The graphical install: a person who never opens a terminal can install, pair, se
 ### Known limits
 
 - A console window can flash when the logon task starts the client on Windows (Windows Terminal about 0.2 s, the classic console about 25 ms); a launcher without a console comes later (issue #6).
-- The window texts for the CLI's errors are English; SmartScreen warns about the unsigned Windows file (issue #7).
+- The window texts for the CLI's errors, and the notes of installing, pairing and uninstalling, are English; SmartScreen warns about the unsigned Windows file (issue #7).
 - Tried with Edge on Windows 11, Ubuntu's GNOME tools and kdialog under a virtual screen; links from Chrome and Firefox, Windows 10 and a real Plasma session are not tried yet.
 
 ## 0.0.1 - 2026-10-06

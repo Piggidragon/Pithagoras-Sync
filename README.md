@@ -23,7 +23,7 @@ Every other permission is a setting too: which pi tools the device serves, paths
 
 ## Install by double click
 
-On Windows 10/11 and a Linux desktop no terminal is needed: download the program, double click it, say Yes to install, then click the pairing link the portal shows under Settings, Devices (or paste it when the program asks). Every step asks first and shows the portal it pairs with. [docs/install.md](docs/install.md) shows each window, and how to uninstall the same way. On Linux the windows need `zenity` or `kdialog`; `pithagoras-sync gui` opens them again later, as does "Pithagoras Sync" in the menu.
+On Windows 10/11 and a Linux desktop no terminal is needed: copy the pairing link the portal shows under Settings, Devices, download the program and double click it. On GNOME one window takes the link and your login password, a second shows the portal it would pair with, and after its Yes the program installs, pairs and says how it stands; KDE and Windows ask the same in as few windows as their dialogs allow (Windows takes the link from the clipboard). Leave the link out to install only, then click the link in the portal later. Nothing changes before you confirm. Opened again, the program shows its status with the actions in one menu: pair again, sudo access (Linux), update, the log, uninstall. [docs/install.md](docs/install.md) shows each window. On Linux the windows need `zenity` or `kdialog`; `pithagoras-sync gui` opens them again later, as does "Pithagoras Sync" in the menu.
 
 The terminal way below does the same and stays the way for servers.
 

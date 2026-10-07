@@ -98,6 +98,14 @@ impl Lang {
         )
     }
 
+    /// Windows: the clipboard's text, not shown, is no pairing link.
+    pub fn clipboard_no_link(self) -> &'static str {
+        self.pick(
+            "The clipboard holds no pairing link (what it holds is not shown). Copy the link from the portal's Devices page, then try again.",
+            "Die Zwischenablage enthält keinen Kopplungslink (was sie enthält, wird nicht angezeigt). Kopiere den Link von der Geräteseite des Portals und versuche es noch einmal.",
+        )
+    }
+
     pub fn link_too_long(self) -> &'static str {
         self.pick(
             "This is not a pairing link: it is far too long.",
@@ -143,6 +151,152 @@ impl Lang {
             Lang::En => format!("Installing failed: {e}"),
             Lang::De => format!("Die Installation ist fehlgeschlagen: {e}"),
         }
+    }
+
+    /// The first window of an install (zenity's form, kdialog's entry): what
+    /// installing does, and that the link may stay empty. `paired`: the
+    /// portal of a pairing kept from an earlier install. `account`: whose
+    /// login password the form asks for too.
+    pub fn install_form_text(
+        self,
+        user: &str,
+        path: Option<&str>,
+        paired: Option<&str>,
+        account: Option<&str>,
+    ) -> String {
+        let install = self.install_question(user, path);
+        let empty = match (paired, self) {
+            (None, Lang::En) => "Left empty, it installs without pairing.".to_string(),
+            (None, Lang::De) => "Bleibt es leer, wird ohne Kopplung installiert.".to_string(),
+            (Some(old), Lang::En) => {
+                format!("Left empty, it installs and keeps the pairing with {old}.")
+            }
+            (Some(old), Lang::De) => format!(
+                "Bleibt es leer, wird installiert und die Kopplung mit {old} bleibt erhalten."
+            ),
+        };
+        let link = match self {
+            Lang::En => format!(
+                "To pair it now, paste the pairing link from the portal's Devices page (Settings, Devices, Pair a device). {empty}"
+            ),
+            Lang::De => format!(
+                "Um ihn gleich zu koppeln, füge den Kopplungslink von der Geräteseite des Portals ein (Einstellungen, Geräte, Gerät koppeln). {empty}"
+            ),
+        };
+        match account {
+            Some(a) => format!("{install}\n\n{link}\n\n{}", self.form_password_note(a)),
+            None => format!("{install}\n\n{link}"),
+        }
+    }
+
+    /// zenity's form for pairing an installed client: the link and, where
+    /// pairing asks for it, the login password of `account`.
+    pub fn pair_form_text(self, account: Option<&str>) -> String {
+        match account {
+            Some(a) => format!("{}\n\n{}", self.entry_text(), self.form_password_note(a)),
+            None => self.entry_text().to_string(),
+        }
+    }
+
+    /// Below a form that asks for the login password next to the link.
+    fn form_password_note(self, account: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pairing decides which portal's agent may use this computer, so it needs your login password ({account}), as `pithagoras-sync pair` does in a terminal. It is checked with su only after you confirmed the portal, and not kept."
+            ),
+            Lang::De => format!(
+                "Die Kopplung legt fest, welcher Agent eines Portals diesen Computer nutzen darf, daher braucht sie dein Anmeldepasswort ({account}), wie `pithagoras-sync pair` im Terminal. Es wird erst geprüft, nachdem du das Portal bestätigt hast, mit su, und nicht aufbewahrt."
+            ),
+        }
+    }
+
+    /// zenity's form again after the password was not taken: the link stays
+    /// (shown as what was parsed), only the password is asked for.
+    pub fn password_again_text(self, portal: &str, name: &str, account: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pairing with the Pithagoras portal {portal} as \"{name}\" needs your login password ({account}). It is checked with su and not kept."
+            ),
+            Lang::De => format!(
+                "Die Kopplung mit dem Pithagoras-Portal {portal} als „{name}“ braucht dein Anmeldepasswort ({account}). Es wird mit su geprüft und nicht aufbewahrt."
+            ),
+        }
+    }
+
+    /// The labels of the form's fields.
+    pub fn link_label(self) -> &'static str {
+        self.pick("Pairing link", "Kopplungslink")
+    }
+
+    pub fn password_label(self) -> &'static str {
+        self.pick("Login password", "Anmeldepasswort")
+    }
+
+    /// Install and pair in one question, when the link is known before the
+    /// first window (opened from the portal, or on Windows in the
+    /// clipboard): the facts of both questions.
+    pub fn install_pair_question(
+        self,
+        user: &str,
+        path: Option<&str>,
+        pair: &InstallPair,
+    ) -> String {
+        let pin = self.pin_note(pair.pinned);
+        let mode = self.pair_mode(pair.mode);
+        let (portal, name) = (pair.portal, pair.name);
+        if let Some(old) = pair.old {
+            let install = self.install_question(user, path);
+            let replace = self.replace_question(old, portal, name, pair.pinned, pair.mode);
+            return format!("{install}\n\n{replace}");
+        }
+        match self {
+            Lang::En => format!(
+                "Install Pithagoras Sync for {user} and pair it with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nInstalling copies the program to {}, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).\n\nThe portal's agent can then ask to use this computer's files and shell. {mode}",
+                path.unwrap_or("your programs folder")
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync für {user} installieren und mit dem Pithagoras-Portal {portal} als „{name}“ koppeln?{pin}\n\nDas Programm wird nach {} kopiert, beim Anmelden gestartet und öffnet pithagoras-sync://-Links (den Kopplungslink im Portal).\n\nDer Agent des Portals kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. {mode}",
+                path.unwrap_or("deinen Programme-Ordner")
+            ),
+        }
+    }
+
+    /// Installed with the link left empty, and not paired.
+    pub fn installed_not_paired(self) -> &'static str {
+        self.pick(
+            "Pithagoras Sync is installed and starts at login. It is not paired yet: click the pairing link on the portal's Devices page (Settings, Devices, Pair a device), or open Pithagoras Sync again and paste it.",
+            "Pithagoras Sync ist installiert und startet beim Anmelden. Es ist noch nicht gekoppelt: Klicke auf den Kopplungslink auf der Geräteseite des Portals (Einstellungen, Geräte, Gerät koppeln), oder öffne Pithagoras Sync erneut und füge ihn ein.",
+        )
+    }
+
+    // Buttons.
+
+    pub fn install_and_pair_button(self) -> &'static str {
+        self.pick("Install and pair", "Installieren und koppeln")
+    }
+
+    pub fn pair_button(self) -> &'static str {
+        self.pick("Pair", "Koppeln")
+    }
+
+    pub fn cancel_button(self) -> &'static str {
+        self.pick("Cancel", "Abbrechen")
+    }
+
+    pub fn open_button(self) -> &'static str {
+        self.pick("Open", "Öffnen")
+    }
+
+    pub fn close_button(self) -> &'static str {
+        self.pick("Close", "Schließen")
+    }
+
+    pub fn choose_button(self) -> &'static str {
+        self.pick("Choose", "Auswählen")
+    }
+
+    pub fn back_button(self) -> &'static str {
+        self.pick("Back", "Zurück")
     }
 
     /// The flow was started by a command the client runs for the portal.
@@ -274,6 +428,18 @@ impl Lang {
         )
     }
 
+    /// `su` refused `n` passwords: the flow ends.
+    pub fn owner_password_tries(self, n: u32) -> String {
+        match self {
+            Lang::En => format!(
+                "The login password was not accepted {n} times. Nothing changed; open Pithagoras Sync again to try again."
+            ),
+            Lang::De => format!(
+                "Das Anmeldepasswort wurde {n}-mal nicht angenommen. Es wurde nichts geändert; öffne Pithagoras Sync erneut, um es noch einmal zu versuchen."
+            ),
+        }
+    }
+
     pub fn owner_password_failed(self, e: &str) -> String {
         match self {
             Lang::En => format!(
@@ -365,26 +531,200 @@ impl Lang {
 
     // The menu of a paired device.
 
-    pub fn menu_text(self, portal: &str) -> String {
+    /// The menu's text: the pairing and the status (`status`, escaped).
+    pub fn menu_text(self, portal: &str, status: &str) -> String {
+        let status = status.trim_end();
         match self {
-            Lang::En => format!("Pithagoras Sync is installed and paired with {portal}."),
-            Lang::De => format!("Pithagoras Sync ist installiert und mit {portal} gekoppelt."),
+            Lang::En => {
+                format!("Pithagoras Sync is installed and paired with {portal}.\n\n{status}")
+            }
+            Lang::De => {
+                format!("Pithagoras Sync ist installiert und mit {portal} gekoppelt.\n\n{status}")
+            }
         }
     }
 
     /// The label of a menu item, by its key.
     pub fn label(self, key: &str) -> &'static str {
         match key {
-            "status" => "Status",
             "pair" => self.pick("Pair again", "Neu koppeln"),
             "sudo" => self.pick("Sudo access", "Sudo-Zugriff"),
+            "update" => self.pick("Update", "Aktualisieren"),
             "log" => self.pick("Open log", "Protokoll öffnen"),
             "uninstall" => self.pick("Uninstall", "Deinstallieren"),
             "set" => self.pick("Enter the password", "Passwort eingeben"),
             "off" => self.pick("Switch sudo access off", "Sudo-Zugriff ausschalten"),
             "forget" => self.pick("Forget the password", "Passwort vergessen"),
-            "back" => self.pick("Back", "Zurück"),
-            _ => self.pick("Close", "Schließen"),
+            _ => "?",
+        }
+    }
+
+    // Update.
+
+    /// A newer release (`version`), made `released`; this computer has
+    /// `current`.
+    /// `client`: a client of this user runs the program, and restarts with
+    /// the new one.
+    pub fn update_question(
+        self,
+        version: &str,
+        released: &str,
+        current: &str,
+        client: bool,
+    ) -> String {
+        let restart = match (self, client) {
+            (Lang::En, true) => "the client restarts with it.",
+            (Lang::En, false) => {
+                "no client of yours runs it now, so it takes effect when the client starts next."
+            }
+            (Lang::De, true) => "der Client startet mit ihr neu.",
+            (Lang::De, false) => {
+                "gerade läuft kein Client von dir damit, sie wirkt also beim nächsten Start des Clients."
+            }
+        };
+        match self {
+            Lang::En => format!(
+                "Version {version} of Pithagoras Sync is available, released {released}; this computer has {current}.\n\nUpdate Pithagoras Sync to {version} now? The release is signed; {restart}"
+            ),
+            Lang::De => format!(
+                "Version {version} von Pithagoras Sync ist verfügbar, veröffentlicht am {released}; dieser Computer hat {current}.\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; {restart}"
+            ),
+        }
+    }
+
+    /// `update` ran from another file than the one it updated: `path`.
+    pub fn ran_unchanged(self, path: &str) -> String {
+        match self {
+            Lang::En => format!("The program you opened, {path}, is unchanged."),
+            Lang::De => format!("Das Programm, das du geöffnet hast, {path}, ist unverändert."),
+        }
+    }
+
+    pub fn no_client_runs(self) -> &'static str {
+        self.pick(
+            "No client of yours runs the updated program now; it runs the new version from its next start. A client the system runs restarts with: sudo systemctl restart pithagoras-sync",
+            "Gerade führt kein Client von dir das aktualisierte Programm aus; er führt die neue Version ab seinem nächsten Start aus. Ein Client, den das System ausführt, startet neu mit: sudo systemctl restart pithagoras-sync",
+        )
+    }
+
+    /// The copy `install` set up, at `path`, was not updated.
+    pub fn copy_not_updated(self, path: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "The installed copy, {path}, which starts at login, was not updated. Open that one and choose Update there."
+            ),
+            Lang::De => format!(
+                "Die installierte Kopie, {path}, die beim Anmelden startet, wurde nicht aktualisiert. Öffne sie und wähle dort Aktualisieren."
+            ),
+        }
+    }
+
+    /// Which release was installed could not be recorded: `e`.
+    pub fn release_not_recorded(self, e: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Which release was installed could not be recorded, so an older one is not yet refused: {e}"
+            ),
+            Lang::De => format!(
+                "Welche Version installiert wurde, konnte nicht festgehalten werden, daher wird eine ältere noch nicht abgelehnt: {e}"
+            ),
+        }
+    }
+
+    /// The program is current, but the client still runs `old`, the program
+    /// the file replaced.
+    pub fn restart_question(self, current: &str, released: &str, old: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pithagoras Sync is up to date ({current}; the newest release was made {released}), but the running client is still {old}.\n\nRestart the client with {current} now?"
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync ist aktuell ({current}; die neueste Version wurde am {released} veröffentlicht), aber der laufende Client ist noch {old}.\n\nDen Client jetzt mit {current} neu starten?"
+            ),
+        }
+    }
+
+    /// No newer release.
+    pub fn up_to_date(self, current: &str, released: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pithagoras Sync is up to date ({current}; the newest release was made {released})."
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync ist aktuell ({current}; die neueste Version wurde am {released} veröffentlicht)."
+            ),
+        }
+    }
+
+    /// `version` is installed; `restarted`: the client took the request to
+    /// restart with it.
+    pub fn updated(self, version: &str, restarted: bool) -> String {
+        match (self, restarted) {
+            (Lang::En, true) => {
+                format!("Pithagoras Sync is updated to {version}. The client restarts with it.")
+            }
+            (Lang::En, false) => format!("Pithagoras Sync is updated to {version}."),
+            (Lang::De, true) => format!(
+                "Pithagoras Sync ist auf {version} aktualisiert. Der Client startet mit dieser Version neu."
+            ),
+            (Lang::De, false) => format!("Pithagoras Sync ist auf {version} aktualisiert."),
+        }
+    }
+
+    pub fn client_restarted(self, current: &str) -> String {
+        match self {
+            Lang::En => format!("The client restarts with {current}."),
+            Lang::De => format!("Der Client startet mit {current} neu."),
+        }
+    }
+
+    pub fn client_not_restarted(self) -> &'static str {
+        self.pick(
+            "The client did not take the request to restart: restart its unit or logon task.",
+            "Der Client hat die Bitte um einen Neustart nicht angenommen: Starte seine Unit oder Anmeldeaufgabe neu.",
+        )
+    }
+
+    /// The Yes was to `asked`, but `offered` is on offer now.
+    pub fn release_changed(self, asked: &str, offered: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Version {offered} is on offer now instead of {asked}: nothing was installed. Choose Update again to see it."
+            ),
+            Lang::De => format!(
+                "Jetzt wird Version {offered} statt {asked} angeboten: Es wurde nichts installiert. Wähle erneut Aktualisieren, um sie zu sehen."
+            ),
+        }
+    }
+
+    /// The Yes was to `version`, which is no longer on offer.
+    pub fn release_gone(self, version: &str) -> String {
+        match self {
+            Lang::En => {
+                format!("Version {version} is no longer on offer: nothing was installed.")
+            }
+            Lang::De => {
+                format!("Version {version} wird nicht mehr angeboten: Es wurde nichts installiert.")
+            }
+        }
+    }
+
+    /// The Yes was to the client's restart, but `version` is on offer now.
+    pub fn release_offered(self, version: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Version {version} is on offer now: nothing was installed or restarted. Choose Update again to see it."
+            ),
+            Lang::De => format!(
+                "Jetzt wird Version {version} angeboten: Es wurde nichts installiert oder neu gestartet. Wähle erneut Aktualisieren, um sie zu sehen."
+            ),
+        }
+    }
+
+    pub fn update_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Updating failed: {e}"),
+            Lang::De => format!("Die Aktualisierung ist fehlgeschlagen: {e}"),
         }
     }
 
@@ -442,11 +782,17 @@ impl Lang {
         }
     }
 
-    /// What the menu's Status shows. Values in `s` are escaped.
+    /// The status the menu shows above its items. Values in `s` are escaped.
     pub fn status(self, s: &StatusView) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let client = match &s.link {
+            None if s.silent => self
+                .pick(
+                    "running, but it did not answer",
+                    "läuft, hat aber nicht geantwortet",
+                )
+                .to_string(),
             None => self.pick("not running", "läuft nicht").to_string(),
             Some((LinkState::Connected, _)) => self
                 .pick("running, connected", "läuft, verbunden")
@@ -761,22 +1107,33 @@ impl Lang {
         )
     }
 
-    /// Windows: one item of a menu, as a Yes/No/Cancel question. After the
-    /// `last` one there is no next choice: No closes as well.
-    pub fn menu_step(self, text: &str, label: &str, last: bool) -> String {
+    /// Windows: one item of a menu, as a Yes/No/Cancel question; `text` (the
+    /// menu's, with the status) in the first box only. After the `last` one
+    /// there is no next choice: No closes as well.
+    pub fn menu_step(self, label: &str, last: bool) -> String {
         match (self, last) {
             (Lang::En, false) => {
-                format!("{text}\n\n{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
+                format!("{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
             }
-            (Lang::En, true) => format!("{text}\n\n{label}?\n\nYes: {label}. No or Cancel: close."),
-            (Lang::De, false) => format!(
-                "{text}\n\n{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen."
-            ),
+            (Lang::En, true) => format!("{label}?\n\nYes: {label}. No or Cancel: close."),
+            (Lang::De, false) => {
+                format!("{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen.")
+            }
             (Lang::De, true) => {
-                format!("{text}\n\n{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
+                format!("{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
             }
         }
     }
+}
+
+/// What the question that installs and pairs at once shows of the pairing.
+pub struct InstallPair<'a> {
+    pub portal: &'a str,
+    pub name: &'a str,
+    pub pinned: bool,
+    pub mode: PairMode,
+    /// The portal of a pairing kept from an earlier install.
+    pub old: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -810,8 +1167,12 @@ mod tests {
     #[test]
     fn the_last_menu_step_offers_no_next_choice() {
         for t in [Lang::En, Lang::De] {
-            let next = t.menu_step("Menu", "Status", false);
-            let last = t.menu_step("Menu", "Close", true);
+            let next = t.menu_step("Pair again", false);
+            let last = t.menu_step("Uninstall", true);
+            assert!(
+                last.starts_with(t.pick("Uninstall?", "Uninstall?")),
+                "{last}"
+            );
             assert!(
                 next.contains(t.pick("the next choice", "die nächste Auswahl")),
                 "{next}"
@@ -861,19 +1222,17 @@ mod tests {
     #[test]
     fn every_menu_label_has_both_languages() {
         for key in [
-            "status",
             "pair",
             "sudo",
+            "update",
             "log",
             "uninstall",
             "set",
             "off",
             "forget",
-            "back",
-            "quit",
         ] {
-            assert!(!Lang::En.label(key).is_empty());
-            assert!(!Lang::De.label(key).is_empty());
+            assert_ne!(Lang::En.label(key), "?");
+            assert_ne!(Lang::De.label(key), "?");
         }
         assert_eq!(Lang::De.label("uninstall"), "Deinstallieren");
     }

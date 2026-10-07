@@ -1025,7 +1025,11 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     let env = Env::new();
     let path = fake_systemd(&env);
     let log = env.root.join("systemctl.log");
-    for prog in ["update-desktop-database", "xdg-mime"] {
+    for prog in [
+        "update-desktop-database",
+        "xdg-mime",
+        "gtk-update-icon-cache",
+    ] {
         let p = env.root.join("fakebin").join(prog);
         std::fs::write(
             &p,
@@ -1045,6 +1049,8 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     };
     let entry = data.join("applications/pithagoras-sync.desktop");
     let icon = data.join("icons/hicolor/scalable/apps/pithagoras-sync.svg");
+    // The raster sizes beside it, where GNOME and KDE look first.
+    let png = data.join("icons/hicolor/256x256/apps/pithagoras-sync.png");
     // Over ssh (no display) nothing of the desktop's.
     let out = run(&["install", "--print"], false).output().await.unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -1083,7 +1089,12 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
         "{desktop}"
     );
     assert!(std::fs::read_to_string(&icon).unwrap().starts_with("<svg"));
+    assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
     let calls = std::fs::read_to_string(&log).unwrap();
+    // The user's hicolor folder has no icon cache here: none is made, since
+    // it would hide the icons other programs add later without one.
+    assert!(!calls.contains("gtk-update-icon-cache"), "{calls}");
+    assert!(!data.join("icons/hicolor/icon-theme.cache").exists());
     assert!(
         calls.contains(&format!(
             "update-desktop-database {}",
@@ -1113,7 +1124,7 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
     assert!(entry.exists());
     let out = run(&["uninstall"], false).output().await.unwrap();
     assert!(out.status.success());
-    assert!(!entry.exists() && !icon.exists());
+    assert!(!entry.exists() && !icon.exists() && !png.exists());
 
     // Left without the unit, `--purge` still finds them.
     let out = run(&["install"], true).output().await.unwrap();
@@ -1141,8 +1152,9 @@ async fn install_in_a_desktop_session_registers_the_pairing_link() {
 /// A stand-in `zenity` (and `kdialog`) in `fakebin`: it writes each dialog's
 /// arguments, one per line and a `----` line after them, to `dialogs.log`, its
 /// environment to `dialogs.env`, and answers with the next line of
-/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). Returns
-/// the PATH to run with.
+/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). It
+/// says it is zenity 4.0.1 when asked (`--version`, no dialog). Returns the
+/// PATH to run with.
 fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
     use std::os::unix::fs::PermissionsExt;
     let bin = env.root.join("fakebin");
@@ -1161,7 +1173,7 @@ fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 4.0.1; exit 0; }}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
                 log = log.display(),
                 envlog = envlog.display(),
                 open = open.display(),
@@ -1284,7 +1296,7 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
     .await;
     looks_installed(&env);
     let answer = format!("0|{PW}");
-    let path = fake_dialogs(&env, &["0|", &answer]);
+    let path = fake_dialogs(&env, &["0|", &answer, &answer, &answer]);
     let out = env
         .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
         .env("PATH", &path)
@@ -1294,13 +1306,40 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
-    assert_eq!(shown.len(), 3, "{shown:#?}");
     assert!(shown[0].contains("--question"), "{shown:#?}");
+    // zenity's form, after the question, for the password alone: the link
+    // is the one confirmed.
+    let flat = |s: &str| s.replace('\n', " ");
     assert!(
-        shown[1].contains("--hide-text") && shown[1].contains("needs your password ("),
+        shown[1].contains("--add-password=Login password")
+            && !shown[1].contains("--add-entry")
+            && flat(&shown[1]).contains("needs your login password ("),
         "{shown:#?}"
     );
-    assert!(shown[2].contains("--error"), "{shown:#?}");
+    // su refused it: the form again, saying so, until it refused three; or
+    // su could not check it at all (no su here): that error, and no retry.
+    if shown[2].contains("--error") {
+        assert_eq!(shown.len(), 3, "{shown:#?}");
+        assert!(
+            flat(&shown[2]).contains("Your password could not be checked"),
+            "{shown:#?}"
+        );
+    } else {
+        assert_eq!(shown.len(), 5, "{shown:#?}");
+        for again in &shown[2..4] {
+            assert!(
+                again.contains("--forms")
+                    && again.contains("--add-password=Login password")
+                    && flat(again).contains("su did not accept this password"),
+                "{shown:#?}"
+            );
+        }
+        assert!(
+            shown[4].contains("--error")
+                && flat(&shown[4]).contains("The login password was not accepted 3 times"),
+            "{shown:#?}"
+        );
+    }
     assert!(!env.config().exists());
     assert!(!env.home.join(".config/pithagoras-sync/token").exists());
     assert_eq!(
@@ -1499,13 +1538,11 @@ async fn the_sudo_password_can_be_set_in_the_window() {
             "0|sudo",
             "0|set",
             "0|not the password",
-            "0|",
             "0|set",
             &pw_answer,
             "0|",
-            "0|",
-            "0|back",
-            "0|quit",
+            "1|",
+            "1|",
         ],
     );
     let out = env
@@ -1521,21 +1558,27 @@ async fn the_sudo_password_can_be_set_in_the_window() {
         String::from_utf8_lossy(&out.stderr)
     );
     let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
-    assert_eq!(shown.len(), 10, "{shown:#?}");
+    // The menu, the sudo menu, the password; the sudo menu again with why
+    // sudo refused it at its top; the password, the question; the sudo menu
+    // saying it is on; the menu, closed. No window of its own for a message.
+    assert_eq!(shown.len(), 8, "{shown:#?}");
     assert!(shown[2].contains("--hide-text"), "{shown:#?}");
     assert!(
         shown[3].contains("sudo did not accept this password (sudo: 1 incorrect password attempt)"),
         "{shown:#?}"
     );
+    assert!(shown[3].contains("--list"), "{shown:#?}");
     assert!(
-        shown[6].contains("The password is stored in the running client."),
+        shown[5].contains("The password is stored in the running client."),
         "{shown:#?}"
     );
-    assert!(shown[7].contains("Sudo access is on."), "{shown:#?}");
+    assert!(shown[6].contains("Sudo access is on."), "{shown:#?}");
     assert!(
-        shown[8].contains("Sudo access: on. Password: stored."),
+        shown[6].contains("Sudo access: on. Password: stored."),
         "{shown:#?}"
     );
+    assert!(shown[6].contains("--cancel-label=Back"), "{shown:#?}");
+    assert!(shown[7].contains("--cancel-label=Close"), "{shown:#?}");
     // Checked with -k, the password on stdin: two checks, each asking first
     // whether sudo needs one at all.
     let validated = std::fs::read_to_string(env.root.join("fakesudo.validated")).unwrap();

@@ -326,17 +326,309 @@ pub fn is_root() -> bool {
 }
 
 /// Restarts the system unit when its process runs the file that was at `exe`
-/// before (`replaced`: this update just replaced it), and says what happened.
-fn restart_unit(exe: &Path, replaced: bool, restarting: Option<u32>) {
+/// before (`replaced`: this update just replaced it); what it says about that.
+fn restart_unit(exe: &Path, replaced: bool, restarting: Option<u32>) -> Option<String> {
     #[cfg(target_os = "linux")]
     let look = |pid| crate::update::what_runs(pid, exe);
     #[cfg(not(target_os = "linux"))]
     let look = |_| None;
-    if let Some(said) =
-        crate::update::restart_system_unit(&actions::System, exe, replaced, restarting, look)
-    {
-        println!("{said}");
+    crate::update::restart_system_unit(&actions::System, exe, replaced, restarting, look)
+}
+
+/// This program's file as it was when the program started (`main` asks
+/// first). Linux names the file of a running program that was replaced since
+/// it started (an update, from a window that stayed open) "<path> (deleted)";
+/// the path it started from holds the new file then.
+pub fn this_program() -> Result<PathBuf, String> {
+    static PROGRAM: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    PROGRAM
+        .get_or_init(|| std::env::current_exe().map_err(|e| e.to_string()))
+        .clone()
+}
+
+/// What `update` is to do: look (`--check`), or what a window's Yes was
+/// given to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked<'a> {
+    /// `update --check`: only look, change nothing.
+    Check,
+    /// No window: the command line, which takes whatever is on offer.
+    Anything,
+    /// This release and no other.
+    Release(&'a str),
+    /// No release: the restart of a client that still runs the program the
+    /// file replaced.
+    Restart,
+}
+
+/// What changed on offer since a window asked: the update stops before it
+/// changes anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changed {
+    /// Another release is on offer than the one asked about.
+    Other { asked: String, offered: String },
+    /// The release asked about is no longer on offer.
+    Gone(String),
+    /// A release is on offer where the restart was asked about.
+    Offered(String),
+}
+
+/// A note of `update` that its other fields do not tell: the command line
+/// prints it (`Display`), a window says it in its language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateNote {
+    /// The program that ran the update is another, unchanged file.
+    Unchanged(String),
+    /// No client of this user runs the updated program.
+    NoClient,
+    /// The copy `install` set up (this path) was not updated.
+    CopyNotUpdated(String),
+    /// Which release was installed could not be recorded (this error).
+    NotRecorded(String),
+    /// What the system unit's restart did (root only): systemd's words.
+    Unit(String),
+}
+
+impl std::fmt::Display for UpdateNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateNote::Unchanged(p) => write!(f, "The one you ran, {p}, is unchanged."),
+            UpdateNote::NoClient => write!(
+                f,
+                "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
+            ),
+            UpdateNote::CopyNotUpdated(p) => write!(
+                f,
+                "The copy `install` set up, {p}, which the unit or logon task starts, was not updated: run `{p} update` for it."
+            ),
+            UpdateNote::NotRecorded(e) => write!(f, "pithagoras-sync: {e}"),
+            UpdateNote::Unit(l) => f.write_str(l),
+        }
     }
+}
+
+/// What is on offer (`offered`, `None`: nothing newer) is what the window
+/// asked the owner about, or the update stops before it changes anything.
+fn the_version_asked_about(offered: Option<&str>, asked: Asked) -> Result<(), Changed> {
+    match (offered, asked) {
+        (Some(o), Asked::Release(v)) if o != v => Err(Changed::Other {
+            asked: v.to_string(),
+            offered: o.to_string(),
+        }),
+        (None, Asked::Release(v)) => Err(Changed::Gone(v.to_string())),
+        (Some(o), Asked::Restart) => Err(Changed::Offered(o.to_string())),
+        _ => Ok(()),
+    }
+}
+
+/// What `update` did or found.
+pub struct Update {
+    /// `--check`: the newer release on offer.
+    pub available: Option<String>,
+    /// The version of the program an update replaces, as it was before.
+    pub current: String,
+    /// When the newest release was made (UTC).
+    pub released: String,
+    /// The version this user's client runs when it is older than `current`:
+    /// it still runs the program the file replaced.
+    pub stale_client: Option<String>,
+    /// The release this update installed.
+    pub installed: Option<String>,
+    /// Whether this user's client took the request to restart.
+    pub restarted: bool,
+    /// What changed on offer since the window asked: nothing was done.
+    pub changed: Option<Changed>,
+    /// Whether a client of this user runs the program `update` replaces,
+    /// and so is asked to restart with the new one.
+    pub client: bool,
+    /// What the fields above do not tell.
+    pub notes: Vec<UpdateNote>,
+}
+
+/// `update` with the release manifest at `manifest` (else the release
+/// channel's). `asked`: `Check` only looks; else what a window showed the
+/// owner, and anything else on offer is refused (`Update::changed`). `say`
+/// gets what the command line prints, line by line, as it happens.
+pub async fn update(
+    dirs: &Dirs,
+    manifest: Option<&str>,
+    asked: Asked<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Update, String> {
+    let check = asked == Asked::Check;
+    owner::not_from_own_command(dirs).await?;
+    let key = crate::update::PUBLIC_KEY
+        .ok_or("this build has no update key; updates come with release builds")?;
+    let source = manifest.unwrap_or(crate::update::DEFAULT_MANIFEST);
+    let me = this_program()?;
+    // The copy the running client was started from, which its unit or
+    // logon task starts again, not necessarily the one run here (a
+    // download, while the installed copy is not on PATH).
+    let running = match control::send(&dirs.socket(), Request::Status).await {
+        Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version, s.pid)),
+        _ => None,
+    };
+    // This user's client's process, for the system unit's restart below.
+    let running_pid = running.as_ref().map(|r| r.2);
+    let running = running.as_ref().map(|(p, v, _)| (p.as_path(), v.as_str()));
+    // As root, the program of the system unit (`setup`'s dedicated user),
+    // whose client root cannot reach over its control socket.
+    let system = if cfg!(target_os = "linux") && is_root() {
+        crate::update::unit_program(&actions::System)
+    } else {
+        None
+    };
+    // The unit's program is checked before root runs it to learn its
+    // version, and only the checked path is used from here on.
+    let target = crate::update::choose_target(
+        running.map(|(p, _)| p),
+        system.as_deref(),
+        &me,
+        &crate::update::RealFs,
+    )?;
+    let exe = target.exe;
+    let unit_runs_exe = target.unit;
+    let runs_exe = |p: &Path| p.is_absolute() && crate::update::same_program(p, &exe);
+    let client = running.filter(|(p, _)| runs_exe(p));
+    // Whether a release is newer is decided by the program it replaces,
+    // as it is on disk.
+    let mine = env!("CARGO_PKG_VERSION");
+    // A unit's program that went missing is put back by any release.
+    let missing = unit_runs_exe && std::fs::symlink_metadata(&exe).is_err();
+    let (current, about) = match crate::update::version_of(&exe) {
+        Some(v) => (v.clone(), format!("{} is {v}", exe.display())),
+        None if missing => ("0.0.0".to_string(), format!("{} is missing", exe.display())),
+        None => {
+            let v = crate::update::current_version(client, mine);
+            let whose = if client.is_some_and(|(_, cv)| cv == v) {
+                "the running client is"
+            } else {
+                "this is"
+            };
+            (v.to_string(), format!("{whose} {v}"))
+        }
+    };
+    let records = [dirs.update_seen_file(&exe), dirs.update_user_seen_file()];
+    let offer = crate::update::check(source, key, &current, &[&records[0], &records[1]]).await?;
+    // The date shows a release listing that stopped moving.
+    let released = crate::update::utc(offer.released);
+    // The process of this user's client once it was asked to restart: it
+    // may be the system unit's own (a unit for root), which then needs
+    // no second restart.
+    let mut restarting = None;
+    let mut update = Update {
+        available: None,
+        current: current.clone(),
+        released: released.clone(),
+        stale_client: client
+            .filter(|(_, v)| crate::update::is_older(v, &current))
+            .map(|(_, v)| v.to_string()),
+        installed: None,
+        restarted: false,
+        changed: None,
+        client: client.is_some(),
+        notes: Vec::new(),
+    };
+    // `say!`: a line the fields of `Update` tell as well; `note!`: one they
+    // do not.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            say(&format!($($arg)*))
+        };
+    }
+    macro_rules! note {
+        ($note:expr) => {{
+            let n = $note;
+            say(&n.to_string());
+            update.notes.push(n);
+        }};
+    }
+    if let Err(c) = the_version_asked_about(offer.plan.as_ref().map(|p| p.version.as_str()), asked)
+    {
+        update.changed = Some(c);
+        return Ok(update);
+    }
+    let Some(plan) = offer.plan else {
+        // The file is current, but this user's client may still run the
+        // one it replaced (`install` run again from a newer download).
+        match update.stale_client.as_deref() {
+            None => {
+                say!("Up to date ({about}; the newest release was made {released}).")
+            }
+            Some(v) => {
+                say!(
+                    "{} is up to date ({current}; the newest release was made {released}), but the running client is still {v}.",
+                    exe.display()
+                );
+                if check {
+                    say!("`pithagoras-sync update` restarts it.");
+                } else if matches!(
+                    control::send(&dirs.socket(), Request::Restart).await,
+                    Ok(Some(r)) if r.ok
+                ) {
+                    restarting = running_pid;
+                    update.restarted = true;
+                    say!(
+                        "It restarts with the current program (its unit or logon task starts it again)."
+                    );
+                } else {
+                    say!("It did not take the request to restart: restart its unit or logon task.");
+                }
+            }
+        }
+        // The file is current, but the unit may still run the one it
+        // replaced (an update whose restart failed, or a copy by hand).
+        if unit_runs_exe
+            && !check
+            && let Some(l) = restart_unit(&exe, false, restarting)
+        {
+            note!(UpdateNote::Unit(l));
+        }
+        return Ok(update);
+    };
+    if check {
+        say!(
+            "Version {} is available, released {released} ({about}).",
+            plan.version
+        );
+        update.available = Some(plan.version);
+        return Ok(update);
+    }
+    crate::update::install(&plan, &exe).await?;
+    update.installed = Some(plan.version.clone());
+    say!("Updated {} to {}.", exe.display(), plan.version);
+    // No program of this user is taken below this release from now on.
+    if let Err(e) = crate::update::record(&records[1], offer.released) {
+        let n = UpdateNote::NotRecorded(e);
+        eprintln!("{n}");
+        update.notes.push(n);
+    }
+    if !crate::update::same_program(&exe, &me) {
+        note!(UpdateNote::Unchanged(me.display().to_string()));
+    }
+    let restarted = client.is_some()
+        && matches!(
+            control::send(&dirs.socket(), Request::Restart).await,
+            Ok(Some(r)) if r.ok
+        );
+    if restarted {
+        say!("The running client restarts with it (its unit or logon task starts it again).");
+        restarting = running_pid;
+        update.restarted = true;
+    }
+    // Root's own client and the dedicated user's unit may run the same
+    // file: both restart.
+    if unit_runs_exe {
+        if let Some(l) = restart_unit(&exe, true, restarting) {
+            note!(UpdateNote::Unit(l));
+        }
+    } else if !restarted {
+        note!(UpdateNote::NoClient);
+        if let Some(other) = crate::update::installed_copy(&me) {
+            note!(UpdateNote::CopyNotUpdated(other.display().to_string()));
+        }
+    }
+    Ok(update)
 }
 
 /// What `pair` says when it runs as root or elevated. The client itself refuses to
@@ -1494,148 +1786,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Sudo { cmd } => sudo_cmd(&dirs, cmd).await?,
         Cmd::Update { check, manifest } => {
-            owner::not_from_own_command(&dirs).await?;
-            let key = crate::update::PUBLIC_KEY
-                .ok_or("this build has no update key; updates come with release builds")?;
-            let source = manifest
-                .as_deref()
-                .unwrap_or(crate::update::DEFAULT_MANIFEST);
-            let me = std::env::current_exe().map_err(|e| e.to_string())?;
-            // The copy the running client was started from, which its unit or
-            // logon task starts again, not necessarily the one run here (a
-            // download, while the installed copy is not on PATH).
-            let running = match control::send(&dirs.socket(), Request::Status).await {
-                Ok(Some(r)) => r.status.map(|s| (PathBuf::from(s.exe), s.version, s.pid)),
-                _ => None,
-            };
-            // This user's client's process, for the system unit's restart below.
-            let running_pid = running.as_ref().map(|r| r.2);
-            let running = running.as_ref().map(|(p, v, _)| (p.as_path(), v.as_str()));
-            // As root, the program of the system unit (`setup`'s dedicated user),
-            // whose client root cannot reach over its control socket.
-            let system = if cfg!(target_os = "linux") && is_root() {
-                crate::update::unit_program(&actions::System)
-            } else {
-                None
-            };
-            // The unit's program is checked before root runs it to learn its
-            // version, and only the checked path is used from here on.
-            let target = crate::update::choose_target(
-                running.map(|(p, _)| p),
-                system.as_deref(),
-                &me,
-                &crate::update::RealFs,
-            )?;
-            let exe = target.exe;
-            let unit_runs_exe = target.unit;
-            let runs_exe = |p: &Path| p.is_absolute() && crate::update::same_program(p, &exe);
-            let client = running.filter(|(p, _)| runs_exe(p));
-            // Whether a release is newer is decided by the program it replaces,
-            // as it is on disk.
-            let mine = env!("CARGO_PKG_VERSION");
-            // A unit's program that went missing is put back by any release.
-            let missing = unit_runs_exe && std::fs::symlink_metadata(&exe).is_err();
-            let (current, about) = match crate::update::version_of(&exe) {
-                Some(v) => (v.clone(), format!("{} is {v}", exe.display())),
-                None if missing => ("0.0.0".to_string(), format!("{} is missing", exe.display())),
-                None => {
-                    let v = crate::update::current_version(client, mine);
-                    let whose = if client.is_some_and(|(_, cv)| cv == v) {
-                        "the running client is"
-                    } else {
-                        "this is"
-                    };
-                    (v.to_string(), format!("{whose} {v}"))
-                }
-            };
-            let records = [dirs.update_seen_file(&exe), dirs.update_user_seen_file()];
-            let offer =
-                crate::update::check(source, key, &current, &[&records[0], &records[1]]).await?;
-            // The date shows a release listing that stopped moving.
-            let released = crate::update::utc(offer.released);
-            // The process of this user's client once it was asked to restart: it
-            // may be the system unit's own (a unit for root), which then needs
-            // no second restart.
-            let mut restarting = None;
-            let Some(plan) = offer.plan else {
-                // The file is current, but this user's client may still run the
-                // one it replaced (`install` run again from a newer download).
-                match client.filter(|(_, v)| crate::update::is_older(v, &current)) {
-                    None => {
-                        println!("Up to date ({about}; the newest release was made {released}).")
-                    }
-                    Some((_, v)) => {
-                        println!(
-                            "{} is up to date ({current}; the newest release was made {released}), but the running client is still {v}.",
-                            exe.display()
-                        );
-                        if check {
-                            println!("`pithagoras-sync update` restarts it.");
-                        } else if matches!(
-                            control::send(&dirs.socket(), Request::Restart).await,
-                            Ok(Some(r)) if r.ok
-                        ) {
-                            restarting = running_pid;
-                            println!(
-                                "It restarts with the current program (its unit or logon task starts it again)."
-                            );
-                        } else {
-                            println!(
-                                "It did not take the request to restart: restart its unit or logon task."
-                            );
-                        }
-                    }
-                }
-                // The file is current, but the unit may still run the one it
-                // replaced (an update whose restart failed, or a copy by hand).
-                if unit_runs_exe && !check {
-                    restart_unit(&exe, false, restarting);
-                }
-                return Ok(ExitCode::SUCCESS);
-            };
-            if check {
-                println!(
-                    "Version {} is available, released {released} ({about}).",
-                    plan.version
-                );
-                return Ok(ExitCode::SUCCESS);
-            }
-            crate::update::install(&plan, &exe).await?;
-            println!("Updated {} to {}.", exe.display(), plan.version);
-            // No program of this user is taken below this release from now on.
-            if let Err(e) = crate::update::record(&records[1], offer.released) {
-                eprintln!("pithagoras-sync: {e}");
-            }
-            if !crate::update::same_program(&exe, &me) {
-                println!("The one you ran, {}, is unchanged.", me.display());
-            }
-            let restarted = client.is_some()
-                && matches!(
-                    control::send(&dirs.socket(), Request::Restart).await,
-                    Ok(Some(r)) if r.ok
-                );
-            if restarted {
-                println!(
-                    "The running client restarts with it (its unit or logon task starts it again)."
-                );
-                restarting = running_pid;
-            }
-            // Root's own client and the dedicated user's unit may run the same
-            // file: both restart.
-            if unit_runs_exe {
-                restart_unit(&exe, true, restarting);
-            } else if !restarted {
-                println!(
-                    "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
-                );
-                if let Some(other) = crate::update::installed_copy(&me) {
-                    println!(
-                        "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
-                        other.display(),
-                        other.display()
-                    );
-                }
-            }
+            let asked = if check { Asked::Check } else { Asked::Anything };
+            update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await?;
         }
         Cmd::Install {
             system,
@@ -1643,7 +1795,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             no_linger,
             print,
         } => {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let exe = this_program()?;
             let plan = install_plan(system, user.as_deref(), !no_linger, &exe)?;
             println!("Install:");
             show_plan(&plan);
@@ -1693,7 +1845,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             let runner = actions::System;
             let plan = if create_user {
-                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let exe = this_program()?;
                 setup::create_plan(&runner, Path::new("/"), &name, &exe)?
             } else {
                 debug_assert!(remove);
@@ -1738,7 +1890,7 @@ fn desktop_installed(data: &Path) -> bool {
     data.join("applications")
         .join(install::DESKTOP_FILE)
         .exists()
-        || install::icon_path(data).exists()
+        || install::icon_paths(data).iter().any(|p| p.exists())
 }
 
 pub(crate) fn install_plan(
@@ -1788,7 +1940,9 @@ pub(crate) fn install_plan(
     // In a graphical session: the menu entry and the handler of pairing links.
     if !headless {
         let program = install::user_program(&home);
-        plan.extend(install::desktop_plan(&data_home(&home), &program)?);
+        let data = data_home(&home);
+        let cache = install::icon_cache(&data).exists();
+        plan.extend(install::desktop_plan(&data, &program, cache)?);
     }
     Ok(plan)
 }
@@ -1809,7 +1963,10 @@ pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     let mut plan = install::user_uninstall_plan(&home);
     let data = data_home(&home);
     if desktop_installed(&data) {
-        plan.extend(install::desktop_uninstall_plan(&data));
+        plan.extend(install::desktop_uninstall_plan(
+            &data,
+            install::icon_cache(&data).exists(),
+        ));
     }
     Ok(plan)
 }
@@ -2025,7 +2182,7 @@ pub(crate) async fn purge(
             .map(|h| data_home(h))
             && desktop_installed(&data)
         {
-            links = install::desktop_uninstall_plan(&data);
+            links = install::desktop_uninstall_plan(&data, install::icon_cache(&data).exists());
         }
         (Vec::new(), links)
     } else if cfg!(windows) {
@@ -2037,7 +2194,7 @@ pub(crate) async fn purge(
     };
     let uninstall = not_again(&stop, uninstall);
     let found = crate::purge::find(dirs)?;
-    let me_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let me_exe = this_program()?;
     let mut programs = vec![me_exe.clone()];
     let copy = if system {
         Some(PathBuf::from(install::SYSTEM_BIN))
@@ -2256,7 +2413,7 @@ use crate::actions::Runner as _;
 mod tests {
     use super::{
         Cli, SudoView, approval_text, root_warning, status_text, stop_note, sudo_status_text,
-        sudo_supported,
+        sudo_supported, the_version_asked_about,
     };
     use crate::control::Status;
     use clap::{CommandFactory, Parser};
@@ -2776,5 +2933,36 @@ mod tests {
         }
         assert!(root_warning(true, false).contains("elevated administrator"));
         assert!(root_warning(false, false).contains("setup --create-user"));
+    }
+
+    /// The window's Yes is to one version: another one on offer by the time
+    /// the update runs is not installed.
+    #[test]
+    fn an_update_installs_only_the_version_asked_about() {
+        use super::{Asked, Changed};
+        let ok = |o, a| the_version_asked_about(o, a).is_ok();
+        assert!(ok(Some("0.0.3"), Asked::Release("0.0.3")));
+        assert!(ok(Some("0.0.4"), Asked::Anything));
+        assert!(ok(None, Asked::Anything));
+        assert!(ok(None, Asked::Restart));
+        assert!(ok(Some("0.0.4"), Asked::Check));
+        assert_eq!(
+            the_version_asked_about(Some("0.0.4"), Asked::Release("0.0.3")),
+            Err(Changed::Other {
+                asked: "0.0.3".into(),
+                offered: "0.0.4".into()
+            })
+        );
+        // The release went (pulled, or installed meanwhile): nothing to say
+        // "updated" about.
+        assert_eq!(
+            the_version_asked_about(None, Asked::Release("0.0.3")),
+            Err(Changed::Gone("0.0.3".into()))
+        );
+        // A Yes to a restart installs no release that came meanwhile.
+        assert_eq!(
+            the_version_asked_about(Some("0.0.4"), Asked::Restart),
+            Err(Changed::Offered("0.0.4".into()))
+        );
     }
 }
