@@ -11,62 +11,73 @@ The windows speak English or German, as your desktop does: on Linux the language
 - **Windows:** download `pithagoras-sync-x86_64-windows.exe` from the [release page](https://github.com/Piggidragon/Pithagoras-Sync/releases) and double click it. The program is not signed yet, so Windows SmartScreen may say "Windows protected your PC": click "More info", then "Run anyway". (Signing is planned, issue #7.)
 - **Linux:** download `pithagoras-sync-x86_64-linux`, mark it as executable (in the file manager: Properties, Permissions, "Allow executing file as program") and double click it. Some file managers ask whether to run it or show it: choose Run.
 
-## 2. Install
+## 2. Install, and pair in the same go
 
-A window asks:
+In the portal, open Settings, Devices, "Pair a device": it shows the pairing link. You can pair while installing, or install first and pair later. Which windows you see depends on your desktop; on each, nothing changes before you confirm, and cancelling any window changes nothing.
+
+**GNOME and other desktops with zenity.** One window says what installing does:
 
 > Install Pithagoras Sync for *you*? It copies the program to *a folder in your home*, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).
 
-**Yes** installs it for your user only, without administrator rights:
+It has a field for the **pairing link** (copy it in the portal, paste it here) and, on a Linux desktop, one for your **login password** (the one you log in with; pairing needs it, as `pithagoras-sync pair` does in a terminal). The buttons are **Install and pair** and **Cancel**. Left empty, the link field means "install, do not pair yet": the password is then not used. Then:
+
+1. A second window shows what the link says, parsed, never the link itself: the portal and the name your computer will have there, and what the agent may do (below). **Yes** goes on; **No** changes nothing, and nothing is installed.
+2. Only after that Yes, your login password is checked with `su`, and not kept. If `su` does not take it, the form comes back with that said at its top, the link kept (the window names the portal it pairs with) and only the password to type.
+3. Then it installs, pairs, and a third window says how it stands (below).
+
+So installing and pairing takes three windows: the form, the confirmation, the result; installing without a link takes two, the form and the result.
+
+**KDE (kdialog).** kdialog has no forms, so the first window is one input box: the same text, and the link to paste (empty: install only); its buttons read OK and Cancel. Then the confirmation, then a window for your login password, then the result.
+
+**Windows.** If the clipboard holds a valid pairing link when you start the program (copy it in the portal first), one box asks both: "Install Pithagoras Sync for *you* and pair it with *the portal* as *name*?", with what installing does and what the agent may do. **Yes** installs and pairs, then a box says how it stands. Without a link in the clipboard it takes two steps: "Install Pithagoras Sync for *you*?", then a box that asks you to copy the link and press OK (it reads the clipboard). Only a text that is a valid pairing link is taken from the clipboard; anything else there is left alone and not shown. Windows asks no password here; the Windows login is the check there ([windows.md](windows.md)).
+
+**Clicking the link instead.** With the program installed or not, a click on the pairing link in the portal opens it (your browser asks whether to open it with Pithagoras Sync; allow it). Before an install, one question then asks to install and pair at once, with the same facts as above; on a Linux desktop the password window follows its Yes.
+
+Installing puts the program in place for your user only, without administrator rights:
 
 - the program goes to `~/.local/bin/pithagoras-sync` (Linux) or `%LOCALAPPDATA%\Programs\pithagoras-sync\pithagoras-sync.exe` (Windows);
 - it starts now and at every login, in the background (a systemd user unit on Linux, a logon task on Windows);
-- your desktop learns that `pithagoras-sync://` links open it, and "Pithagoras Sync" appears in the menu (Linux) so you can open these windows again later.
+- your desktop learns that `pithagoras-sync://` links open it, and "Pithagoras Sync" appears in the menu with its icon (Linux) so you can open these windows again later.
 
-**No** changes nothing and closes the window.
+## 3. What the pairing question says
 
-## 3. Pair with your portal
-
-In the portal, open Settings, Devices, "Pair a device". There are two ways to pair:
-
-- **Click the link** the portal shows. Your browser asks whether to open it with Pithagoras Sync; allow it.
-- **Paste it.** If the program is still open after installing, it asks you to "Paste the pairing link from the portal's Devices page". Copy the link in the portal and paste it there (on Windows: copy it, then press OK; the program reads it from the clipboard). With nothing pasted, or no text in the clipboard, it says so and asks again.
-
-Either way, a window then shows the portal it would pair with and the name your computer will have there:
+The confirmation shows the portal it would pair with and the name your computer will have there:
 
 > Pair this computer with the Pithagoras portal https://portal.example as "my-laptop"?
 
 Below it says what the agent may do right after pairing: this computer's mode, which pairing keeps. Normally that is "every call asks you first"; if you switched this computer to `folders` or `full` earlier, the window says so, and for `full` that the agent then acts with your rights right away. For a portal on this computer over plain `http` it adds who else could answer on its port, as `pair` does ([windows.md](windows.md#plain-http-to-a-local-portal)).
 
-Check that this is your portal. **Yes** pairs; **No** changes nothing. A link that is not a valid pairing link, that names a portal on another machine over plain `http`, or whose portal address has spaces or other characters a real address does not need (it could make the question read differently) is refused before anything happens.
+Check that this is your portal. A link that is not a valid pairing link, that names a portal on another machine over plain `http`, or whose portal address has spaces or other characters a real address does not need (it could make the question read differently) is refused before anything happens; typed into the form, the form comes back with why at its top.
 
-On a Linux desktop it then asks for your password (the one you log in with), as `pithagoras-sync pair` does in a terminal: pairing decides whose agent may use this computer, and a program of the agent that clicks through the windows does not know it. It is checked with `su` and not kept. A wrong one, or a cancel, changes nothing. When `su` fails for another reason (an expired password, say), the window shows what it said instead of calling the password wrong. If it cannot be checked (some login setups ask for a fingerprint or a security key instead), pair in a terminal: `pithagoras-sync pair '<link>'`. Windows asks no password here; the Windows login is the check there ([windows.md](windows.md)).
+The login password (Linux desktop) is checked with `su` and not kept: pairing decides whose agent may use this computer, and a program of the agent that clicks through the windows does not know it. When `su` fails for another reason (an expired password, say), the window shows what it said instead of calling the password wrong. If it cannot be checked (some login setups ask for a fingerprint or a security key instead), pair in a terminal: `pithagoras-sync pair '<link>'`.
 
-After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is. A connection to the portal of an earlier pairing, still open while the client switches, does not count as connected; after an unpair, it shows as not paired. Notes come with it, for example that the keyring did not take the pairing's token and it is kept in a file instead. Notes of the install (for example that pairing links may not open the program, so paste them) are shown right after installing.
+After pairing it waits a few seconds and tells you how it stands: "Pithagoras Sync is running, connected to *your portal*, and starts at login", or "Installed, not connected yet" with the reason, and where its log is. A connection to the portal of an earlier pairing, still open while the client switches, does not count as connected; after an unpair, it shows as not paired. The notes of installing and pairing come with it, for example that pairing links may not open the program (paste them), or that the keyring did not take the pairing's token and it is kept in a file instead.
 
 From now on the portal's agent can ask to use this computer. Until you change it, every file access and command asks you first; you answer in the portal's Devices tab. What else you can allow (folders, a mode without questions) is in [permissions.md](permissions.md).
 
-## 4. Later: status, pairing again, the log
+## 4. Later: the menu
 
-Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows a menu:
+Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows one window: at the top whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on, read anew each time the window opens; below it the actions. **Open** runs the one you picked; **Close** (or closing the window) ends the program, and the client keeps running in the background. (On KDE the two buttons keep kdialog's own labels, OK and Cancel.)
 
-- **Status:** whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on.
-- **Pair again:** pair with another portal, or again with the same one (it asks before it replaces the pairing).
+- **Pair again:** pair with another portal, or again with the same one: the link (and on GNOME the login password) in one window, then the question, which says it replaces the pairing.
 - **Sudo access** (Linux only): see below.
-- **Open log:** the client's log in a text editor. On Linux, without a log file, that is the client's lines from the journal; for a client the system unit runs (`install --system`, `setup`) the system journal (`journalctl -u`). The user it runs as can read the client's own lines there where the journal is kept on disk, since journald keeps each user's lines in a file of their own; systemd's lines about the unit need root or the groups `systemd-journal` and `adm`, and so do all lines where the journal is kept only in memory or not split by user. When journalctl shows no lines of the client, the window says that it may not have written any yet, or that the journal is kept in one of these ways.
+- **Update:** looks for a newer release, signed by the release key built into the program, as `pithagoras-sync update --check` does. If there is one, it asks "Update Pithagoras Sync to *version* now?"; **Yes** installs that version (and no other) and restarts the client. Up to date, it says so at the top of the menu. Builds without a release key (built from source) have no Update entry.
+- **Open log:** the client's log in a text editor. On Linux, without a log file, that is the client's lines from the journal; for a client the system unit runs (`install --system`, `setup`) the system journal (`journalctl -u`). The user it runs as can read the client's own lines there where the journal is kept on disk, since journald keeps each user's lines in a file of their own; systemd's lines about the unit need root or the groups `systemd-journal` and `adm`, and so do all lines where the journal is kept only in memory or not split by user. When journalctl shows no lines of the client, the menu says that it may not have written any yet, or that the journal is kept in one of these ways.
 - **Uninstall:** see below.
-- **Quit:** closes the window; the client keeps running in the background.
+
+What an action reports and needs no answer (the pairing's result, that sudo access is on, why the log did not open) shows at the top of the next window, mostly the menu, instead of a window of its own. Questions always get their own window. On Windows the menu is a row of boxes, one per action: **Yes** runs it, **No** goes on to the next, **Cancel** closes; the status is in the first box.
 
 ## 5. Sudo access (Linux)
 
 The portal's agent can run commands as root (`sudo <command>`) only if you allow it here and give the client your sudo password. The password stays on this computer; the agent never sees it, and every such command still asks you first.
 
-Choose **Sudo access** in the menu. A window says whether sudo access is on and whether a password is stored, and offers:
+Choose **Sudo access** in the menu. A window says whether sudo access is on and whether a password is stored, and offers (its **Back** button returns to the menu):
 
 - **Enter the password:** a field that shows dots, not what you type. The program checks the password with `sudo` itself before it keeps anything: a wrong one is refused ("sudo did not accept this password", with sudo's last line unless that line holds what you typed), and nothing changes. A right one goes to the running client (or, if you chose to keep it in a file or the keyring, there, for the client's next start). It then asks "Switch sudo access on now?"; **Yes** switches it on, **No** keeps the password and leaves sudo access off.
 - **Switch sudo access off** (when it is on): the password stays.
 - **Forget the password** (when one is stored): it asks first, and if sudo access is on, whether to switch it off too.
-- **Back.**
+
+What happened (sudo access is on, the password is forgotten, why sudo refused the password) shows at the top of this window when it comes back.
 
 If `sudo` asks you no password on this computer (a rule in sudoers says so), there is nothing to store and the window says so; switching sudo access on then is a terminal command, `pithagoras-sync sudo activate --no-password`, because the window cannot tell that you are the one asking.
 
@@ -85,6 +96,6 @@ If removing fails halfway, the window says what failed and that uninstalling aga
 
 ## What the windows never do
 
-- They never pair, install or uninstall without your Yes.
+- They never pair, install, update or uninstall without your Yes.
 - They never show or send your passwords. The sudo password is typed into a field that hides it, checked with `sudo` on this computer and kept only here; it never goes to the portal, into a log or onto a command line.
-- On Linux, a command that the portal's agent runs on this computer cannot use them to pair or uninstall: they refuse before they show anything, as the command line does. On a desktop, pairing also needs your password. Windows has no such check yet ([windows.md](windows.md)).
+- On Linux, a command that the portal's agent runs on this computer cannot use them to pair, update or uninstall: they refuse before they show anything, as the command line does. On a desktop, pairing also needs your password. Windows has no such check yet ([windows.md](windows.md)).
