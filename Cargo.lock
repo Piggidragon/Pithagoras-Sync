@@ -893,7 +893,6 @@ version = "0.0.2"
 dependencies = [
  "clap",
  "libc",
- "minisign-verify",
  "ring",
  "serde",
  "serde_json",
@@ -1295,6 +1294,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "httparse",
+ "minisign-verify",
  "ring",
  "rustls",
  "rustls-native-certs",
@@ -1308,6 +1308,25 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "sync-mcp"
+version = "0.0.2"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "sync-connector",
+ "sync-ops",
+ "sync-policy",
+ "sync-proto",
+ "sync-testkit",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

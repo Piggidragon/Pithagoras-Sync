@@ -5,6 +5,8 @@
 //! It implements only what the protocol document says; it is not a model of the
 //! real portal's behaviour beyond that.
 
+pub mod fake_mcp;
+pub mod files;
 #[cfg(unix)]
 pub mod keyring;
 

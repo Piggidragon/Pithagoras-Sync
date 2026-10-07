@@ -12,6 +12,10 @@ pub mod info;
 pub mod search;
 pub mod shim;
 
+/// A Job Object with kill-on-close: what commands run in, and the computer-use
+/// servers too.
+#[cfg(windows)]
+pub use exec::win::Job;
 pub use exec::{ExecConfig, ExecOutcome, Execs};
 pub use shim::{SHIM_ARG, shim_main};
 

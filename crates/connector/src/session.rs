@@ -178,6 +178,20 @@ pub async fn run(
             }
         });
     }
+    if let Some(cu) = device.computer_use() {
+        let mut changed = cu.subscribe();
+        let ev = shared.clone();
+        tasks.spawn(async move {
+            loop {
+                let text = match changed.recv().await {
+                    Ok(c) => notification(MCP_CHANGED, c),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                ev.send_text(text).await;
+            }
+        });
+    }
     if let Some(store) = &device.store {
         let mut changed = store.subscribe();
         let ev = shared.clone();
@@ -533,6 +547,23 @@ async fn dispatch(
             let store = shared.device.store.clone().ok_or_else(|| unknown(method))?;
             let p: PolicySetParams = parse(params)?;
             to_value(blocking(move || store.set_from_portal(p)).await?)
+        }
+        MCP_LIST => {
+            let cu = shared
+                .device
+                .computer_use()
+                .ok_or_else(|| unknown(method))?;
+            parse::<EmptyParams>(params)?;
+            to_value(cu.list())
+        }
+        MCP_CALL => {
+            let cu = shared
+                .device
+                .computer_use()
+                .ok_or_else(|| unknown(method))?
+                .clone();
+            let p: McpCallParams = parse(params)?;
+            to_value(cu.call(id, p).await?)
         }
         EXEC_SIGNAL => {
             let p: ExecSignalParams = parse(params)?;

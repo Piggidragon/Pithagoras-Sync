@@ -8,6 +8,7 @@ pub mod net;
 pub mod pair;
 pub mod session;
 pub mod settings;
+pub mod signed;
 pub mod tls;
 pub mod token;
 pub mod url;

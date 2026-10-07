@@ -55,8 +55,19 @@ async fn post_inner(
 /// GETs `url` (https, or http to this machine only), following up to five
 /// redirects, and returns the body of a 200 answer of at most `max` bytes.
 pub async fn get(url: &str, max: usize) -> Result<Vec<u8>, String> {
+    get_checked(url, max, &|_| Ok(())).await
+}
+
+/// `get`, with `allowed` asked about the URL and every redirect before it is
+/// opened: a download pinned to some hosts cannot be sent to another.
+pub async fn get_checked(
+    url: &str,
+    max: usize,
+    allowed: &(dyn Fn(&str) -> Result<(), String> + Sync),
+) -> Result<Vec<u8>, String> {
     let mut url = url.to_string();
     for _ in 0..=5 {
+        allowed(&url)?;
         let (origin, target) = split_url(&url)?;
         let mut io = crate::net::open(&origin, None).await?;
         let head = format!(

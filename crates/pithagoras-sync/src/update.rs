@@ -85,14 +85,7 @@ pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 
 /// The manifest, if `sig` is a valid signature of `data` by `key`.
 pub fn verify(data: &[u8], sig: &str, key: &str) -> Result<Manifest, String> {
-    let key = minisign_verify::PublicKey::from_base64(key.trim())
-        .map_err(|e| format!("the update key of this build is unusable: {e}"))?;
-    let sig = minisign_verify::Signature::decode(sig)
-        .map_err(|e| format!("the manifest's signature is unreadable: {e}"))?;
-    // Legacy (non-prehashed) signatures are taken too: the manifest is small, and
-    // Ed25519 over the whole of it is as strong.
-    key.verify(data, &sig, true)
-        .map_err(|e| format!("the manifest's signature does not verify: {e}"))?;
+    sync_connector::signed::verify(data, sig, key, "manifest")?;
     serde_json::from_slice(data).map_err(|e| format!("the manifest is unreadable: {e}"))
 }
 

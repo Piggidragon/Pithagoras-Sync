@@ -4,18 +4,35 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use sync_ops::{Execs, info};
+use sync_policy::BoxFuture;
 use sync_policy::config::PortalPolicy;
 use sync_policy::paths::to_wire;
 use sync_policy::secret::SecretSlot;
 use sync_policy::{ApprovalQueue, Engine, FoldersShell, Mode};
 use sync_proto::methods::{
-    CAP_APPROVALS, CAP_POLICY, CAPABILITIES, DeviceInfo, FolderInfo, Hello, PiTool,
+    CAP_APPROVALS, CAP_MCP, CAP_POLICY, CAPABILITIES, DeviceInfo, FolderInfo, Hello, McpCallParams,
+    McpCallResult, McpChanged, McpListResult, PiTool,
 };
+use sync_proto::{Id, RpcError};
 
 use crate::settings::ConfigStore;
 use tokio::sync::watch;
 
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Computer use as the session serves it (`mcp.list`, `mcp.call`,
+/// `mcp.changed`); `sync_mcp::Service` is the real one.
+pub trait ComputerUse: Send + Sync {
+    fn list(&self) -> McpListResult;
+    /// One call; `id` is the portal's, for the consent question.
+    fn call<'a>(
+        &'a self,
+        id: &'a Id,
+        params: McpCallParams,
+    ) -> BoxFuture<'a, Result<McpCallResult, RpcError>>;
+    /// Fires when the list or the consent changed.
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<McpChanged>;
+}
 
 pub struct Device {
     pub engine: Arc<Engine>,
@@ -30,6 +47,8 @@ pub struct Device {
     /// The elevation secret: commands get it through sudo, and the engine's audit
     /// log, the commands' output and every text frame to the portal leave it out.
     pub secrets: Arc<SecretSlot>,
+    /// Computer use, once the client set it up.
+    computer_use: std::sync::OnceLock<Arc<dyn ComputerUse>>,
 }
 
 impl Device {
@@ -59,7 +78,17 @@ impl Device {
             approvals,
             store,
             secrets,
+            computer_use: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Serves computer use from now on (once; later calls are ignored).
+    pub fn set_computer_use(&self, cu: Arc<dyn ComputerUse>) {
+        let _ = self.computer_use.set(cu);
+    }
+
+    pub fn computer_use(&self) -> Option<&Arc<dyn ComputerUse>> {
+        self.computer_use.get()
     }
 
     /// Whether the portal may read the settings now.
@@ -145,7 +174,21 @@ impl Device {
                 .into_iter()
                 .filter(|t| policy.tools.enabled(*t))
                 .collect(),
-            mcp_tools: Vec::new(),
+            mcp_tools: self
+                .computer_use()
+                .map(|cu| {
+                    cu.list()
+                        .servers
+                        .iter()
+                        .flat_map(|s| {
+                            s.tools.iter().map(|t| sync_proto::methods::McpToolRef {
+                                server: s.name.clone(),
+                                tool: t.name.clone(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             client_version: CLIENT_VERSION.into(),
         }
     }
@@ -163,9 +206,10 @@ impl Device {
                 .copied()
                 .chain(self.approvals.is_some().then_some(CAP_APPROVALS))
                 .chain(self.shares_policy().then_some(CAP_POLICY))
+                .chain(self.computer_use().is_some().then_some(CAP_MCP))
                 .map(str::to_string)
                 .collect(),
-            mcp_version: None,
+            mcp_version: self.computer_use().map(|cu| cu.list().version),
         }
     }
 }
