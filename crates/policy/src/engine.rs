@@ -133,7 +133,40 @@ impl From<Refusal> for RpcError {
 enum Scope {
     Read,
     Write,
+    /// Computer use, given "for this chat" when the consent asks.
+    Screen,
 }
+
+/// A computer-use call to decide (`authorize_screen`).
+#[derive(Debug, Clone)]
+pub struct ScreenRequest<'a> {
+    pub server: &'a str,
+    pub tool: &'a str,
+    /// The arguments as the owner reads them in the question and the audit
+    /// log: visible escapes, cut. Typed text appears only this far.
+    pub shown: &'a str,
+}
+
+/// Why a computer-use call is refused, with the reason the portal gets in the
+/// error's `data` (`sync_proto::mcp_reason`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenRefusal {
+    pub reason: Option<&'static str>,
+    pub message: String,
+}
+
+impl From<ScreenRefusal> for RpcError {
+    fn from(r: ScreenRefusal) -> RpcError {
+        let e = RpcError::denied(r.message);
+        match r.reason {
+            Some(reason) => e.with_reason(reason),
+            None => e,
+        }
+    }
+}
+
+/// Why computer use asks, in every question it raises.
+pub const SCREEN_REASON: &str = "computer use asks (policy.computer_use.consent = ask): it is as strong as Full mode, since the agent can see your screen and click and type anything you can, a terminal included";
 
 #[derive(Debug, Default)]
 struct ChatState {
@@ -576,6 +609,7 @@ impl Engine {
             reasons,
             preview,
             offer_chat: offer.is_some(),
+            offer_time: offer.is_some(),
             max_minutes: opts.max_minutes,
             expires_ms: self.now() + timeout.as_millis() as i64,
             on_timeout_allow: opts.on_timeout == TimeoutAnswer::Allow,
@@ -628,6 +662,149 @@ impl Engine {
                 }
                 record(&cwd, "approved", Some(reason_text));
                 Ok(permit)
+            }
+        }
+    }
+
+    /// Decides one computer-use call by the owner's consent, which is separate
+    /// from the mode: `off` refuses, `allow` lets it through until it ends, `ask`
+    /// asks once per chat (once, for this chat, or deny). An unanswered question
+    /// is a denial whatever `approvals.on_timeout` says. The device's pause and
+    /// hours apply as to every call. The caller marks the chat tainted once the
+    /// call reached the server.
+    pub async fn authorize_screen(
+        &self,
+        call: &Call<'_>,
+        req: ScreenRequest<'_>,
+    ) -> Result<(), ScreenRefusal> {
+        use sync_proto::mcp_reason as why;
+        let target = format!("{}.{} {}", req.server, req.tool, req.shown);
+        let record = |decision: &str, reason: Option<String>| {
+            self.record_in(
+                Some(call.chat),
+                "computer_use",
+                &target,
+                None,
+                decision,
+                reason,
+                None,
+            );
+        };
+        let deny = |reason: Option<&'static str>, message: String| {
+            record("denied", Some(message.clone()));
+            ScreenRefusal { reason, message }
+        };
+        if self.is_paused() {
+            return Err(deny(Some(why::PAUSED), "the device is paused".into()));
+        }
+        if call.portal_tainted {
+            self.mark_tainted(call.chat);
+        }
+        let snap = self.snapshot();
+        let now = self.now();
+        match &snap.rules {
+            Err(e) => {
+                return Err(deny(
+                    None,
+                    format!(
+                        "the device's policy has a broken rule ({e}), so it refuses everything"
+                    ),
+                ));
+            }
+            Ok(rules) if !rules.within_hours(now) => {
+                return Err(deny(
+                    Some(why::HOURS),
+                    "outside the hours this device works for the portal".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        match snap.policy.computer_use.effective(now) {
+            crate::config::Consent::Off => {
+                return Err(deny(
+                    Some(why::CONSENT_OFF),
+                    "computer use is off on this device (pithagoras-sync computer-use ask, or allow --minutes N)".into(),
+                ));
+            }
+            crate::config::Consent::Allow => {
+                record("allowed", Some("computer use is allowed for a time".into()));
+                return Ok(());
+            }
+            crate::config::Consent::Ask => {}
+        }
+        let given = {
+            let mut chats = self.chats.lock().unwrap();
+            chats.get_mut(call.chat).is_some_and(|c| {
+                c.used_ms = now;
+                c.approved
+                    .get(&Scope::Screen)
+                    .is_some_and(|until| until.is_none_or(|u| now < u))
+            })
+        };
+        if given {
+            record(
+                "allowed",
+                Some("computer use was allowed for this chat".into()),
+            );
+            return Ok(());
+        }
+        if !self.approver.can_prompt() {
+            return Err(deny(
+                Some(why::CONSENT_TIMEOUT),
+                "computer use asks, and nobody can answer prompts on this device".into(),
+            ));
+        }
+        let opts = snap.policy.approvals.clone();
+        let timeout = Duration::from_secs(opts.timeout_secs);
+        let request = ApprovalRequest {
+            call: call.id.cloned(),
+            chat: call.chat.to_string(),
+            tool: "computer_use".into(),
+            target: target.clone(),
+            cwd: None,
+            reasons: vec![SCREEN_REASON.to_string()],
+            preview: None,
+            offer_chat: true,
+            offer_time: false,
+            max_minutes: opts.max_minutes,
+            expires_ms: now + timeout.as_millis() as i64,
+            on_timeout_allow: false,
+        };
+        let answer = match tokio::time::timeout(timeout, self.approver.ask(&request)).await {
+            Ok(a) => a,
+            Err(_) => {
+                return Err(deny(
+                    Some(why::CONSENT_TIMEOUT),
+                    format!(
+                        "no answer to the computer-use question within {}s",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+        };
+        if self.is_paused() {
+            return Err(deny(Some(why::PAUSED), "the device is paused".into()));
+        }
+        match answer {
+            Answer::Deny => Err(deny(
+                Some(why::CONSENT_DENIED),
+                "the owner denied computer use".into(),
+            )),
+            Answer::ForChat => {
+                let until = match opts.remember_minutes {
+                    0 => None,
+                    m => Some(self.now() + i64::from(m) * 60_000),
+                };
+                let now = self.now();
+                chat_state(&mut self.chats.lock().unwrap(), call.chat, now)
+                    .approved
+                    .insert(Scope::Screen, until);
+                record("approved", Some("computer use, for this chat".into()));
+                Ok(())
+            }
+            Answer::Once | Answer::ForTime(_) => {
+                record("approved", Some("computer use, once".into()));
+                Ok(())
             }
         }
     }

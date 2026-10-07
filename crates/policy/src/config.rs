@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-pub use sync_proto::methods::{Access, Mode};
+pub use sync_proto::methods::{Access, Consent, Mode};
 
 pub use crate::rules::{
     CommandRule, Commands, Compiled, DenyRule, GlobGrant, Hours, Rights, Tools,
@@ -229,6 +229,77 @@ impl Default for PrivilegeOptions {
     }
 }
 
+/// The longest an `allow` consent of computer use lasts.
+pub const MAX_ALLOW_MINUTES: u32 = 8 * 60;
+
+/// Computer use (docs/computer-use.md): whether the agent may see the screen and
+/// use the pointer and keyboard. Separate from the mode, and the device's alone:
+/// `policy.set` refuses any change to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ComputerUseOptions {
+    pub consent: Consent,
+    /// When an `allow` ends (Unix ms), dated by the device when it is given.
+    pub until_ms: Option<i64>,
+    /// Look for new pins of the installed MCP servers once a day.
+    pub auto_update: bool,
+}
+
+impl Default for ComputerUseOptions {
+    fn default() -> Self {
+        ComputerUseOptions {
+            consent: Consent::Off,
+            until_ms: None,
+            auto_update: true,
+        }
+    }
+}
+
+impl ComputerUseOptions {
+    /// The consent in force at `now_ms`: an `allow` that ran out, or one without
+    /// an end (written by hand), is `off`.
+    pub fn effective(&self, now_ms: i64) -> Consent {
+        match self.consent {
+            Consent::Allow => match self.until_ms {
+                Some(until) if now_ms < until => Consent::Allow,
+                _ => Consent::Off,
+            },
+            c => c,
+        }
+    }
+
+    /// When an `allow` in force ends.
+    pub fn expires_ms(&self, now_ms: i64) -> Option<i64> {
+        (self.effective(now_ms) == Consent::Allow)
+            .then_some(self.until_ms)
+            .flatten()
+    }
+
+    /// Sets the consent; `allow` for `minutes` from `now_ms`, at most
+    /// `MAX_ALLOW_MINUTES`.
+    pub fn set(
+        &mut self,
+        consent: Consent,
+        minutes: Option<u32>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.until_ms = match (consent, minutes) {
+            (Consent::Allow, Some(m)) if (1..=MAX_ALLOW_MINUTES).contains(&m) => {
+                Some(now_ms + i64::from(m) * 60_000)
+            }
+            (Consent::Allow, _) => {
+                return Err(format!(
+                    "allow needs --minutes from 1 to {MAX_ALLOW_MINUTES} (8 hours)"
+                ));
+            }
+            (_, Some(_)) => return Err("minutes go with allow only".into()),
+            _ => None,
+        };
+        self.consent = consent;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Policy {
@@ -247,6 +318,8 @@ pub struct Policy {
     pub hours: Option<Hours>,
     pub approvals: ApprovalOptions,
     pub privilege: PrivilegeOptions,
+    /// Device only.
+    pub computer_use: ComputerUseOptions,
 }
 
 impl Default for Policy {
@@ -264,6 +337,7 @@ impl Default for Policy {
             hours: None,
             approvals: ApprovalOptions::default(),
             privilege: PrivilegeOptions::default(),
+            computer_use: ComputerUseOptions::default(),
         }
     }
 }
@@ -447,6 +521,31 @@ impl PortalPolicy {
     }
 }
 
+/// One installed version of an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledVersion {
+    pub version: String,
+    /// The hash over the version's whole folder (`sync_mcp::fsutil::tree_hash`),
+    /// checked before every start.
+    pub sha256: String,
+}
+
+/// An MCP server `computer-use install` put on the device: the version in use
+/// and the one before it, for one rollback. Written by the device only, and
+/// never in the portal's document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledServer {
+    pub version: String,
+    pub sha256: String,
+    /// The serial of the pins document it was installed from (0: built in).
+    #[serde(default)]
+    pub serial: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<InstalledVersion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeviceConfig {
@@ -457,6 +556,9 @@ pub struct DeviceConfig {
     pub token_storage: Option<TokenStorage>,
     pub policy: Policy,
     pub exec: ExecOptions,
+    /// The installed MCP servers of computer use, by name.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mcp: std::collections::BTreeMap<String, InstalledServer>,
 }
 
 impl DeviceConfig {
@@ -597,6 +699,18 @@ impl Dirs {
         self.state.join("update-released")
     }
 
+    /// Computer use: the MCP servers' folders, their logs and the newest pins
+    /// document taken. No file tool reaches it.
+    pub fn mcp_dir(&self) -> PathBuf {
+        self.state.join("mcp")
+    }
+
+    /// The highest serial of a pins document this user's client took: a lower
+    /// one is an older document served again and is refused.
+    pub fn mcp_serial_file(&self) -> PathBuf {
+        self.state.join("mcp-pins-serial")
+    }
+
     /// Present while the client is paused by `panic`, until `unlock`.
     pub fn paused_file(&self) -> PathBuf {
         self.state.join("paused")
@@ -678,6 +792,30 @@ mod tests {
     }
 
     #[test]
+    fn an_allow_consent_ends_and_is_bounded() {
+        let mut c = ComputerUseOptions::default();
+        assert_eq!(c.effective(0), Consent::Off);
+        assert!(c.set(Consent::Allow, None, 0).is_err());
+        assert!(
+            c.set(Consent::Allow, Some(MAX_ALLOW_MINUTES + 1), 0)
+                .is_err()
+        );
+        assert!(c.set(Consent::Allow, Some(0), 0).is_err());
+        assert!(c.set(Consent::Ask, Some(5), 0).is_err());
+        assert_eq!(c.consent, Consent::Off);
+        c.set(Consent::Allow, Some(30), 1_000).unwrap();
+        assert_eq!(c.effective(1_000 + 30 * 60_000 - 1), Consent::Allow);
+        assert_eq!(c.expires_ms(1_000), Some(1_000 + 30 * 60_000));
+        assert_eq!(c.effective(1_000 + 30 * 60_000), Consent::Off);
+        assert_eq!(c.expires_ms(1_000 + 30 * 60_000), None);
+        c.set(Consent::Ask, None, 5).unwrap();
+        assert_eq!((c.effective(5), c.until_ms), (Consent::Ask, None));
+        // Allow written by hand without an end counts as off.
+        let by_hand: ComputerUseOptions = toml::from_str("consent = \"allow\"").unwrap();
+        assert_eq!(by_hand.effective(0), Consent::Off);
+    }
+
+    #[test]
     fn full_without_expiry_stays() {
         let mut p = Policy::default();
         p.full.expiry_hours = 0;
@@ -718,6 +856,7 @@ mod tests {
         assert_eq!(p.full.expiry_hours, 8);
         assert!(p.commands.never_ask.is_empty());
         assert!(p.hours.is_none());
+        assert_eq!(p.computer_use.consent, Consent::Off);
         assert_eq!(
             p.protected.tool_config,
             [".git", ".envrc", ".vscode", ".idea"]

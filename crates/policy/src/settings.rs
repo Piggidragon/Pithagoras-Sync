@@ -6,7 +6,9 @@
 //! kept (`token_storage`) and the elevation secret. A few
 //! settings in it are the device's alone (the shell and sudo the client runs, where
 //! the secret is kept): a portal that could point them elsewhere could make the
-//! device hand the secret to a program of its choosing.
+//! device hand the secret to a program of its choosing. Computer use's consent
+//! is the device's alone too: it is as strong as Full mode, and the owner gives
+//! it on the device or not at all.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +21,9 @@ pub const DEVICE_ONLY: &[&str] = &[
     "exec.shell",
     "policy.privilege.sudo_path",
     "policy.privilege.secret_storage",
+    "policy.computer_use.consent",
+    "policy.computer_use.until_ms",
+    "policy.computer_use.auto_update",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +117,10 @@ pub fn apply_from_portal(
         (
             "policy.privilege.secret_storage",
             new.policy.privilege.secret_storage != cfg.policy.privilege.secret_storage,
+        ),
+        (
+            "policy.computer_use",
+            new.policy.computer_use != cfg.policy.computer_use,
         ),
     ];
     if let Some((key, _)) = device_only.iter().find(|(_, changed)| *changed) {
@@ -287,6 +296,66 @@ mod tests {
         ] {
             assert!(matches!(set(&c, edit), Err(SetError::Invalid(_))));
         }
+    }
+
+    #[test]
+    fn the_portal_cannot_touch_computer_use_in_any_spelling() {
+        let mut c = cfg(PortalPolicy::Write);
+        let doc = document(&c);
+        for key in [
+            "policy.computer_use.consent",
+            "policy.computer_use.until_ms",
+            "policy.computer_use.auto_update",
+        ] {
+            assert!(doc.device_only.iter().any(|d| d == key), "{key}");
+        }
+        let denied = |c: &DeviceConfig, edit: &dyn Fn(&mut Value)| {
+            let mut v = settings_value(c);
+            edit(&mut v);
+            apply_from_portal(
+                c,
+                PolicySetParams {
+                    settings: v,
+                    if_version: None,
+                },
+                1_000,
+            )
+        };
+        let edits: [fn(&mut Value); 5] = [
+            |v| v["policy"]["computer_use"]["consent"] = "allow".into(),
+            |v| v["policy"]["computer_use"]["consent"] = "ask".into(),
+            |v| v["policy"]["computer_use"]["until_ms"] = i64::MAX.into(),
+            |v| v["policy"]["computer_use"]["auto_update"] = false.into(),
+            |v| {
+                v["policy"]["computer_use"] =
+                    serde_json::json!({"consent": "allow", "until_ms": i64::MAX})
+            },
+        ];
+        for e in &edits {
+            assert!(matches!(denied(&c, e), Err(SetError::Denied(_))));
+        }
+        // Other spellings are not settings at all.
+        let others: [fn(&mut Value); 7] = [
+            |v| v["policy"]["computer_use"]["Consent"] = "allow".into(),
+            |v| v["policy"]["computerUse"] = serde_json::json!({"consent": "allow"}),
+            |v| v["policy"]["consent"] = "allow".into(),
+            |v| v["computer_use"] = serde_json::json!({"consent": "allow"}),
+            |v| v["exec"]["computer_use"] = serde_json::json!({"consent": "allow"}),
+            |v| v["mcp"] = serde_json::json!({}),
+            |v| v["policy"]["computer_use"]["consent"] = "ALLOW".into(),
+        ];
+        for e in &others {
+            assert!(matches!(denied(&c, e), Err(SetError::Invalid(_))));
+        }
+        // Leaving it out is not a way to reset it either.
+        c.policy.computer_use.consent = sync_proto::methods::Consent::Ask;
+        let r = denied(&c, &|v| {
+            v["policy"].as_object_mut().unwrap().remove("computer_use");
+        });
+        assert!(matches!(r, Err(SetError::Denied(_))), "{r:?}");
+        // Sent back unchanged, the rest of a change goes through.
+        let (next, _) = denied(&c, &|v| v["policy"]["tools"]["bash"] = false.into()).unwrap();
+        assert_eq!(next.policy.computer_use, c.policy.computer_use);
     }
 
     #[test]

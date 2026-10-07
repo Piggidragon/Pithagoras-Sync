@@ -1248,3 +1248,196 @@ async fn a_commands_approval_and_audit_name_its_folder() {
         Some(f.p("outside").as_str())
     );
 }
+
+fn screen_call<'a>(chat: &'a str) -> Call<'a> {
+    Call {
+        id: None,
+        chat,
+        portal_tainted: false,
+        tool: "computer_use",
+        pi_tool: None,
+    }
+}
+
+fn screen_req(shown: &str) -> ScreenRequest<'_> {
+    ScreenRequest {
+        server: "cu",
+        tool: "type_text",
+        shown,
+    }
+}
+
+fn consent(c: Consent, minutes: Option<u32>, now: i64) -> Policy {
+    let mut p = Policy::default();
+    p.computer_use.set(c, minutes, now).unwrap();
+    p
+}
+
+#[tokio::test]
+async fn computer_use_is_off_until_the_owner_consents() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let yes = scripted(Answer::Once);
+    // Full mode is not consent.
+    let mut full = Policy::default();
+    full.full.expiry_hours = 0;
+    full.set_mode(Mode::Full, 0);
+    for policy in [Policy::default(), full] {
+        let e = f.engine(policy, Profile::Desktop, yes.clone());
+        let r = e
+            .authorize_screen(&screen_call("c1"), screen_req("{}"))
+            .await
+            .unwrap_err();
+        assert_eq!(r.reason, Some(mcp_reason::CONSENT_OFF));
+    }
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+    let rec = f.audit();
+    let last = rec.last().unwrap();
+    assert_eq!(
+        (last.tool.as_str(), last.decision.as_str()),
+        ("computer_use", "denied")
+    );
+}
+
+#[tokio::test]
+async fn an_allow_consent_runs_out_and_falls_back_to_off() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let yes = scripted(Answer::Once);
+    let now = f.clock.load(Ordering::SeqCst);
+    let e = f.engine(
+        consent(Consent::Allow, Some(10), now),
+        Profile::Desktop,
+        yes.clone(),
+    );
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    f.clock.store(now + 10 * 60_000, Ordering::SeqCst);
+    let r = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_OFF));
+    assert_eq!(yes.asked.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ask_asks_once_per_chat_with_its_own_choices() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let once = scripted(Answer::Once);
+    let e = f.engine(
+        consent(Consent::Ask, None, 0),
+        Profile::Desktop,
+        once.clone(),
+    );
+    let mut call = screen_call("c1");
+    call.portal_tainted = true;
+    e.authorize_screen(&call, screen_req("{\"text\": \"hi\"}"))
+        .await
+        .unwrap();
+    assert!(e.is_tainted("c1"), "the portal's flag adds");
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        once.asked.load(Ordering::SeqCst),
+        2,
+        "once is this call only"
+    );
+    let req = once.last.lock().unwrap().clone().unwrap();
+    assert_eq!(req.tool, "computer_use");
+    assert!(req.offer_chat && !req.offer_time && !req.on_timeout_allow);
+    assert!(req.reasons[0].contains("Full mode"), "{:?}", req.reasons);
+    assert!(req.target.starts_with("cu.type_text "), "{}", req.target);
+
+    let chat = scripted(Answer::ForChat);
+    let e = f.engine(
+        consent(Consent::Ask, None, 0),
+        Profile::Desktop,
+        chat.clone(),
+    );
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 1, "for this chat");
+    e.authorize_screen(&screen_call("c2"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 2, "another chat asks");
+    // The grant's end and a pause take it back.
+    e.grant_end("c1");
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 3);
+    e.pause();
+    let r = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::PAUSED));
+    e.unlock();
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 4);
+
+    let no = scripted(Answer::Deny);
+    let e = f.engine(consent(Consent::Ask, None, 0), Profile::Desktop, no);
+    let r = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_DENIED));
+}
+
+#[tokio::test]
+async fn an_unanswered_consent_is_a_denial_even_with_on_timeout_allow() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let mut p = consent(Consent::Ask, None, 0);
+    p.approvals.timeout_secs = 1;
+    p.approvals.on_timeout = sync_policy::config::TimeoutAnswer::Allow;
+    let e = f.engine(p, Profile::Desktop, Arc::new(Never));
+    let r = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_TIMEOUT));
+    let none = f.engine(
+        consent(Consent::Ask, None, 0),
+        Profile::Desktop,
+        Arc::new(NoApprover { why: "test" }),
+    );
+    let r = none
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_TIMEOUT));
+}
+
+#[tokio::test]
+async fn hours_apply_to_computer_use() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let now = f.clock.load(Ordering::SeqCst);
+    let mut p = consent(Consent::Allow, Some(60), now);
+    // A window of one minute, far from the fixture's clock.
+    p.hours = Some(Hours {
+        days: vec![],
+        from: "03:00".into(),
+        to: "03:01".into(),
+        utc_offset_minutes: Some(0),
+    });
+    let e = f.engine(p, Profile::Desktop, scripted(Answer::Once));
+    let r = e
+        .authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::HOURS));
+}

@@ -42,7 +42,7 @@ Who may change them on the device:
 | `policy.full.until_ms` | Unix ms or none | none | When the current Full mode ends; set by the device when Full is switched on. | set by `mode full` | no effect (the device dates it) |
 | `policy.full.protected_paths` | `true`, `false` | `true` | Protected paths (below) ask in Full mode too. | `config set` | yes |
 | `policy.full.pattern_prompts` | `true`, `false` | `true` | Risky commands ask in Full mode: `sudo`, `su`, `doas`, `pkexec` and the like, `git push`, a download piped into a shell, `rm -r` outside the working folder. A client that runs as root (Linux, an LXC for example) does not ask for `sudo`, `su`, `doas` or `pkexec`, which change nothing for it; the other patterns still ask. The same holds for the unconfined Folders shell. | `config set` | yes |
-| `policy.full.taint_prompts` | `true`, `false` | `true` | Calls from a chat the portal marked as having seen untrusted content (`ctx.tainted`) ask in Full mode too. | `config set` | yes |
+| `policy.full.taint_prompts` | `true`, `false` | `true` | Calls from a chat that has seen untrusted content ask in Full mode too: one the portal marked (`ctx.tainted`), and every chat that used computer use (a screenshot is untrusted content), from its first `mcp.call` on. | `config set` | yes |
 
 ### Folders
 
@@ -101,6 +101,24 @@ The first answer wins. "Of its kind" means reads or writes from the same chat, a
 | `policy.approvals.remember_minutes` | 0 to 10080 | `60` | How long an "allow for this chat" answer lasts; `0`: until the chat's grant ends. | `config set` | yes |
 | `policy.approvals.max_minutes` | 0 to 10080 | `480` | The longest "allow for a time" answer the device takes. | `config set` | yes |
 | `policy.approvals.desktop_notifications` | `true`, `false` | `false` | Also show approvals as desktop notifications with Allow once and Deny (Linux desktop profile, with a notification service). Off by default: the device's own approval window comes back with the phase 2 desktop app. | `config set policy.approvals.desktop_notifications true` | yes |
+
+### Computer use: `policy.computer_use`
+
+Computer use lets the agent see the screen and use the pointer and keyboard of this computer through an MCP server the client installs (docs/computer-use.md). It is **as strong as Full mode**: the agent can click and type anything you can, a terminal included. So it has a consent of its own, separate from the mode, and only you give it, on this computer.
+
+| Setting | Values | Default | What it does | CLI | Portal |
+|---|---|---|---|---|---|
+| `policy.computer_use.consent` | `off`, `ask`, `allow` | `off` | `off`: every computer-use call is refused (the tools stay listed to the portal, so a chat's tool list does not change). `ask`: the first call of each chat asks you through the approval path (the portal's Devices tab, `approvals`/`approve`/`deny`), with the choices once, for this chat and deny; the question shows the tool and its arguments (typed text and keys too, with control characters as visible escapes, cut at 1000 characters). A question nobody answers is a denial, whatever `policy.approvals.on_timeout` says. `allow`: no questions until it ends (at most 8 hours), then `off`. | `computer-use off`, `computer-use ask`, `computer-use allow --minutes N` (or `config set policy.computer_use.consent ask`; `allow` only through its command, which dates its end) | no |
+| `policy.computer_use.until_ms` | Unix ms or none | none | When the current `allow` ends; set by `computer-use allow`. Kept across restarts, as Full's end is. An `allow` without it (written by hand) counts as `off`. | set by `computer-use allow` | no |
+| `policy.computer_use.auto_update` | `true`, `false` | `true` | Once a day, at a random time, the running client looks for a newer signed pins document and updates the installed MCP servers to it (docs/mcp-updates.md). Off: only `pithagoras-sync update` and `computer-use update` do. | `config set policy.computer_use.auto_update false` | no |
+
+- What a computer-use call goes through, in order: the pause and the hours as for every call, the allow-list (only exact tool names of the installed server version that the client's table allows; anything else is never listed and never called), the arguments checked against the tool's schema, the consent, and for pointer and keyboard input the focus check: no window of Pithagoras Sync may be open or focused, and when the client cannot tell which windows are open, the call is refused.
+- **Taint.** Every computer-use call marks its chat as having seen untrusted content on the device, so with `policy.full.taint_prompts` (the default) the next command or write from that chat asks even in Full mode. Ending the chat's grant clears it, as for the portal's flag.
+- `panic` ends every computer-use call, stops the servers and turns an `allow` into `off`; `unlock` does not give it back. A "for this chat" answer ends with the chat's grant, with `policy.approvals.remember_minutes`, and with `panic`.
+- Every decision goes to the audit log (`"tool": "computer_use"`, the target `<server>.<tool> <arguments as the question shows them>`) and to the portal's Audit page.
+- While calls run, a desktop notification at the start of each burst (Linux, with a notification service) says which chat uses the screen, and `status` shows it.
+- The portal reads these settings (`policy.get`) and can never change them, also with `portal_policy = "write"`: `policy.set` refuses any change to `policy.computer_use`, and a document that leaves the table out counts as a change.
+- The installed servers are not settings: the config's `[mcp]` table records each server's version and the hash of its files (`computer-use install`, `update`, `rollback` write it). `config set` refuses it, and the portal never sees it.
 
 ### Root and elevation: `policy.privilege`
 
@@ -183,9 +201,10 @@ The password is read from the keyring at start, after the control socket is up, 
 
 | Command | What it does |
 |---|---|
-| `pithagoras-sync panic` | Closes the link, kills every command, denies every call (pending approvals included) and forgets the elevation password held in memory, until `unlock`. |
+| `pithagoras-sync panic` | Closes the link, kills every command, denies every call (pending approvals included), stops the computer-use servers, turns a computer-use `allow` into `off` and forgets the elevation password held in memory, until `unlock`. |
 | `pithagoras-sync unlock` | Ends a pause; reloads the stored password when storage is `file`. |
-| `pithagoras-sync update [--check]` | Replaces the program the running client was started from (else the one you ran) with a newer signed release and restarts the client. Never changes a setting. |
+| `pithagoras-sync update [--check]` | Replaces the program the running client was started from (else the one you ran) with a newer signed release and restarts the client, and updates the installed computer-use servers to the newest signed pins, also when there is no newer client. Never changes a setting. |
+| `pithagoras-sync computer-use ...` | Install, set up, test, update, roll back and remove the computer-use server, and set its consent (`off`, `ask`, `allow --minutes N`); docs/computer-use.md. |
 | `pithagoras-sync status` | Mode, folders, approvals, elevation, the connection. |
 | `pithagoras-sync gui [<link>]` | The graphical flow ([install.md](install.md)): install, pair (from a `pithagoras-sync://` link the browser hands over, or one pasted in), status, the log, an update, uninstall with or without `--purge`. The program started with no command from a file manager or the menu, or with a pairing link alone, runs it too. It runs the code of `install`, `pair`, `update` and `uninstall` and changes no setting of its own; see "The graphical flow" below. |
 | `pithagoras-sync uninstall --purge [--yes] [--print]` | Stops the client, undoes `install` and removes its pairing, config (folders and policy included), token, stored password, audit log, log and update records; the program stays. On Linux refused from the commands the client runs; on Windows commands run unconfined and can run it (see `windows.md`). |

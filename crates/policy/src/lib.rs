@@ -24,10 +24,11 @@ pub mod win;
 pub use approve::{Answer, ApprovalRequest, Approver, BoxFuture, NoApprover};
 pub use audit::{AuditLog, AuditRecord};
 pub use config::{
-    Access, DeviceConfig, Dirs, FolderGrant, FoldersShell, Mode, Policy, PortalConfig, Profile,
+    Access, ComputerUseOptions, Consent, DeviceConfig, Dirs, FolderGrant, FoldersShell, Mode,
+    Policy, PortalConfig, Profile,
 };
 pub use engine::{
     Call, Clock, Confine, Engine, EngineOptions, Event, LandlockRules, Permit, Refusal, Request,
-    system_clock,
+    ScreenRefusal, ScreenRequest, system_clock,
 };
 pub use queue::{AnswerError, ApprovalEvent, ApprovalQueue};

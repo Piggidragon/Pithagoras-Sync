@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 use sync_policy::config::SecretStorage;
-use sync_policy::{DeviceConfig, Mode};
+use sync_policy::{Consent, DeviceConfig, Mode};
 
 pub enum Op {
     Set(Value),
@@ -129,6 +129,17 @@ pub fn edit_on(
     } else {
         next.policy.full.until_ms = None;
     }
+    // An allow of computer use always has an end, dated here by its own command.
+    let (old_cu, new_cu) = (&cfg.policy.computer_use, &mut next.policy.computer_use);
+    if new_cu.until_ms != old_cu.until_ms {
+        return Err("policy.computer_use.until_ms is set by `pithagoras-sync computer-use allow --minutes N`".into());
+    }
+    if new_cu.consent != old_cu.consent {
+        if new_cu.consent == Consent::Allow {
+            return Err("allowing computer use takes a time: `pithagoras-sync computer-use allow --minutes N` (at most 480)".into());
+        }
+        new_cu.until_ms = None;
+    }
     // The password in the keyring is for sudo, which Windows has not.
     if windows
         && next.policy.privilege.secret_storage == SecretStorage::Keyring
@@ -188,6 +199,42 @@ mod tests {
             );
         }
         assert!(edit(&cfg, "policy.mode", Op::Add(parse_value("x")), 0).is_err());
+    }
+
+    #[test]
+    fn computer_use_is_allowed_only_for_a_time() {
+        let cfg = DeviceConfig::default();
+        let key = "policy.computer_use.consent";
+        assert!(edit(&cfg, key, Op::Set(parse_value("allow")), 0).is_err());
+        assert!(
+            edit(
+                &cfg,
+                "policy.computer_use.until_ms",
+                Op::Set(parse_value("99999999999999")),
+                0
+            )
+            .is_err()
+        );
+        let c = edit(&cfg, key, Op::Set(parse_value("ask")), 0).unwrap();
+        assert_eq!(c.policy.computer_use.consent, Consent::Ask);
+        let mut allowed = cfg.clone();
+        allowed
+            .policy
+            .computer_use
+            .set(Consent::Allow, Some(5), 0)
+            .unwrap();
+        let c = edit(&allowed, key, Op::Set(parse_value("off")), 0).unwrap();
+        assert_eq!(c.policy.computer_use.until_ms, None);
+        let c = edit(
+            &cfg,
+            "policy.computer_use.auto_update",
+            Op::Set(parse_value("false")),
+            0,
+        )
+        .unwrap();
+        assert!(!c.policy.computer_use.auto_update);
+        // The installed servers are the device's record, not a setting.
+        assert!(edit(&cfg, "mcp", Op::Set(parse_value("{}")), 0).is_err());
     }
 
     #[test]
