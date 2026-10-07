@@ -24,6 +24,10 @@ pub const APPROVAL_LIST: &str = "approval.list";
 pub const POLICY_GET: &str = "policy.get";
 /// Replaces the device's settings (`portal_policy = write` only).
 pub const POLICY_SET: &str = "policy.set";
+/// Computer use: the MCP servers installed on the device and their allowed tools.
+pub const MCP_LIST: &str = "mcp.list";
+/// Computer use: one call of an allowed tool of an MCP server on the device.
+pub const MCP_CALL: &str = "mcp.call";
 
 /// Portal to device notification: a chat's grant of this device ended.
 pub const GRANT_END: &str = "grant.end";
@@ -35,6 +39,8 @@ pub const AUDIT: &str = "audit";
 pub const APPROVAL_REQUESTED: &str = "approval.requested";
 pub const APPROVAL_RESOLVED: &str = "approval.resolved";
 pub const POLICY_CHANGED: &str = "policy.changed";
+/// The list `mcp.list` returns, or the consent, changed.
+pub const MCP_CHANGED: &str = "mcp.changed";
 
 /// Capabilities phase 1 announces in `hello`.
 pub const CAPABILITIES: &[&str] = &["fs", "grep", "find", "exec", "probe"];
@@ -42,6 +48,9 @@ pub const CAPABILITIES: &[&str] = &["fs", "grep", "find", "exec", "probe"];
 pub const CAP_APPROVALS: &str = "approvals";
 /// Added when the device shares its settings (`portal_policy` read or write).
 pub const CAP_POLICY: &str = "policy";
+/// Added when the device serves computer use (`mcp.list`, `mcp.call`,
+/// `mcp.changed`), whether or not a server is installed yet.
+pub const CAP_MCP: &str = "mcp";
 
 /// Which chat a call comes from, and the portal guard's taint flag for it. The
 /// device keeps its own taint and only ever adds the portal's flag to it.
@@ -387,8 +396,10 @@ pub struct DeviceInfo {
     /// The pi tools switched on; the portal offers the device to these only.
     #[serde(default)]
     pub tools: Vec<PiTool>,
-    /// Computer-use tools; always empty in phase 1.
-    pub mcp_tools: Vec<serde_json::Value>,
+    /// Computer use: the allowed tools of the installed MCP servers, as
+    /// `mcp.list` lists them (empty when none is installed).
+    #[serde(default)]
+    pub mcp_tools: Vec<McpToolRef>,
     pub client_version: String,
 }
 
@@ -402,6 +413,10 @@ pub struct Hello {
     /// As in `DeviceInfo::shell`.
     pub shell: String,
     pub capabilities: Vec<String>,
+    /// With `mcp` in `capabilities`: the `version` of what `mcp.list` returns
+    /// now, so a portal can tell whether the tools it registered are current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_version: Option<String>,
 }
 
 /// Device to portal: one decision for the portal's Audit page. Only decisions are
@@ -559,6 +574,132 @@ pub struct PolicyDocument {
     pub device_only: Vec<String>,
 }
 
+/// Whether the agent may use the screen, pointer and keyboard
+/// (`policy.computer_use.consent`). Set on the device only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Consent {
+    /// Every computer-use call is refused.
+    #[default]
+    Off,
+    /// Each chat asks the owner, through the approval path.
+    Ask,
+    /// Allowed without asking until `until_ms`, then back to `off`.
+    Allow,
+}
+
+impl Consent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Consent::Off => "off",
+            Consent::Ask => "ask",
+            Consent::Allow => "allow",
+        }
+    }
+}
+
+/// Longest server or tool name `mcp.call` takes, in bytes.
+pub const MAX_MCP_NAME: usize = 64;
+/// Most bytes of `mcp.call`'s `args`, as JSON.
+pub const MAX_MCP_ARGS: usize = 64 * 1024;
+/// Most content items of one `mcp.call` result.
+pub const MAX_MCP_ITEMS: usize = 16;
+/// Most text of one `mcp.call` result, all text items together, in bytes.
+pub const MAX_MCP_TEXT: usize = 1024 * 1024;
+/// Most base64 characters of one image item.
+pub const MAX_MCP_IMAGE: usize = 3 * 1024 * 1024;
+/// Most bytes of one `mcp.call` result as JSON: well below the 4 MiB message.
+pub const MAX_MCP_RESULT: usize = 3 * 1024 * 1024 + 512 * 1024;
+/// The image types `mcp.call` passes on.
+pub const MCP_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+
+/// `mcp.call`. `ctx` is the context of every other call; its `tool` label must
+/// be absent, since no pi tool fits computer use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCallParams {
+    pub server: String,
+    pub tool: String,
+    /// The tool's arguments; an object, checked against the input schema the
+    /// server listed before the server sees it.
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    pub ctx: Ctx,
+}
+
+/// One item of an `mcp.call` result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum McpContent {
+    Text {
+        text: String,
+    },
+    Image {
+        /// One of `MCP_IMAGE_TYPES`.
+        mime: String,
+        /// Base64 (standard alphabet, padded).
+        data: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpCallResult {
+    pub content: Vec<McpContent>,
+    /// The tool itself reported a failure (MCP's `isError`); `content` says what.
+    pub is_error: bool,
+}
+
+/// One allowed tool of a server, as `mcp.list` lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: String,
+    /// The JSON Schema of `args`, as the server listed it when it was installed.
+    pub input_schema: serde_json::Value,
+    /// Pointer or keyboard input: the device checks before each call that no
+    /// window of Pithagoras Sync is open or focused.
+    pub input: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// The pinned version installed.
+    pub version: String,
+    /// `ready`, or `unavailable` (then `error` says why and `tools` is empty).
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub tools: Vec<McpToolInfo>,
+}
+
+/// `mcp.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpListResult {
+    /// A hash of `servers`; changes whenever they do.
+    pub version: String,
+    pub consent: Consent,
+    /// When an `allow` consent ends (Unix ms); absent otherwise.
+    pub consent_expires_ms: Option<i64>,
+    pub servers: Vec<McpServerInfo>,
+}
+
+/// `device.info`'s short form of an allowed tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolRef {
+    pub server: String,
+    pub tool: String,
+}
+
+/// Device to portal (`mcp.changed`): what `mcp.list` returns, or the consent,
+/// changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpChanged {
+    pub version: String,
+    pub consent: Consent,
+    pub consent_expires_ms: Option<i64>,
+}
+
 /// `POST /sync/v1/pair` body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairRequest {
@@ -611,6 +752,53 @@ mod tests {
         assert!(
             serde_json::from_value::<GrantEndParams>(json!({"chat": "c".repeat(300)})).is_err()
         );
+    }
+
+    #[test]
+    fn mcp_calls_take_an_object_and_nothing_else() {
+        let ok = json!({"server": "s", "tool": "t", "args": {"x": 1}, "ctx": {"chat": "c"}});
+        let p: McpCallParams = serde_json::from_value(ok.clone()).unwrap();
+        assert_eq!(p.args["x"], 1);
+        let mut no_args = ok.clone();
+        no_args.as_object_mut().unwrap().remove("args");
+        assert!(
+            serde_json::from_value::<McpCallParams>(no_args)
+                .unwrap()
+                .args
+                .is_empty()
+        );
+        for bad in [
+            json!({"server": "s", "tool": "t", "args": [1], "ctx": {"chat": "c"}}),
+            json!({"server": "s", "tool": "t", "args": "x", "ctx": {"chat": "c"}}),
+            json!({"server": "s", "tool": "t", "ctx": {"chat": "c", "consent": true}}),
+            json!({"server": "s", "tool": "t", "ctx": {"chat": "c"}, "approved": true}),
+            json!({"server": "s", "tool": "t"}),
+        ] {
+            assert!(
+                serde_json::from_value::<McpCallParams>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_content_is_text_or_an_image() {
+        let r = McpCallResult {
+            content: vec![
+                McpContent::Text { text: "hi".into() },
+                McpContent::Image {
+                    mime: "image/png".into(),
+                    data: "AA==".into(),
+                },
+            ],
+            is_error: false,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v,
+            json!({"content": [{"type": "text", "text": "hi"}, {"type": "image", "mime": "image/png", "data": "AA=="}], "is_error": false})
+        );
+        assert_eq!(Consent::default(), Consent::Off);
     }
 
     #[test]

@@ -923,7 +923,7 @@ fn spawn(
 }
 
 #[cfg(windows)]
-mod win {
+pub mod win {
     //! Job Objects: every process in a job dies with `TerminateJobObject`, and with
     //! kill-on-close when the client itself goes away.
 

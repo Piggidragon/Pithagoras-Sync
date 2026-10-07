@@ -261,6 +261,30 @@ impl Lang {
         }
     }
 
+    /// After the install: whether the computer-use server comes too.
+    pub fn computer_use_question(self) -> &'static str {
+        self.pick(
+            "Also install computer use?\n\nIt lets the portal's agent see this screen and use the pointer and keyboard, through a separate program (an MCP server) that Pithagoras Sync downloads, checks and keeps in its own folder. It stays off until you allow it (`pithagoras-sync computer-use ask` or `allow --minutes N`); allowed, it is as strong as Full mode: the agent can click and type anything you can.",
+            "Auch Computersteuerung installieren?\n\nDamit kann der Agent des Portals diesen Bildschirm sehen und Maus und Tastatur benutzen, über ein eigenes Programm (einen MCP-Server), das Pithagoras Sync herunterlädt, prüft und in seinem eigenen Ordner ablegt. Sie bleibt aus, bis du sie erlaubst (`pithagoras-sync computer-use ask` oder `allow --minutes N`); erlaubt ist sie so mächtig wie der Modus Full: Der Agent kann alles anklicken und eintippen, was du kannst.",
+        )
+    }
+
+    pub fn computer_use_installed(self, what: &str) -> String {
+        match self {
+            Lang::En => format!("Computer use ({what}) is installed and off until you allow it."),
+            Lang::De => format!(
+                "Die Computersteuerung ({what}) ist installiert und aus, bis du sie erlaubst."
+            ),
+        }
+    }
+
+    pub fn computer_use_failed(self, e: &str) -> String {
+        match self {
+            Lang::En => format!("Computer use was not installed: {e}"),
+            Lang::De => format!("Die Computersteuerung wurde nicht installiert: {e}"),
+        }
+    }
+
     /// Installed with the link left empty, and not paired.
     pub fn installed_not_paired(self) -> &'static str {
         self.pick(

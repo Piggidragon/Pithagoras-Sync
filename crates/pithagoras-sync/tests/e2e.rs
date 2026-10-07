@@ -904,6 +904,14 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "sudo clear --deactivate",
         "update --manifest /nowhere/manifest.json",
         "uninstall --purge --yes",
+        "computer-use install",
+        "computer-use allow --minutes 5",
+        "computer-use ask",
+        "computer-use test",
+        "computer-use update",
+        "computer-use rollback",
+        "computer-use setup --yes",
+        "computer-use uninstall",
     ]
     .iter()
     .enumerate()
@@ -1683,6 +1691,14 @@ async fn commands_run_without_a_display_or_a_bus() {
         &["update", "--check"],
         &["approvals"],
         &["toggle"],
+        &["install", "--computer-use", "--print"],
+        &["computer-use", "install", "--print"],
+        &["computer-use", "status"],
+        &["computer-use", "status", "--json"],
+        &["computer-use", "test"],
+        &["computer-use", "setup"],
+        &["computer-use", "update", "--check"],
+        &["computer-use", "uninstall"],
         &[
             "pair",
             "pithagoras-sync://pair?portal=https://x.example&code=A B",

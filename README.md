@@ -2,7 +2,7 @@
 
 Lets the agent of your [Pithagoras](https://github.com/thecodacus/pithagoras) portal reach your own computers, the way a file-sync client reaches the cloud: pair once, it starts with the machine, reconnects by itself, and from then on the agent can use that computer's files, shell and git when a chat is granted the device.
 
-**Status: 0.0.1.** It is the background client without a GUI (phase 1); 0.1.0 is the release where all of phase 1 is done. The portal side is the Devices add-on of the portal (`thecodacus/pithagoras#87`, not merged yet); until it is, the client can be tried against a mock portal or a portal that runs that branch. The desktop app with overlay, voice and computer use is phase 2.
+**Status: 0.0.1.** It is the background client without a GUI (phase 1); 0.1.0 is the release where all of phase 1 is done. The portal side is the Devices add-on of the portal (`thecodacus/pithagoras#87`, not merged yet); until it is, the client can be tried against a mock portal or a portal that runs that branch. Computer use (the agent sees the screen and uses the pointer and keyboard, see below) comes with 0.0.3. The desktop app with overlay and voice is phase 2.
 
 ## Platforms
 
@@ -86,6 +86,19 @@ Double clicking the downloaded program installs and pairs it (above). In PowerSh
 
 `install` copies it to `%LOCALAPPDATA%\Programs\pithagoras-sync`, adds a logon task that starts it at logon and again within a minute if it stops, and registers it for `pithagoras-sync://` links (under `HKEY_CURRENT_USER`); it needs no admin rights. The connector token is kept in the Windows Credential Manager (`token_storage`, [docs/permissions.md](docs/permissions.md)). The task runs the client without elevation, even when `install` ran in an elevated PowerShell; started by hand in an elevated one, the client refuses to run unless you allow it. Until it is paired the client waits, and `pair` makes it connect at once. You never start it yourself (`pithagoras-sync run` is only for running it by hand in a terminal, for debugging). The installed copy is not on the `PATH`; the downloaded file does the same for every later command (`.\pithagoras-sync.exe status`). Commands run in PowerShell. Windows has no shell sandbox yet, so in Folders mode every command asks unless you allow an unconfined shell, and `sudo` commands are Linux only (`pithagoras-sync sudo` says so). Each time the task starts the client (at logon, and again after a stop or an update) a console window can flash for a fraction of a second; the graphical install of 0.0.2 does not change that; a launcher without console is explored later (issue #6). Details are in [docs/windows.md](docs/windows.md).
 
+## Computer use
+
+The agent can also see a computer's screen and use its pointer and keyboard, through an MCP server the client installs and runs itself (`computer-use-linux` on Linux, Windows-MCP with a Python of its own on Windows):
+
+```sh
+pithagoras-sync computer-use install      # the pinned server, hash-checked (or: install --computer-use)
+pithagoras-sync computer-use setup        # what it needs on this desktop, step by step
+pithagoras-sync computer-use test         # a screenshot, the pointer moved 10 px and back
+pithagoras-sync computer-use ask          # each chat asks before its first call; or: allow --minutes N, off
+```
+
+It is off until you switch it on, on the device only, and allowed it is as strong as Full mode: the agent can click and type anything you can, a terminal included. Only an allow-list of exact tool names is ever called (screenshots, windows, pointer, typing, keys), input is refused while a Pithagoras Sync window is open, every call marks its chat as having seen untrusted content, and `panic` stops it. `pithagoras-sync update` keeps the server current from a signed list of pins, also between client releases. Details, the risk and the setup per desktop: [docs/computer-use.md](docs/computer-use.md).
+
 ## Commands as root (sudo)
 
 On Linux, the agent can run `sudo <command>` if you allow it and type your password on the device, never in the portal:
@@ -147,12 +160,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The tests use temporary folders and a mock portal. They never touch your real config, systemd or a real portal. `scripts/windows-vm-test.sh <host>` runs the Windows tests on a Windows machine over ssh.
+The tests use temporary folders, a mock portal and a fake MCP server. They never touch your real config, systemd, your screen or a real portal. The end-to-end tests start the client, which refuses to run as root: run them as an ordinary user. `scripts/windows-vm-test.sh <host>` runs the Windows tests on a Windows machine over ssh.
 
 ## Documentation
 
 - [docs/install.md](docs/install.md): installing, pairing and uninstalling by double click, window by window.
 - [docs/permissions.md](docs/permissions.md): every setting, its default, and who may change it.
+- [docs/computer-use.md](docs/computer-use.md): computer use, its risk, install, setup and consent; [docs/mcp-pins.md](docs/mcp-pins.md) and [docs/mcp-updates.md](docs/mcp-updates.md): the pinned servers and how the pins are updated.
 - [docs/protocol.md](docs/protocol.md): the wire protocol between portal and device, and the decisions still open.
 - [docs/testing.md](docs/testing.md): the tests, the tools for trying a client by hand, and the record of the test machine.
 - [docs/windows.md](docs/windows.md): how the Windows client differs, what was tested and what was not.

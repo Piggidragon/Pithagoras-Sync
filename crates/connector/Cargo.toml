@@ -23,6 +23,7 @@ futures-util.workspace = true
 httparse.workspace = true
 ring.workspace = true
 base64.workspace = true
+minisign-verify.workspace = true
 
 [dev-dependencies]
 sync-testkit.workspace = true

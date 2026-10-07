@@ -58,9 +58,12 @@ pub struct ApprovalRequest {
     pub reasons: Vec<String>,
     /// A short preview of what a write puts there.
     pub preview: Option<String>,
-    /// Whether "allow for this chat" and "for a time" may be offered (file tools in
-    /// Ask mode only; a standing approval of the shell would cover any command).
+    /// Whether "allow for this chat" may be offered (file tools in Ask mode, and
+    /// the consent of computer use; a standing approval of the shell would cover
+    /// any command).
     pub offer_chat: bool,
+    /// Whether "allow for a time" may be offered (file tools in Ask mode only).
+    pub offer_time: bool,
     /// The longest "for a time" answer.
     pub max_minutes: u32,
     /// When the engine stops waiting (Unix ms).

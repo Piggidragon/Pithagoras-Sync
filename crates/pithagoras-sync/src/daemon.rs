@@ -51,6 +51,10 @@ pub struct Daemon {
     /// for the one before a new pairing is not reported connected: the window
     /// that paired waits for the new one.
     linked: std::sync::Mutex<Option<PortalConfig>>,
+    /// Computer use: the installed servers and their calls.
+    mcp: Arc<sync_mcp::Service>,
+    /// How the last look for new pins went, for `computer-use status`.
+    mcp_update: std::sync::Mutex<Option<String>>,
 }
 
 /// Why a request on the keyring was cut off at `control::keyring_work`.
@@ -60,7 +64,7 @@ const KEYRING_SLOW: &str = "the keyring did not finish in time (a prompt left op
 /// shown as a notification (Allow once / Deny) answering the same queue. Off by
 /// default; the device's own dialog replaces it in phase 2.
 #[cfg(unix)]
-async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
+async fn mirror_to_notifications(queue: Arc<ApprovalQueue>, computer_use: ComputerUseGate) -> bool {
     use std::collections::HashMap;
     use sync_policy::notify::NotifyApprover;
     let Some(n) = NotifyApprover::connect().await else {
@@ -74,7 +78,7 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
         loop {
             match events.recv().await {
                 Ok(ApprovalEvent::Requested(info)) => {
-                    let (n, q) = (n.clone(), queue.clone());
+                    let (n, q, cu) = (n.clone(), queue.clone(), computer_use.clone());
                     let id = info.id;
                     shown.insert(
                         id,
@@ -88,11 +92,17 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
                                 reasons: info.reasons,
                                 preview: info.preview,
                                 offer_chat: false,
+                                offer_time: false,
                                 max_minutes: info.max_minutes,
                                 expires_ms: info.expires_ms,
                                 on_timeout_allow: false,
                             };
                             let choice = match n.ask(&req).await {
+                                // A click while computer use is active may be
+                                // the agent's own: it counts as no.
+                                _ if cu.get().is_some_and(|s| s.active()) => {
+                                    sync_proto::methods::Choice::Deny
+                                }
                                 Answer::Deny => sync_proto::methods::Choice::Deny,
                                 _ => sync_proto::methods::Choice::Once,
                             };
@@ -113,6 +123,10 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
     });
     true
 }
+
+/// The computer-use service, once the client made it, for what answers
+/// approvals beside the control channel.
+type ComputerUseGate = Arc<std::sync::OnceLock<Arc<sync_mcp::Service>>>;
 
 fn now_ms() -> i64 {
     system_clock()()
@@ -145,13 +159,14 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         return Err(root_refusal(cfg!(windows)));
     }
     let queue = ApprovalQueue::new(system_clock());
+    let gate: ComputerUseGate = Arc::default();
     #[allow(unused_mut)]
     let mut approvals =
         "through the portal's Devices tab and `pithagoras-sync approve`".to_string();
     #[cfg(unix)]
     if cfg.policy.approvals.desktop_notifications
         && cfg.profile == Profile::Desktop
-        && mirror_to_notifications(queue.clone()).await
+        && mirror_to_notifications(queue.clone(), gate.clone()).await
     {
         approvals.push_str(", and as desktop notifications");
     }
@@ -209,7 +224,33 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         Some(store.clone()),
     );
     crate::secrets::scrub_log_with(device.secrets.clone());
-    device.engine.seal(vec![crate::secrets::file(&dirs)]);
+    // No file tool reaches the stored secret or the computer-use servers.
+    device
+        .engine
+        .seal(vec![crate::secrets::file(&dirs), dirs.mcp_dir()]);
+    #[cfg(unix)]
+    let indicator: Arc<dyn sync_mcp::service::Indicator> = if cfg.profile == Profile::Desktop {
+        Arc::new(sync_mcp::service::Notification)
+    } else {
+        Arc::new(sync_mcp::service::NoIndicator)
+    };
+    #[cfg(not(unix))]
+    let indicator: Arc<dyn sync_mcp::service::Indicator> = Arc::new(sync_mcp::service::NoIndicator);
+    let mcp = sync_mcp::Service::new(
+        device.engine.clone(),
+        sync_mcp::service::Options {
+            dir: dirs.mcp_dir(),
+            os: sync_mcp::os().into(),
+            base_env: std::env::vars().collect(),
+            limits: sync_mcp::Limits::default(),
+            indicator,
+            active_ms: crate::computer_use::active_ms(),
+        },
+    );
+    mcp.reload(cfg.mcp.clone(), crate::computer_use::store(&dirs).current())
+        .await;
+    device.set_computer_use(mcp.clone());
+    let _ = gate.set(mcp.clone());
     let keyring = sync_policy::keyring::system(&dirs);
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
@@ -248,6 +289,8 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         secret_gen: std::sync::Mutex::new(0),
         secret_writes: tokio::sync::Mutex::new(()),
         linked: std::sync::Mutex::new(None),
+        mcp,
+        mcp_update: std::sync::Mutex::new(None),
     });
 
     // The file (or nothing, for memory) before the link starts: reading it waits
@@ -271,6 +314,8 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         status_tx,
         shutdown.clone(),
     ));
+    tokio::spawn(watch_consent(daemon.clone(), shutdown.clone()));
+    tokio::spawn(daily_pins(daemon.clone(), shutdown.clone()));
     // The keyring after the control channel is up: it may ask the owner to
     // unlock it, and `panic` must reach the client meanwhile.
     if daemon.store.config().policy.privilege.secret_storage == SecretStorage::Keyring {
@@ -281,6 +326,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     shutdown_tx.send_replace(true);
     let _ = tokio::time::timeout(Duration::from_secs(15), supervisor).await;
     device.execs.kill_all().await;
+    daemon.mcp.stop_all().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), control).await;
     Ok(daemon.restarting.load(std::sync::atomic::Ordering::SeqCst))
 }
@@ -360,7 +406,11 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
                 _ = int.recv() => return,
                 _ = daemon.restart.notified() => return,
                 _ = hup.recv() => {
-                    if let Err(e) = daemon.reload() {
+                    // As the control socket's reload: the agent could have
+                    // typed both the file and the signal.
+                    if daemon.mcp.active() {
+                        warn!("reload refused: {}", crate::owner::COMPUTER_USE_ACTIVE);
+                    } else if let Err(e) = daemon.reload().await {
                         warn!("reload failed, keeping the old config: {e}");
                     }
                 }
@@ -396,13 +446,34 @@ impl Daemon {
 
     /// Takes the config file as it is now. A bad file leaves the running policy as it
     /// was.
-    pub fn reload(&self) -> Result<(), String> {
+    pub async fn reload(&self) -> Result<(), String> {
         let cfg = self.store.reload()?;
         if let Some(p) = &cfg.portal {
             self.device.set_name(p.name.clone());
         }
+        // Waits for the calls in flight before a server changes.
+        self.mcp
+            .reload(
+                cfg.mcp.clone(),
+                crate::computer_use::store(&self.dirs).current(),
+            )
+            .await;
+        self.mcp.announce();
         let _ = self.relink.try_send(());
         info!("config reloaded");
+        Ok(())
+    }
+
+    /// Takes the installed servers' record from the file and the pins in
+    /// force, and nothing else of the file: what the daily look changed. The
+    /// file may hold edits typed while computer use was active, which only
+    /// the owner's reload takes.
+    async fn reload_servers(&self) -> Result<(), String> {
+        let cfg = self.store.reload_mcp()?;
+        self.mcp
+            .reload(cfg.mcp, crate::computer_use::store(&self.dirs).current())
+            .await;
+        self.mcp.announce();
         Ok(())
     }
 
@@ -441,7 +512,80 @@ impl Daemon {
             config_file: self.dirs.config_file().to_string_lossy().into_owned(),
             audit_file: self.dirs.audit_file().to_string_lossy().into_owned(),
             exe: self.exe.to_string_lossy().into_owned(),
+            computer_use: self.computer_use_line(&cfg),
+            computer_use_active: self.mcp.active(),
         }
+    }
+
+    fn computer_use_line(&self, cfg: &DeviceConfig) -> String {
+        let consent = crate::computer_use::consent_text(cfg, now_ms());
+        let list = self.mcp.list();
+        let servers: Vec<String> = list
+            .servers
+            .iter()
+            .map(|s| match &s.error {
+                Some(e) => format!("{} {} (unavailable: {e})", s.name, s.version),
+                None => format!("{} {}", s.name, s.version),
+            })
+            .collect();
+        let mut line = format!(
+            "consent {consent}; {}",
+            if servers.is_empty() {
+                "no server installed".to_string()
+            } else {
+                servers.join(", ")
+            }
+        );
+        if let Some(u) = self.mcp.in_use()
+            && now_ms() - u.last_ms < 10 * 60_000
+        {
+            line.push_str(&format!(
+                "; in use by chat {} (last call {})",
+                sync_policy::approve::visible(&u.chat),
+                crate::update::utc((u.last_ms / 1000) as u64)
+            ));
+        }
+        line
+    }
+
+    /// `panic` takes an allow of computer use back, in the running client
+    /// and in the file each (an allow only the file holds, typed while a
+    /// reload was refused, would come live at the next start): `unlock` does
+    /// not give it again. An `ask` stays.
+    fn consent_off_after_panic(&self) -> Result<(), String> {
+        self.narrow_consent("panic", |cfg| {
+            cfg.policy.computer_use.consent == Consent::Allow
+        })
+    }
+
+    /// Switches computer use off in the running client, then in the file,
+    /// taking nothing else from the file (it may hold what the agent typed
+    /// into an editor while computer use was active). An error says the file
+    /// may still hold the old consent: the running client is off all the same.
+    fn consent_off(&self, why: &str) -> Result<(), String> {
+        self.narrow_consent(why, |_| true)
+    }
+
+    /// Switches computer use off wherever `whether` says, in the running
+    /// client and in the file each.
+    fn narrow_consent(
+        &self,
+        why: &str,
+        whether: impl Fn(&DeviceConfig) -> bool,
+    ) -> Result<(), String> {
+        let r = self.store.update(why, |cfg| {
+            if whether(cfg) {
+                cfg.policy.computer_use.consent = Consent::Off;
+                cfg.policy.computer_use.until_ms = None;
+            }
+        });
+        self.mcp.announce();
+        r.map_err(|e| {
+            warn!("{why} could not switch computer use off in the config file: {e}");
+            format!(
+                "the running client allows no computer use without asking now, but the config file could not be changed ({e}): it may still allow computer use and would allow it again at the next start or reload. Fix the file, then run `pithagoras-sync computer-use off` again"
+            )
+        })
     }
 
     async fn handle(&self, req: Request) -> Reply {
@@ -456,10 +600,14 @@ impl Daemon {
                     warn!("cannot write the pause marker: {e}");
                 }
                 self.device.pause().await;
+                self.mcp.stop_all().await;
                 // Kept in memory only, the secret is gone until the owner types it
                 // again; a stored one comes back with unlock.
                 self.drop_secret();
-                Reply::ok()
+                match self.consent_off_after_panic() {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => Reply::err(format!("paused, but {e}")),
+                }
             }
             Request::Unlock => {
                 if let Err(e) = std::fs::remove_file(self.dirs.paused_file())
@@ -483,7 +631,7 @@ impl Daemon {
                     )),
                 }
             }
-            Request::Reload => match self.reload() {
+            Request::Reload => match self.reload().await {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),
             },
@@ -503,6 +651,44 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e.to_string()),
             },
+            Request::ComputerUseOff => {
+                match self.consent_off("the device owner (computer-use off)") {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => Reply::err(e),
+                }
+            }
+            Request::McpStatus { probe } => Reply {
+                mcp: Some(crate::control::McpReport {
+                    servers: self.mcp.status(probe).await,
+                    in_use: self.mcp.in_use(),
+                    test: Vec::new(),
+                    last_update: self.mcp_update.lock().unwrap().clone(),
+                }),
+                ..Reply::ok()
+            },
+            Request::McpTest { verbose } => {
+                let Some(name) = self.mcp.list().servers.first().map(|s| s.name.clone()) else {
+                    return Reply::err(
+                        "no computer-use server is installed: `pithagoras-sync computer-use install`",
+                    );
+                };
+                match self
+                    .mcp
+                    .with_client(&name, |c, pin| {
+                        Box::pin(sync_mcp::selftest::run(c, pin, verbose))
+                    })
+                    .await
+                {
+                    Ok(test) => Reply {
+                        mcp: Some(crate::control::McpReport {
+                            test,
+                            ..Default::default()
+                        }),
+                        ..Reply::ok()
+                    },
+                    Err(e) => Reply::err(e),
+                }
+            }
             Request::Restart => {
                 info!("restarting on the owner's request");
                 self.restarting
@@ -705,6 +891,60 @@ async fn load_from_keyring(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) 
     }
 }
 
+/// Sends `mcp.changed` when an allow of computer use runs out (nothing else
+/// tells the portal then).
+async fn watch_consent(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(15)) => d.mcp.announce(),
+            _ = until(&mut shutdown) => return,
+        }
+    }
+}
+
+/// Once a day, at a random time, looks for new signed pins and updates the
+/// installed servers (`policy.computer_use.auto_update`). The new version is
+/// switched to once no call is in flight. While the device is paused or
+/// computer use is off, the pins are taken but nothing is installed.
+async fn daily_pins(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
+    let mut next = crate::computer_use::first_check_ms(now_ms());
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(crate::computer_use::check_tick()) => {}
+            _ = until(&mut shutdown) => return,
+        }
+        let cfg = d.store.config();
+        if !crate::computer_use::check_due(&cfg, now_ms(), next) {
+            continue;
+        }
+        next = now_ms() + crate::computer_use::CHECK_EVERY_MS;
+        let mut lines = Vec::new();
+        let dirs = d.dirs.clone();
+        let hold = crate::computer_use::hold_updates(d.device.engine.is_paused(), &cfg, now_ms());
+        let r = crate::computer_use::update(&dirs, false, hold, &mut |l| lines.push(l)).await;
+        let summary = match r {
+            Ok(u) if u.changed.is_empty() && u.notes.is_empty() => "up to date".to_string(),
+            Ok(u) => u
+                .changed
+                .iter()
+                .map(|c| format!("updated {c}"))
+                .chain(u.notes)
+                .collect::<Vec<_>>()
+                .join("; "),
+            Err(e) => e,
+        };
+        info!("computer use, daily look for new pins: {summary}");
+        *d.mcp_update.lock().unwrap() = Some(format!(
+            "{} ({})",
+            summary,
+            crate::update::utc((now_ms() / 1000) as u64)
+        ));
+        if let Err(e) = d.reload_servers().await {
+            warn!("computer use: the servers were not reloaded: {e}");
+        }
+    }
+}
+
 /// The first wait before reading the token again from a keyring that was not
 /// there; it doubles up to `KEYRING_RETRY_MAX`.
 const KEYRING_RETRY: Duration = Duration::from_secs(3);
@@ -845,6 +1085,16 @@ async fn handle_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         Ok(req) if from_own_command && !req.allowed_from_own_commands() => Reply::err(
             "commands the client runs for the portal cannot change, unlock or reload it, answer its approvals or set its secrets",
         ),
+        // A probe would start or ping the server in use: the status then
+        // says how it is without one.
+        Ok(Request::McpStatus { probe: true }) if d.mcp.active() => {
+            d.handle(Request::McpStatus { probe: false }).await
+        }
+        // The agent may be typing into a terminal of the owner's: what
+        // comes in then could be its own answer.
+        Ok(req) if d.mcp.active() && !req.allowed_while_computer_use() => {
+            Reply::err(crate::owner::COMPUTER_USE_ACTIVE)
+        }
         Ok(req) => d.handle(req).await,
         Err(e) => Reply::err(e),
     };

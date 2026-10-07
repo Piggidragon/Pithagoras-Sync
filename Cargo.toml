@@ -5,6 +5,7 @@ members = [
     "crates/policy",
     "crates/ops",
     "crates/connector",
+    "crates/mcp",
     "crates/testkit",
     "crates/release",
     "crates/pithagoras-sync",
@@ -22,6 +23,7 @@ sync-proto = { path = "crates/proto" }
 sync-policy = { path = "crates/policy" }
 sync-ops = { path = "crates/ops" }
 sync-connector = { path = "crates/connector" }
+sync-mcp = { path = "crates/mcp" }
 sync-testkit = { path = "crates/testkit" }
 sync-release = { path = "crates/release" }
 

@@ -213,10 +213,16 @@ impl Approver for ApprovalQueue {
                     .is_some_and(|c| c.len() > MAX_APPROVAL_TEXT);
             let choices = if cut {
                 vec![Choice::Deny]
-            } else if req.offer_chat {
-                vec![Choice::Once, Choice::Chat, Choice::Time, Choice::Deny]
             } else {
-                vec![Choice::Once, Choice::Deny]
+                let mut c = vec![Choice::Once];
+                if req.offer_chat {
+                    c.push(Choice::Chat);
+                }
+                if req.offer_time {
+                    c.push(Choice::Time);
+                }
+                c.push(Choice::Deny);
+                c
             };
             let info = {
                 let mut inner = self.inner.lock().unwrap();
@@ -279,6 +285,7 @@ mod tests {
             reasons: vec!["Ask mode".into()],
             preview: None,
             offer_chat,
+            offer_time: offer_chat,
             max_minutes: 60,
             expires_ms: i64::MAX,
             on_timeout_allow: false,

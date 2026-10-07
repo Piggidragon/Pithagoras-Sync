@@ -94,6 +94,43 @@ impl ConfigStore {
         }
     }
 
+    /// Changes the settings the client runs by, as `f` says, without taking
+    /// anything else from the file: the device's own narrowing (`panic`,
+    /// `computer-use off`), made also when the file holds edits it would not
+    /// take now. Audited as the owner's. It takes effect in the running client
+    /// first, so a file that cannot be written does not keep it from holding;
+    /// then the same change goes into the file as it is now (what the owner
+    /// wrote there meanwhile stays). An error says the file was not changed.
+    pub fn update(&self, why: &str, f: impl Fn(&mut DeviceConfig)) -> Result<(), String> {
+        let mut next = self.config();
+        f(&mut next);
+        let mut changes = Vec::new();
+        settings::diff("", &owned(&self.config()), &owned(&next), &mut changes);
+        for c in &changes {
+            self.engine.record(
+                None,
+                "policy",
+                &c.key,
+                "changed",
+                Some(format!("by {why}: {} -> {}", c.old, c.new)),
+            );
+        }
+        self.apply(next, why);
+        let mut file = DeviceConfig::load(&self.file)?;
+        f(&mut file);
+        file.save(&self.file)
+    }
+
+    /// Takes the record of the installed computer-use servers from the file,
+    /// and nothing else: the client's own change after it updated a server,
+    /// made also when the file holds edits it would not take now.
+    pub fn reload_mcp(&self) -> Result<DeviceConfig, String> {
+        let file = DeviceConfig::load(&self.file)?;
+        let mut cfg = self.cfg.lock().unwrap();
+        cfg.mcp = file.mcp;
+        Ok(cfg.clone())
+    }
+
     pub fn portal_policy(&self) -> PortalPolicy {
         self.cfg.lock().unwrap().portal_policy
     }
@@ -109,21 +146,31 @@ impl ConfigStore {
         Ok(settings::document(&cfg))
     }
 
-    /// `policy.set`: only with `portal_policy = write`. Based on the file as it is
-    /// now, so a change the owner just made is not overwritten unseen (the
-    /// portal's `if_version` then conflicts). Each changed setting is audited.
+    /// `policy.set`: only with `portal_policy = write`. Checked against the
+    /// file as it is now, so a change the owner just made is not overwritten
+    /// unseen (the portal's `if_version` then conflicts), and against the
+    /// settings the client runs by, which alone take the change: what else
+    /// the file holds (edits typed while computer use was active, say) never
+    /// goes live through a portal message, and a device-only setting changed
+    /// only in the file stays as the client runs it. Each changed setting is
+    /// audited.
     pub fn set_from_portal(&self, params: PolicySetParams) -> Result<PolicyDocument, RpcError> {
         // One change at a time, from the file onwards.
         static SETTING: Mutex<()> = Mutex::new(());
         let _one = SETTING.lock().unwrap();
         let current = self.load().map_err(|e| RpcError::new(code::IO, e))?;
-        let (next, changes) = settings::apply_from_portal(&current, params, system_clock()())
-            .map_err(|e| match e {
-                SetError::Denied(m) => RpcError::denied(m),
-                SetError::Conflict(m) => RpcError::new(code::CONFLICT, m),
-                SetError::Invalid(m) => RpcError::new(code::INVALID_PARAMS, m),
-            })?;
-        next.save(&self.file)
+        let now = system_clock()();
+        let refused = |e| match e {
+            SetError::Denied(m) => RpcError::denied(m),
+            SetError::Conflict(m) => RpcError::new(code::CONFLICT, m),
+            SetError::Invalid(m) => RpcError::new(code::INVALID_PARAMS, m),
+        };
+        let (saved, _) =
+            settings::apply_from_portal(&current, params.clone(), now).map_err(refused)?;
+        let (next, changes) =
+            settings::apply_from_portal(&self.config(), params, now).map_err(refused)?;
+        saved
+            .save(&self.file)
             .map_err(|e| RpcError::new(code::IO, e))?;
         for c in &changes {
             self.engine.record(
@@ -140,11 +187,13 @@ impl ConfigStore {
 }
 
 /// The settings the owner keeps in the file, the pairing aside (`pair` and `unpair`
-/// change that, and it is not a permission).
+/// change that, and it is not a permission) and the record of the installed
+/// computer-use servers (the device's own, which the portal never sees).
 fn owned(cfg: &DeviceConfig) -> serde_json::Value {
     let mut v = serde_json::to_value(cfg).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.remove("portal");
+        o.remove("mcp");
     }
     v
 }

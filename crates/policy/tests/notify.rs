@@ -181,6 +181,7 @@ fn request(offer_chat: bool) -> ApprovalRequest {
         reasons: vec!["protected".into()],
         preview: None,
         offer_chat,
+        offer_time: offer_chat,
         max_minutes: 60,
         expires_ms: i64::MAX,
         on_timeout_allow: false,

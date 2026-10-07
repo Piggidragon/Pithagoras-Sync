@@ -57,6 +57,16 @@ If pairing fails after an install, the window says so and that the program is in
 
 From now on the portal's agent can ask to use this computer. Until you change it, every file access and command asks you first; you answer in the portal's Devices tab. What else you can allow (folders, a mode without questions) is in [permissions.md](permissions.md).
 
+## Computer use (optional)
+
+Right after installing, one more question asks whether to install computer use too:
+
+> Also install computer use? It lets the portal's agent see this screen and use the pointer and keyboard, through a separate program (an MCP server) that Pithagoras Sync downloads, checks and keeps in its own folder. It stays off until you allow it (`pithagoras-sync computer-use ask` or `allow --minutes N`); allowed, it is as strong as Full mode: the agent can click and type anything you can.
+
+**Yes** downloads and checks the server (on Windows with a Python of its own; you need not install one) and says so with the other notes; **No** installs the client alone, and `pithagoras-sync computer-use install` adds it later. It does not switch computer use on: that is your separate choice, made on this computer only, never in the portal. A failure here leaves the client installed and says why. The question shows only where this version of the program has a server pinned for your system ([computer-use.md](computer-use.md), which also has the setup steps for GNOME and what Windows needs).
+
+Pithagoras Sync's own windows are off limits for computer use: while one is open, the agent's clicks and keys are refused.
+
 ## 4. Later: the menu
 
 Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows one window: at the top whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on, read anew each time the window opens (a client that does not answer within two seconds shows as running but not answering, with the rest from the settings; right after an update restarted the client, one that has not answered yet shows as restarting, for up to a minute, instead of not running); below it the actions. **Open** runs the one you picked; **Close** (or closing the window) ends the program, and the client keeps running in the background. (On KDE the two buttons keep kdialog's own labels, OK and Cancel.)

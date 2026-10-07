@@ -901,6 +901,96 @@ async fn with_write_the_portal_changes_the_policy_and_each_change_is_audited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_devices_own_narrowing_holds_without_the_file_and_keeps_the_owners_edits() {
+    let fx = Fx::new();
+    let mut policy = fx.folders(&[("home/proj", Access::Rw)]);
+    let now = system_clock()();
+    policy
+        .computer_use
+        .set(Consent::Allow, Some(60), now)
+        .unwrap();
+    let (dev, _queue, store) = fx.full_device(policy.clone(), PortalPolicy::Off);
+    let off = |c: &mut DeviceConfig| {
+        c.policy.computer_use.consent = Consent::Off;
+        c.policy.computer_use.until_ms = None;
+    };
+    // The owner changed the file meanwhile, and the client has not taken it.
+    let mut cfg = DeviceConfig::load(&fx.config_file()).unwrap();
+    cfg.policy.tools.bash = false;
+    cfg.save(&fx.config_file()).unwrap();
+    store.update("panic", off).unwrap();
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Off
+    );
+    assert!(
+        dev.engine.policy().0.tools.bash,
+        "nothing else taken from the file"
+    );
+    let saved = DeviceConfig::load(&fx.config_file()).unwrap();
+    assert_eq!(saved.policy.computer_use.consent, Consent::Off);
+    assert!(
+        !saved.policy.tools.bash,
+        "the owner's edit stays in the file"
+    );
+
+    // A file that cannot be written: the running client narrows all the same,
+    // and the caller hears that the file is unchanged.
+    let fx = Fx::new();
+    let (dev, _queue, store) = fx.full_device(policy, PortalPolicy::Off);
+    std::fs::remove_file(fx.config_file()).unwrap();
+    std::fs::create_dir(fx.config_file()).unwrap();
+    assert!(store.update("panic", off).is_err());
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Off
+    );
+    assert_eq!(
+        store.config().policy.computer_use.effective(now),
+        Consent::Off
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_message_never_makes_a_file_edit_of_a_device_only_setting_live() {
+    let fx = Fx::new();
+    let mut policy = fx.folders(&[("home/proj", Access::Ro)]);
+    let now = system_clock()();
+    policy.computer_use.set(Consent::Ask, None, now).unwrap();
+    let (dev, _, _store) = fx.full_device(policy, PortalPolicy::Write);
+    let (_mock, dev, r, dl) = connect(dev).await;
+    // Typed into config.toml while computer use was active, not reloaded.
+    let mut cfg = DeviceConfig::load(&fx.config_file()).unwrap();
+    cfg.policy
+        .computer_use
+        .set(Consent::Allow, Some(480), now)
+        .unwrap();
+    cfg.save(&fx.config_file()).unwrap();
+    // The portal echoes the file's computer-use table with a change of its own.
+    let doc = dl.call("policy.get", json!({})).await.unwrap();
+    let mut settings = doc["settings"].clone();
+    settings["policy"]["computer_use"] = serde_json::to_value(&cfg.policy.computer_use).unwrap();
+    settings["policy"]["folders"][0]["access"] = "rw".into();
+    let e = dl.call("policy.set", json!({"settings": settings})).await;
+    assert_eq!(err_code(e), code::DENIED);
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Ask
+    );
+    // Whichever way the portal sends it, while the file and the running
+    // client disagree on it: refused, until the owner reloads or fixes the file.
+    let mut settings = doc["settings"].clone();
+    settings["policy"]["folders"][0]["access"] = "rw".into();
+    let e = dl.call("policy.set", json!({"settings": settings})).await;
+    assert_eq!(err_code(e), code::DENIED);
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Ask
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn tool_labels_only_narrow() {
     let fx = Fx::new();
     let mut policy = fx.folders(&[("home/proj", Access::Rw)]);
