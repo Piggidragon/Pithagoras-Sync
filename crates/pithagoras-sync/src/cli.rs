@@ -1838,12 +1838,21 @@ async fn stop_client(dirs: &Dirs) -> Result<(), String> {
 }
 
 /// What an error of `uninstall --purge` after the stop says about the unit or
-/// task: stopped (or switched off) and how to start it again, or already deleted.
-fn stop_note(stopped: bool, deleted: bool, windows: bool, system: bool) -> String {
-    if !stopped {
-        String::new()
-    } else if deleted {
+/// task, which was as `before` says before the stop (`None`: there was none to
+/// stop): off as it was, how to put it back as it was, or deleted already.
+fn stop_note(
+    before: Option<install::Before>,
+    deleted: bool,
+    windows: bool,
+    system: bool,
+) -> String {
+    let Some(before) = before else {
+        return String::new();
+    };
+    if deleted {
         "\nThe unit or task is deleted already: `install` sets it up again.".into()
+    } else if windows && !before.enabled {
+        "\nThe logon task stays switched off, as it was before.".into()
     } else if windows {
         // The name has a space.
         format!(
@@ -1851,12 +1860,18 @@ fn stop_note(stopped: bool, deleted: bool, windows: bool, system: bool) -> Strin
             install::TASK_NAME
         )
     } else {
+        let what = match (before.enabled, before.running) {
+            (true, true) => "enable --now",
+            (true, false) => "enable",
+            (false, true) => "start",
+            (false, false) => return "\nThe unit stays off, as it was before.".into(),
+        };
         format!(
-            "\nThe unit was stopped: `{} {}` starts it again.",
+            "\nThe unit is off now: `{} {what} {}` puts it back as it was.",
             if system {
-                "sudo systemctl start"
+                "sudo systemctl"
             } else {
-                "systemctl --user start"
+                "systemctl --user"
             },
             install::UNIT_NAME
         )
@@ -1874,27 +1889,35 @@ fn delete_hint(path: &Path) -> String {
 }
 
 /// What an error of `uninstall --purge` after the stop says, once it put back
-/// what the stop did where the unit or task is still `installed`: switched on
-/// and started again, so a purge that failed does not leave the device
-/// offline. Only when that fails too, how to do it by hand.
+/// what the stop changed where the unit or task is still `installed`: switched
+/// on again if it was on, and started again if a client ran, so a purge that
+/// failed neither leaves the device offline nor brings back what the owner had
+/// switched off. Only when that fails too, how to do it by hand.
 fn after_stop_note(
-    stopped: bool,
+    before: Option<install::Before>,
     installed: bool,
     windows: bool,
     system: bool,
     runner: &dyn actions::Runner,
 ) -> String {
-    if !stopped || !installed {
-        return stop_note(stopped, !installed, windows, system);
+    let Some(b) = before.filter(|_| installed) else {
+        return stop_note(before, !installed, windows, system);
+    };
+    let plan = install::restart_plan(windows, system, b);
+    if plan.is_empty() {
+        return stop_note(before, false, windows, system);
     }
-    match actions::apply(
-        &install::restart_plan(windows, system),
-        Path::new("/"),
-        runner,
-    ) {
-        Ok(_) if windows => "\nThe logon task was switched on again and starts the client.".into(),
-        Ok(_) => "\nThe unit was started again.".into(),
-        Err(_) => stop_note(true, false, windows, system),
+    match actions::apply(&plan, Path::new("/"), runner) {
+        Ok(_) if windows && b.running => {
+            "\nThe logon task was switched on again and starts the client.".into()
+        }
+        Ok(_) if windows => "\nThe logon task was switched on again.".into(),
+        Ok(_) => match (b.enabled, b.running) {
+            (true, true) => "\nThe unit was switched on and started again.".into(),
+            (true, false) => "\nThe unit was switched on again.".into(),
+            _ => "\nThe unit was started again.".into(),
+        },
+        Err(_) => stop_note(before, false, windows, system),
     }
 }
 
@@ -2169,6 +2192,10 @@ pub(crate) async fn purge(
         hints.extend(actions::apply(plan, Path::new("/"), &actions::System)?);
         Ok(())
     };
+    // What the unit or task is before the stop, so a purge that fails puts
+    // back only that.
+    let before = (!stop.is_empty())
+        .then(|| install::state_before(cfg!(windows), system, &runner, running.is_some()));
     apply(&stop)?;
     // From here on an error comes after the unit or task was stopped, and may
     // come after part of it was removed: it says so, and that running this again
@@ -2176,7 +2203,7 @@ pub(crate) async fn purge(
     let deleted = std::cell::Cell::new(false);
     let after_stop = |e: String| {
         let note = after_stop_note(
-            !stop.is_empty(),
+            before,
             !deleted.get() && is_installed(),
             cfg!(windows),
             system,
@@ -2458,53 +2485,105 @@ mod tests {
     }
 
     /// A purge that fails after the stop while the unit or task is still there
-    /// switches it on and starts it again; only when that fails too it says how.
+    /// puts back what was on before, and nothing else: a task or unit the
+    /// owner had switched off stays off, and a client that was not running is
+    /// not started. Only when putting back fails it says how.
     #[test]
-    fn a_failed_purge_starts_the_client_again() {
+    fn a_failed_purge_puts_back_only_what_was_on() {
         use super::after_stop_note;
         use crate::actions::{Fake, argv};
+        use crate::install::Before;
+        let on = Before {
+            enabled: true,
+            running: true,
+        };
+        let off = Before {
+            enabled: false,
+            running: false,
+        };
         let task = |a: &str| argv(&["schtasks", a, "/TN", "Pithagoras Sync"]);
-        let fake = Fake::default();
-        let n = after_stop_note(true, true, true, false, &fake);
-        assert!(n.contains("switched on again"), "{n}");
         let mut enable = task("/Change");
         enable.push("/ENABLE".into());
-        assert_eq!(*fake.ran.lock().unwrap(), [enable, task("/Run")]);
+        let fake = Fake::default();
+        let n = after_stop_note(Some(on), true, true, false, &fake);
+        assert_eq!(
+            n,
+            "\nThe logon task was switched on again and starts the client."
+        );
+        assert_eq!(*fake.ran.lock().unwrap(), [enable.clone(), task("/Run")]);
+        // On, but no client ran: switched on, not run.
+        let fake = Fake::default();
+        let idle = Before {
+            enabled: true,
+            running: false,
+        };
+        let n = after_stop_note(Some(idle), true, true, false, &fake);
+        assert_eq!(n, "\nThe logon task was switched on again.");
+        assert_eq!(*fake.ran.lock().unwrap(), [enable.clone()]);
+        // Switched off before: it stays so, whether a client ran beside it or not.
+        for running in [false, true] {
+            let fake = Fake::default();
+            let b = Before {
+                enabled: false,
+                running,
+            };
+            let n = after_stop_note(Some(b), true, true, false, &fake);
+            assert_eq!(n, "\nThe logon task stays switched off, as it was before.");
+            assert!(fake.ran.lock().unwrap().is_empty());
+        }
         let fake = Fake {
             answers: vec![("schtasks /Change".into(), Err("refused".into()))],
             ..Fake::default()
         };
-        let n = after_stop_note(true, true, true, false, &fake);
+        let n = after_stop_note(Some(on), true, true, false, &fake);
         assert!(
             n.contains("/TN \"Pithagoras Sync\" /ENABLE` turns it on"),
             "{n}"
         );
-        for (system, start) in [
-            (
-                false,
-                argv(&[
-                    "systemctl",
-                    "--user",
-                    "enable",
-                    "--now",
-                    "pithagoras-sync.service",
-                ]),
-            ),
-            (
-                true,
-                argv(&["systemctl", "enable", "--now", "pithagoras-sync.service"]),
-            ),
-        ] {
-            let fake = Fake::default();
-            let n = after_stop_note(true, true, false, system, &fake);
-            assert_eq!(n, "\nThe unit was started again.");
-            assert_eq!(*fake.ran.lock().unwrap(), [start]);
+        for system in [false, true] {
+            let systemctl = |what: &str| {
+                let mut a = vec!["systemctl"];
+                if !system {
+                    a.push("--user");
+                }
+                a.extend([what, "pithagoras-sync.service"]);
+                argv(&a)
+            };
+            for (b, ran, said) in [
+                (
+                    on,
+                    vec![systemctl("enable"), systemctl("start")],
+                    "\nThe unit was switched on and started again.",
+                ),
+                (
+                    Before {
+                        enabled: true,
+                        running: false,
+                    },
+                    vec![systemctl("enable")],
+                    "\nThe unit was switched on again.",
+                ),
+                (
+                    Before {
+                        enabled: false,
+                        running: true,
+                    },
+                    vec![systemctl("start")],
+                    "\nThe unit was started again.",
+                ),
+                (off, vec![], "\nThe unit stays off, as it was before."),
+            ] {
+                let fake = Fake::default();
+                let n = after_stop_note(Some(b), true, false, system, &fake);
+                assert_eq!(n, said, "{b:?}");
+                assert_eq!(*fake.ran.lock().unwrap(), ran, "{b:?}");
+            }
         }
-        // Not stopped, or deleted already: nothing to start.
-        for (stopped, installed) in [(false, true), (true, false)] {
+        // Nothing stopped, or deleted already: nothing to put back.
+        for (before, installed) in [(None, true), (Some(on), false)] {
             let fake = Fake::default();
-            let n = after_stop_note(stopped, installed, true, false, &fake);
-            assert_eq!(n, stop_note(stopped, !installed, true, false));
+            let n = after_stop_note(before, installed, true, false, &fake);
+            assert_eq!(n, stop_note(before, !installed, true, false));
             assert!(fake.ran.lock().unwrap().is_empty());
         }
     }
@@ -2541,15 +2620,32 @@ mod tests {
 
     #[test]
     fn a_purge_error_says_what_the_stop_left() {
-        assert_eq!(stop_note(false, false, true, false), "");
+        use crate::install::Before;
+        let b = |enabled, running| Some(Before { enabled, running });
+        assert_eq!(stop_note(None, false, true, false), "");
         // The task's name has a space and is quoted, so the command works as printed.
-        let w = stop_note(true, false, true, false);
+        let w = stop_note(b(true, true), false, true, false);
         assert!(w.contains("/TN \"Pithagoras Sync\" /ENABLE"), "{w}");
-        assert!(stop_note(true, false, false, false).contains("systemctl --user start"));
-        assert!(stop_note(true, false, false, true).contains("sudo systemctl start"));
+        assert!(stop_note(b(false, false), false, true, false).contains("stays switched off"));
+        // As it was: switched on and started, only one of them, or neither.
+        for (system, sc) in [(false, "systemctl --user"), (true, "sudo systemctl")] {
+            for (enabled, running, what) in [
+                (true, true, "enable --now"),
+                (true, false, "enable"),
+                (false, true, "start"),
+            ] {
+                let n = stop_note(b(enabled, running), false, false, system);
+                assert!(
+                    n.contains(&format!("`{sc} {what} pithagoras-sync.service`")),
+                    "{n}"
+                );
+            }
+            let n = stop_note(b(false, false), false, false, system);
+            assert_eq!(n, "\nThe unit stays off, as it was before.");
+        }
         // Once the task is deleted there is nothing to switch on.
         for windows in [true, false] {
-            let d = stop_note(true, true, windows, false);
+            let d = stop_note(b(true, true), true, windows, false);
             assert!(
                 d.contains("deleted already") && !d.contains("/ENABLE"),
                 "{d}"

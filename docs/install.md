@@ -81,7 +81,7 @@ Choose **Uninstall** in the menu. Where the system unit runs the client (`instal
 
 Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login, or a folder that stays because something in it is not the client's). Remove the device in the portal as well (Settings, Devices).
 
-If removing fails halfway, the window says what failed and that uninstalling again goes on with what is left. Where the client was stopped for it and is still installed, it is started again first, so the computer does not stay offline.
+If removing fails halfway, the window says what failed and that uninstalling again goes on with what is left. Where the unit or logon task is still there, it is first put back as it was before: switched on again if it was on, and started again if a client was running, so the computer does not stay offline. A unit or task you had switched off stays off, and a client that was not running is not started; the message says which.
 
 ## What the windows never do
 

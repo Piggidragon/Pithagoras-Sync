@@ -353,29 +353,115 @@ pub fn system_stop_plan() -> Vec<Action> {
     }]
 }
 
-/// Puts back what the stop of `uninstall --purge` (and the `disable` of the
-/// uninstall after it) did, when the purge fails while the unit or task is
-/// still there: switched on, and the client started.
-pub fn restart_plan(windows: bool, system: bool) -> Vec<Action> {
+/// What the unit or task was before `uninstall --purge` stopped it, so a purge
+/// that fails puts back that and no more: a unit the owner had switched off
+/// stays off, and a client that was not running is not started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Before {
+    /// Switched on: starts with the login or the machine.
+    pub enabled: bool,
+    /// A client was running: the unit was up, or one answered on the control
+    /// channel (Windows has no state of the task to ask that is not in the
+    /// system's language).
+    pub running: bool,
+}
+
+/// Asks the service manager what the unit or task is now, before the purge
+/// stops it. `client_running`: a client answered on the control channel.
+/// What it cannot find out counts as off, so a failed purge never switches on
+/// what it does not know was on.
+pub fn state_before(
+    windows: bool,
+    system: bool,
+    runner: &dyn crate::actions::Runner,
+    client_running: bool,
+) -> Before {
     if windows {
-        return vec![
-            Action::Run {
-                argv: argv(&["schtasks", "/Change", "/TN", TASK_NAME, "/ENABLE"]),
-            },
-            Action::Try {
+        let enabled = runner
+            .try_run(&argv(&["schtasks", "/Query", "/TN", TASK_NAME, "/XML"]))
+            .is_ok_and(|xml| task_enabled(&xml));
+        return Before {
+            enabled,
+            running: client_running,
+        };
+    }
+    let systemctl = |args: &[&str]| {
+        let mut a = vec!["systemctl"];
+        if !system {
+            a.push("--user");
+        }
+        a.extend(args);
+        a.push(UNIT_NAME);
+        runner.try_run(&argv(&a))
+    };
+    // `is-enabled` exits non-zero for anything that is not switched on.
+    let enabled = systemctl(&["is-enabled"]).is_ok_and(|s| s.trim() == "enabled");
+    // A unit between two starts (`activating`) is up as well.
+    let active = systemctl(&["show", "-p", "ActiveState", "--value"])
+        .is_ok_and(|s| !matches!(s.trim(), "" | "inactive" | "failed"));
+    Before {
+        enabled,
+        running: client_running || active,
+    }
+}
+
+/// Whether the logon task's definition (`schtasks /Query /XML`) has it
+/// switched on: `<Enabled>false</Enabled>` in its settings is off, the same in
+/// every language. A definition without its settings counts as off.
+pub fn task_enabled(xml: &str) -> bool {
+    let Some(settings) = xml
+        .find("<Settings>")
+        .and_then(|i| xml[i..].find("</Settings>").map(|j| &xml[i..i + j]))
+    else {
+        return false;
+    };
+    // Task Scheduler leaves the element out where it is on (the default).
+    match settings.find("<Enabled>") {
+        None => true,
+        Some(i) => {
+            let rest = &settings[i + "<Enabled>".len()..];
+            rest.split('<').next().is_some_and(|v| v.trim() == "true")
+        }
+    }
+}
+
+/// Puts back what the stop of `uninstall --purge` (and the `disable` of the
+/// uninstall after it) changed, as `before` says it was, when the purge fails
+/// while the unit or task is still there. Empty where nothing was on.
+pub fn restart_plan(windows: bool, system: bool, before: Before) -> Vec<Action> {
+    if windows {
+        // A switched-off task cannot be run, so a client started by hand
+        // beside it is not started again.
+        if !before.enabled {
+            return Vec::new();
+        }
+        let mut plan = vec![Action::Run {
+            argv: argv(&["schtasks", "/Change", "/TN", TASK_NAME, "/ENABLE"]),
+        }];
+        if before.running {
+            plan.push(Action::Try {
                 argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
                 hint: "the task starts it within a minute".into(),
-            },
-        ];
+            });
+        }
+        return plan;
     }
-    let mut systemctl = vec!["systemctl"];
-    if !system {
-        systemctl.push("--user");
+    let systemctl = |what: &str| {
+        let mut a = vec!["systemctl"];
+        if !system {
+            a.push("--user");
+        }
+        a.extend([what, UNIT_NAME]);
+        Action::Run { argv: argv(&a) }
+    };
+    let mut plan = Vec::new();
+    if before.enabled {
+        plan.push(systemctl("enable"));
     }
-    systemctl.extend(["enable", "--now", UNIT_NAME]);
-    vec![Action::Run {
-        argv: argv(&systemctl),
-    }]
+    if before.running {
+        plan.push(systemctl("start"));
+    }
+    plan
 }
 
 fn xml_escape(s: &str) -> String {
@@ -605,6 +691,80 @@ pub fn windows_uninstall_plan(local_app_data: &str, task: bool) -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::actions::{Fake, apply};
+
+    /// Only the task's own setting counts, not its triggers'; a definition
+    /// that cannot be read counts as off.
+    #[test]
+    fn a_switched_off_task_is_read_from_its_settings() {
+        let on = task_xml("S-1-5-21-1", r"C:\p.exe");
+        assert!(task_enabled(&on));
+        let settings_off = on.replace(
+            "<Enabled>true</Enabled>\n  </Settings>",
+            "<Enabled>false</Enabled>\n  </Settings>",
+        );
+        assert_ne!(settings_off, on);
+        assert!(!task_enabled(&settings_off));
+        let triggers_off = on.replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 2);
+        assert!(task_enabled(&triggers_off));
+        assert!(task_enabled(&on.replace(
+            "    <Enabled>true</Enabled>\n  </Settings>",
+            "  </Settings>"
+        )));
+        assert!(!task_enabled(""));
+        assert!(!task_enabled("ERROR: access denied"));
+    }
+
+    /// What the unit was before the purge, asked of systemd, with what it
+    /// cannot tell taken as off.
+    #[test]
+    fn the_state_before_the_purge_is_asked_of_the_service_manager() {
+        let fake = |enabled: Result<&str, &str>, active: &str| Fake {
+            answers: vec![
+                (
+                    "systemctl is-enabled".into(),
+                    enabled.map(String::from).map_err(String::from),
+                ),
+                ("systemctl show".into(), Ok(active.into())),
+            ],
+            ..Fake::default()
+        };
+        let b = |enabled, running| Before { enabled, running };
+        for (enabled, active, client, want) in [
+            (Ok("enabled\n"), "active\n", false, b(true, true)),
+            (Ok("enabled\n"), "activating\n", false, b(true, true)),
+            (Err("disabled"), "inactive\n", false, b(false, false)),
+            (Err("disabled"), "failed\n", true, b(false, true)),
+            (Ok("static\n"), "inactive\n", false, b(false, false)),
+            (Err("no bus"), "", false, b(false, false)),
+        ] {
+            let f = fake(enabled, active);
+            assert_eq!(
+                state_before(false, true, &f, client),
+                want,
+                "{enabled:?} {active}"
+            );
+        }
+        // The user unit is asked with --user.
+        let f = Fake::default();
+        state_before(false, false, &f, false);
+        let ran = f.ran.lock().unwrap();
+        assert_eq!(ran.len(), 2);
+        assert!(ran.iter().all(|a| a[1] == "--user"), "{ran:?}");
+        // Windows: the task's definition, and the control channel for the client.
+        let f = Fake {
+            answers: vec![(
+                "schtasks /Query".into(),
+                Ok(task_xml("S-1-5-21-1", r"C:\p.exe")),
+            )],
+            ..Fake::default()
+        };
+        assert_eq!(state_before(true, false, &f, true), b(true, true));
+        let f = Fake {
+            answers: vec![("schtasks /Query".into(), Err("no such task".into()))],
+            ..Fake::default()
+        };
+        assert_eq!(state_before(true, false, &f, false), b(false, false));
+    }
 
     #[test]
     fn the_logon_task_is_switched_off_before_it_is_ended() {

@@ -419,19 +419,27 @@ async fn a_step_that_may_fail_shows_only_the_clients_note() {
 
 /// A `systemctl` and `loginctl` on PATH that write their arguments to
 /// `systemctl.log` and succeed, but say no unit is active: nothing reaches the
-/// real systemd. Returns the PATH to run with.
+/// real systemd. With the file `unit-state` in the test's root (two lines:
+/// what `is-enabled` and `show -p ActiveState` say) they answer those as a
+/// unit in that state. Returns the PATH to run with.
 fn fake_systemd(env: &Env) -> String {
     use std::os::unix::fs::PermissionsExt;
     let bin = env.root.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     let log = env.root.join("systemctl.log");
+    let state = env.root.join("unit-state");
     for prog in ["systemctl", "loginctl"] {
         let p = bin.join(prog);
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\necho \"{prog} $*\" >> '{}'\ncase \"$1\" in is-active) exit 3;; esac\nexit 0\n",
-                log.display()
+                "#!/bin/sh\necho \"{prog} $*\" >> '{log}'\ncase \"$1\" in is-active) exit 3;; esac\n\
+                 if [ -f '{state}' ]; then case \" $* \" in\n\
+                 *' is-enabled '*) e=$(sed -n 1p '{state}'); echo \"$e\"; [ \"$e\" = enabled ]; exit;;\n\
+                 *' ActiveState '*) sed -n 2p '{state}'; exit 0;;\n\
+                 esac; fi\nexit 0\n",
+                log = log.display(),
+                state = state.display()
             ),
         )
         .unwrap();
@@ -575,18 +583,31 @@ async fn purge_removes_what_the_client_left_but_the_program() {
     assert!(text.contains("The program itself stays"), "{text}");
 }
 
-/// A purge that fails while the unit is still there starts it again, so the
-/// device is not left offline, and says so.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_purge_that_fails_starts_the_unit_again() {
+/// `uninstall --purge` with the unit's folder read-only, so it fails after the
+/// stop while the unit is still there; `state` is what systemd says of the
+/// unit before (`is-enabled`, then `ActiveState`), `client` whether a client
+/// runs. Returns what it said on stderr and the systemctl calls after the
+/// uninstall's `disable --now`.
+async fn failed_purge(state: &str, client: bool) -> (String, String) {
     use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        // Root removes the unit file anyway.
-        return;
-    }
     let env = Env::new();
     let path = fake_systemd(&env);
-    env.ok(&["mode", "ask"]).await;
+    std::fs::write(env.root.join("unit-state"), state).unwrap();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    let daemon = if client {
+        env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "failpurge"])
+            .await;
+        let daemon = env.start();
+        mock.next_device(WAIT).await.expect("the client connects");
+        Some(daemon)
+    } else {
+        env.ok(&["mode", "ask"]).await;
+        None
+    };
     let unit = env
         .home
         .join(".config/systemd/user/pithagoras-sync.service");
@@ -602,15 +623,59 @@ async fn a_purge_that_fails_starts_the_unit_again() {
         .await
         .unwrap();
     std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(err.contains("The unit was started again."), "{err}");
     assert!(err.contains("Run this again"), "{err}");
     assert!(unit.exists());
+    if let Some(d) = daemon {
+        assert!(gone(d.id().unwrap()).await, "the client was stopped");
+    }
     let calls = std::fs::read_to_string(env.root.join("systemctl.log")).unwrap();
-    let disable = calls.find("systemctl --user disable --now pithagoras-sync.service");
-    let enable = calls.find("systemctl --user enable --now pithagoras-sync.service");
-    assert!(disable.is_some() && disable < enable, "{calls}");
+    let disable = "systemctl --user disable --now pithagoras-sync.service\n";
+    let after = calls
+        .find(disable)
+        .map(|i| calls[i + disable.len()..].to_string())
+        .unwrap_or_else(|| panic!("no disable: {calls}"));
+    (err, after)
+}
+
+/// A purge that fails while the unit is still there puts back what it
+/// stopped, so the device is not left offline, and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_that_fails_starts_the_unit_again() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root removes the unit file anyway.
+        return;
+    }
+    let (err, after) = failed_purge("enabled\nactive\n", false).await;
+    assert!(
+        err.contains("The unit was switched on and started again."),
+        "{err}"
+    );
+    assert_eq!(
+        after,
+        "systemctl --user enable pithagoras-sync.service\nsystemctl --user start pithagoras-sync.service\n"
+    );
+    // A client running beside a unit that was switched off and down: the
+    // client comes back through the unit, which stays switched off.
+    let (err, after) = failed_purge("disabled\ninactive\n", true).await;
+    assert!(err.contains("The unit was started again."), "{err}");
+    assert_eq!(after, "systemctl --user start pithagoras-sync.service\n");
+}
+
+/// A purge that fails switches on and starts nothing the owner had off: the
+/// unit was switched off and no client ran, so it stays that way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_that_fails_leaves_a_unit_that_was_off_off() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let (err, after) = failed_purge("disabled\ninactive\n", false).await;
+    assert!(
+        err.contains("The unit stays off, as it was before."),
+        "{err}"
+    );
+    assert_eq!(after, "");
 }
 
 /// Uninstalling in the window prints nothing (there is no terminal): what
