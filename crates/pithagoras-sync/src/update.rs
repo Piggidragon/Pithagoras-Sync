@@ -1531,9 +1531,13 @@ mod tests {
         }
         let mut tries = 0;
         let mut child = loop {
-            // `; :` keeps the shell from exec'ing sleep in its place.
+            // `; :` keeps the shell from exec'ing sleep in its place. The shell
+            // says "up" once it runs: until then the new process still has the
+            // test's own program (fork before exec), which is what a loaded CI
+            // machine showed.
             match std::process::Command::new(&exe)
-                .args(["-c", "sleep 30; :"])
+                .args(["-c", "echo up; sleep 30; :"])
+                .stdout(std::process::Stdio::piped())
                 .spawn()
             {
                 Err(e) if text_busy(&e) && tries < 50 => {
@@ -1544,6 +1548,14 @@ mod tests {
             }
         };
         let pid = child.id();
+        {
+            use std::io::BufRead;
+            let mut up = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut up)
+                .unwrap();
+            assert_eq!(up.trim(), "up");
+        }
         assert_eq!(what_runs(pid, &exe), Some(Runs::Same));
         let other = t.path().join("other");
         std::fs::copy(&exe, &other).unwrap();
