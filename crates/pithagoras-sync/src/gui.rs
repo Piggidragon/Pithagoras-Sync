@@ -304,7 +304,7 @@ impl Dialogs for Later<'_> {
         self.d.form(&self.with_held(text), form, buttons)
     }
 
-    fn at_hand(&self) -> Option<String> {
+    fn at_hand(&self) -> Option<Secret> {
         self.d.at_hand()
     }
 }
@@ -354,8 +354,8 @@ async fn install(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<PairUri>)
     let (user, path) = h.install_target();
     let (user, path) = (shown(&user), path.map(|p| shown(&p)));
     // The clipboard's text is taken only as a link that parses; anything
-    // else in it is dropped unseen.
-    let link = link.or_else(|| d.at_hand().and_then(|c| parse(t, c.trim()).ok()));
+    // else in it is dropped unseen, and zeroed.
+    let link = link.or_else(|| d.at_hand().and_then(|c| parse(t, c.expose().trim()).ok()));
     if let Some(u) = link {
         let portal = shown(&u.portal.to_string());
         let name = shown(&h.device_name());

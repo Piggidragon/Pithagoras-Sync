@@ -89,6 +89,24 @@ pub struct Filled {
     pub password: Option<Secret>,
 }
 
+/// A form as dialogs without forms ask it: a window per field, the entry
+/// first. Cancelled in one, the form is.
+pub fn form_per_field<D: Dialogs + ?Sized>(
+    d: &D,
+    text: &str,
+    form: Form,
+    buttons: Buttons,
+) -> Option<Filled> {
+    let mut filled = Filled::default();
+    if form.entry.is_some() {
+        filled.entry = Some(d.entry(text, buttons)?);
+    }
+    if form.password.is_some() {
+        filled.password = Some(d.password(text)?);
+    }
+    Some(filled)
+}
+
 pub trait Dialogs {
     fn style(&self) -> Style;
     fn info(&self, text: &str);
@@ -110,19 +128,12 @@ pub trait Dialogs {
     /// The fields of `form` in one window (`Style::Forms`); `None` when
     /// cancelled. Elsewhere one window per field.
     fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
-        let mut filled = Filled::default();
-        if form.entry.is_some() {
-            filled.entry = Some(self.entry(text, buttons)?);
-        }
-        if form.password.is_some() {
-            filled.password = Some(self.password(text)?);
-        }
-        Some(filled)
+        form_per_field(self, text, form, buttons)
     }
     /// A text the owner has at hand without being asked for it: the
     /// clipboard's on Windows. The flow takes it only as a pairing link that
     /// parses, and drops anything else unseen.
-    fn at_hand(&self) -> Option<String> {
+    fn at_hand(&self) -> Option<Secret> {
         None
     }
 }
@@ -751,16 +762,8 @@ impl Dialogs for Native {
 
     fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
         if let Helper::Kdialog(_) = self.helper {
-            // No forms: a window per field.
-            let entry = match form.entry {
-                Some(_) => Some(self.entry(text, buttons)?),
-                None => None,
-            };
-            let password = match form.password {
-                Some(_) => Some(self.password(text)?),
-                None => None,
-            };
-            return Some(Filled { entry, password });
+            // No forms.
+            return form_per_field(self, text, form, buttons);
         }
         match self.run(&Ask::Form(text, form, buttons)) {
             (Some(0), Some(t)) => Some(split_form(t, form)),
@@ -833,7 +836,7 @@ mod win {
 
     /// The clipboard's text, if it holds some: at most `MAX_ANSWER` units and
     /// one more, so a longer text is still too long for the link's check.
-    fn clipboard() -> Option<String> {
+    fn clipboard() -> Option<Secret> {
         // SAFETY: the clipboard is opened and closed here; the data is read
         // under GlobalLock, up to its NUL, never past the block's size or
         // MAX_ANSWER units.
@@ -847,7 +850,8 @@ mod win {
                 let p = GlobalLock(h) as *const u16;
                 if !p.is_null() {
                     let size = GlobalSize(h) / 2;
-                    let mut units = Vec::new();
+                    // Sized up front, so no copy is left behind by growing.
+                    let mut units = Vec::with_capacity(size.min(MAX_ANSWER + 1));
                     let mut i = 0;
                     while i <= MAX_ANSWER && i < size {
                         let u = *p.add(i);
@@ -858,7 +862,7 @@ mod win {
                         i += 1;
                     }
                     GlobalUnlock(h);
-                    text = Some(String::from_utf16_lossy(&units));
+                    text = Some(super::utf16_secret(&mut units));
                 }
             }
             CloseClipboard();
@@ -890,7 +894,11 @@ mod win {
             }
             // OK with no text in the clipboard (empty, or a picture) is an
             // answer too: the flow says so and asks again.
-            Some(clipboard().unwrap_or_default().trim().to_string())
+            Some(
+                clipboard()
+                    .map(|c| c.expose().trim().to_string())
+                    .unwrap_or_default(),
+            )
         }
 
         fn password(&self, _text: &str) -> Option<Secret> {
@@ -919,10 +927,24 @@ mod win {
             None
         }
 
-        fn at_hand(&self) -> Option<String> {
+        fn at_hand(&self) -> Option<Secret> {
             clipboard()
         }
     }
+}
+
+/// The text of UTF-16 `units` (the clipboard's), which are zeroed: until it
+/// parses as a pairing link it is anything the user copied, a password
+/// perhaps, so no copy of it outlives its `Secret`.
+#[cfg(any(windows, test))]
+pub(crate) fn utf16_secret(units: &mut [u16]) -> Secret {
+    // At most three bytes per unit: the string never grows (and copies).
+    let mut text = String::with_capacity(units.len() * 3);
+    text.extend(
+        char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+    );
+    units.fill(0);
+    Secret::new(text)
 }
 
 /// Scripted answers, recording what was shown (tests).
@@ -1016,16 +1038,8 @@ impl Dialogs for Fake {
 
     fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
         if self.style != Style::Forms {
-            // As the dialog programs without forms do: one window per field.
-            let entry = match form.entry {
-                Some(_) => Some(self.entry(text, buttons)?),
-                None => None,
-            };
-            let password = match form.password {
-                Some(_) => Some(self.password(text)?),
-                None => None,
-            };
-            return Some(Filled { entry, password });
+            // As the dialog programs without forms do.
+            return form_per_field(self, text, form, buttons);
         }
         let fields: Vec<&str> = [form.entry, form.password].into_iter().flatten().collect();
         let kind = format!("form [{}] [{}]", fields.join(", "), buttons.ok);
@@ -1039,8 +1053,8 @@ impl Dialogs for Fake {
         Some(split_form(format!("{out}\n"), form))
     }
 
-    fn at_hand(&self) -> Option<String> {
-        self.at_hand.clone()
+    fn at_hand(&self) -> Option<Secret> {
+        self.at_hand.clone().map(Secret::new)
     }
 }
 
@@ -1052,6 +1066,18 @@ mod tests {
         ok: "Open",
         cancel: "Close",
     };
+
+    /// The clipboard's text (Windows) may be anything the user copied: the
+    /// units read are zeroed once they are a `Secret`.
+    #[test]
+    fn the_clipboards_text_leaves_no_copy() {
+        let mut units: Vec<u16> = "pässwört 🔑".encode_utf16().collect();
+        units.push(0xd800); // a lone surrogate
+        let s = utf16_secret(&mut units);
+        assert_eq!(s.expose(), "pässwört 🔑\u{fffd}");
+        assert!(units.iter().all(|u| *u == 0), "{units:?}");
+        assert_eq!(utf16_secret(&mut []).expose(), "");
+    }
 
     #[test]
     fn own_lines_stay_lines() {
