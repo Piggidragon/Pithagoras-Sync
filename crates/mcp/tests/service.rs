@@ -165,7 +165,6 @@ async fn fx(consent: Consent, answer: Answer, limits: sync_mcp::Limits) -> Fx {
         Options {
             dir: root.join("mcp"),
             os: sync_mcp::os().into(),
-            arch: sync_mcp::arch().into(),
             base_env: common::env(),
             limits,
             indicator: indicator.clone(),
@@ -183,6 +182,9 @@ async fn fx(consent: Consent, answer: Answer, limits: sync_mcp::Limits) -> Fx {
         svc,
     }
 }
+
+/// How long a test waits for a step before it fails.
+const WAIT: Duration = Duration::from_secs(20);
 
 fn reason(e: &RpcError) -> Option<&str> {
     e.reason()
@@ -334,6 +336,14 @@ async fn an_allowed_call_runs_taints_and_shows_the_indicator_once_per_burst() {
         .unwrap();
     assert_eq!(f.indicator.0.lock().unwrap().as_slice(), ["c1"]);
     assert_eq!(f.svc.in_use().unwrap().chat, "c1");
+    // Another chat on the screen, and the first call after a `panic`, are
+    // bursts of their own.
+    f.call("c2", "screenshot", json!({})).await.unwrap();
+    f.call("c2", "screenshot", json!({})).await.unwrap();
+    f.svc.stop_all().await;
+    f.call("c2", "screenshot", json!({})).await.unwrap();
+    assert_eq!(f.indicator.0.lock().unwrap().as_slice(), ["c1", "c2", "c2"]);
+    assert_eq!(f.svc.in_use().unwrap().chat, "c2");
     // Within a minute of a call it counts as active.
     assert!(f.svc.active());
     let rec = f.record();
@@ -391,6 +401,13 @@ async fn a_crash_backs_off_and_a_hang_times_out() {
     assert_eq!((e.code, reason(&e)), (code::SERVER, Some(why::CRASHED)));
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), Some(why::NOT_RUNNING), "backoff: {e:?}");
+    // Probes within the backoff keep the crash as the last error.
+    for _ in 0..3 {
+        let st = f.svc.status(true).await;
+        let last = st[0].last_error.clone().unwrap();
+        assert!(!last.contains("starts again"), "{last}");
+        assert!(st[0].retry_in_secs.is_some());
+    }
     tokio::time::sleep(Duration::from_millis(1100)).await;
     // Started again after the backoff (and crashing again).
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
@@ -403,6 +420,21 @@ async fn a_crash_backs_off_and_a_hang_times_out() {
     f.install("1.0.0", &["hang"], None).await;
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!((e.code, reason(&e)), (code::TIMEOUT, Some(why::TIMED_OUT)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_error_answer_of_the_server_fails_the_call_only() {
+    let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
+    f.install("1.0.0", &["rpc-error"], None).await;
+    for _ in 0..2 {
+        let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
+        assert_eq!((e.code, reason(&e)), (code::SERVER, Some(why::TOOL_ERROR)));
+        assert!(e.message.contains("invalid coordinates"), "{e:?}");
+    }
+    // No backoff, no second start.
+    let st = f.svc.status(false).await;
+    assert!(st[0].running && st[0].retry_in_secs.is_none(), "{st:?}");
+    assert_eq!(f.record().lines().filter(|l| *l == "initialize").count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -421,6 +453,31 @@ async fn panic_ends_the_call_in_flight_and_stops_the_server() {
     assert!(!st[0].running);
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), Some(why::PAUSED));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn consent_switched_off_while_the_server_starts_stops_the_input() {
+    let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
+    f.install("1.0.0", &["slow-start"], None).await;
+    let call = f.call("c1", "type_text", json!({"text": "hello"}));
+    let off = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (mut p, profile) = f.engine.policy();
+        p.computer_use.set(Consent::Off, None, 0).unwrap();
+        f.engine.reload(p, profile);
+    };
+    let (r, ()) = tokio::join!(call, off);
+    assert_eq!(reason(&r.unwrap_err()), Some(why::CONSENT_OFF));
+    assert!(
+        !f.record().contains("tools/call type_text"),
+        "{}",
+        f.record()
+    );
+    let audit = std::fs::read_to_string(f.root.join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("switched off while the call waited"),
+        "{audit}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -607,33 +664,29 @@ async fn a_call_waiting_for_its_consent_question_is_not_activity() {
     assert!(f.svc.active());
 }
 
-/// The reload runs as far as hashing the changed server's files; meanwhile a
-/// call takes the server it finds. The reload must not swap it under the call.
+/// A reload while a call holds the server (here, while its consent question
+/// waits) must not swap the server under it; the last call out applies it.
 #[tokio::test]
 async fn a_reload_never_swaps_the_server_a_call_holds() {
     let f = fx(Consent::Ask, Answer::Once, common::limits()).await;
     let pin = f.install("1.0.0", &[], None).await;
     let gate = f.approver.hold();
-    let svc = f.svc.clone();
-    let record = installed(&f, &pin);
-    // New pins that no longer name the server.
-    let reload = tokio::spawn(async move {
-        svc.reload(
-            record,
-            Document {
-                serial: 5,
-                issued_ms: 1,
-                servers: vec![],
-            },
-        )
-        .await
-    });
-    // The reload task starts and waits for its hash.
-    tokio::task::yield_now().await;
     let call = f.call("c1", "screenshot", json!({}));
     let check = async {
-        gate.asked.notified().await;
-        reload.await.unwrap();
+        tokio::time::timeout(WAIT, gate.asked.notified())
+            .await
+            .expect("the call asks");
+        // New pins that no longer name the server.
+        f.svc
+            .reload(
+                installed(&f, &pin),
+                Document {
+                    serial: 5,
+                    issued_ms: 1,
+                    servers: vec![],
+                },
+            )
+            .await;
         let state = f.svc.list().servers[0].state.clone();
         gate.answer.notify_one();
         state

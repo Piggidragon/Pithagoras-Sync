@@ -137,9 +137,25 @@ async fn a_crash_mid_call_is_reported() {
 }
 
 #[tokio::test]
-async fn an_oversized_line_or_flood_stops_the_server() {
+async fn an_oversized_answer_fails_its_call_and_a_flood_stops_the_server() {
+    // One line over the limit (a large screenshot): that call fails, the
+    // server stays.
     let t = tempfile::tempdir().unwrap();
-    let mut c = start(t.path(), &["long-line"], limits()).await;
+    let mut l = limits();
+    l.max_output = 4 << 20;
+    let mut c = start(t.path(), &["long-line"], l).await;
+    let e = c.call("screenshot", &Map::new()).await.unwrap_err();
+    assert!(matches!(e, ClientError::TooLarge(_)), "{e:?}");
+    assert!(!c.is_dead());
+    c.request("ping", json!({}), Duration::from_secs(5))
+        .await
+        .unwrap();
+    c.kill().await;
+    // One with no end within what a call may give stops it.
+    let t = tempfile::tempdir().unwrap();
+    let mut l = limits();
+    l.max_output = 512 << 10;
+    let mut c = start(t.path(), &["long-line"], l).await;
     let e = c.call("screenshot", &Map::new()).await.unwrap_err();
     assert!(matches!(e, ClientError::BadAnswer(_)), "{e:?}");
     assert!(c.is_dead());

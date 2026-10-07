@@ -88,6 +88,9 @@ pub mod mcp_reason {
     pub const CRASHED: &str = "crashed";
     /// SERVER: the server's answer broke the protocol or the device's limits.
     pub const BAD_ANSWER: &str = "bad_answer";
+    /// SERVER: the server refused the call with an error answer of its own
+    /// (arguments it does not take, say); the message holds its text.
+    pub const TOOL_ERROR: &str = "tool_error";
     /// TIMEOUT: the call took longer than the device waits.
     pub const TIMED_OUT: &str = "timed_out";
 }

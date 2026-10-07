@@ -32,6 +32,9 @@ pub trait ComputerUse: Send + Sync {
     ) -> BoxFuture<'a, Result<McpCallResult, RpcError>>;
     /// Fires when the list or the consent changed.
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<McpChanged>;
+    /// Whether a call runs or ran within the last minute: the agent may be
+    /// clicking on the owner's screen, the portal's own page included.
+    fn active(&self) -> bool;
 }
 
 pub struct Device {

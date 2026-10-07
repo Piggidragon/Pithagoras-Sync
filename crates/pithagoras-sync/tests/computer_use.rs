@@ -432,10 +432,46 @@ async fn while_computer_use_is_active_the_owners_side_takes_nothing() {
     env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
     env.publish(1, "1.0.0");
     env.ok(&["computer-use", "install"]).await;
-    env.ok(&["computer-use", "allow", "--minutes", "5"]).await;
+    env.ok(&["computer-use", "ask"]).await;
     let daemon = env.start();
     let dl = mock.next_device(WAIT).await.expect("connects");
-    call(&dl, "c1", "screenshot", json!({})).await.unwrap();
+    // Asks once for c1; the answer comes before any call ran.
+    let question = |chat: &'static str| {
+        let dl = &dl;
+        async move {
+            let pending = dl
+                .start_call(
+                    "mcp.call",
+                    json!({"server": "fake", "tool": "screenshot", "args": {}, "ctx": {"chat": chat}}),
+                )
+                .await;
+            let a = dl
+                .notification("approval.requested", WAIT)
+                .await
+                .expect("a question");
+            (pending, a)
+        }
+    };
+    let (pending, a) = question("c1").await;
+    dl.call("approval.answer", json!({"id": a["id"], "answer": "chat"}))
+        .await
+        .unwrap();
+    pending.await.unwrap().unwrap();
+    // The agent could be clicking on the portal's Devices tab now: its own
+    // consent for c2 is refused, a deny goes through.
+    let (pending, a) = question("c2").await;
+    for answer in ["chat", "once"] {
+        let e = dl
+            .call("approval.answer", json!({"id": a["id"], "answer": answer}))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("computer use is active"), "{e:?}");
+    }
+    dl.call("approval.answer", json!({"id": a["id"], "answer": "deny"}))
+        .await
+        .unwrap();
+    let e = pending.await.unwrap().unwrap_err();
+    assert_eq!(reason(&e), "consent_denied");
     // The agent could be typing these into a terminal now.
     for args in [
         &["approve", "1"][..],
@@ -490,7 +526,21 @@ async fn while_computer_use_is_active_the_owners_side_takes_nothing() {
     env.ok(&["computer-use", "off"]).await;
     let e = call(&dl, "c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), "consent_off");
+    // An allow typed into the file meanwhile (the reload refused, so only
+    // the file holds it): `panic` takes it back there too.
+    let mut cfg = sync_policy::DeviceConfig::load(&file).unwrap();
+    cfg.policy
+        .computer_use
+        .set(
+            sync_policy::Consent::Allow,
+            Some(60),
+            sync_policy::system_clock()(),
+        )
+        .unwrap();
+    cfg.save(&file).unwrap();
     env.ok(&["panic"]).await;
+    let cfg = sync_policy::DeviceConfig::load(&file).unwrap();
+    assert_eq!(cfg.policy.computer_use.consent, sync_policy::Consent::Off);
     stop(daemon).await;
 }
 
@@ -506,6 +556,7 @@ async fn the_daily_look_takes_only_the_servers_from_the_file() {
     env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
     env.publish(1, "1.0.0");
     env.ok(&["computer-use", "install"]).await;
+    env.ok(&["computer-use", "ask"]).await;
     let daemon = env.start();
     let dl = mock.next_device(WAIT).await.expect("connects");
     let before = Env::mode_line(&env.ok(&["status"]).await);
@@ -529,5 +580,38 @@ async fn the_daily_look_takes_only_the_servers_from_the_file() {
     assert!(updated, "the daily look updated the server");
     let after = Env::mode_line(&env.ok(&["status"]).await);
     assert_eq!(after, before, "the daily look took the mode from the file");
+    stop(daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daily_look_installs_nothing_while_computer_use_is_off() {
+    let mut env = Env::new().await;
+    env.check_ms = Some("1500".into());
+    env.publish(1, "1.0.0");
+    env.ok(&["computer-use", "install"]).await;
+    let daemon = env.start();
+    env.publish(2, "2.0.0");
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen = env.ok(&["computer-use", "status"]).await;
+        if seen.contains("Last look for new pins") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        seen.contains("fake 2.0.0 waits, computer use is off"),
+        "{seen}"
+    );
+    // The pins were taken; the server was neither installed nor started.
+    assert!(seen.contains("Server: fake 1.0.0"), "{seen}");
+    let folders = std::fs::read_dir(env.state().join("mcp/fake"))
+        .unwrap()
+        .count();
+    assert_eq!(folders, 1, "no folder for 2.0.0");
+    let cfg =
+        sync_policy::DeviceConfig::load(&env.home.join(".config/pithagoras-sync/config.toml"))
+            .unwrap();
+    assert_eq!(cfg.mcp["fake"].version, "1.0.0");
     stop(daemon).await;
 }

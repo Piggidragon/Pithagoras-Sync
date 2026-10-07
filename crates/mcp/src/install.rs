@@ -379,15 +379,24 @@ pub fn kept_pin(dir: &Path) -> Result<ServerPin, String> {
     serde_json::from_slice(&data).map_err(|e| format!("{PIN_FILE}: {e}"))
 }
 
-/// Whether the installed version may run: its folders the user's own and
-/// private, and its hash the one recorded at install.
-pub fn verify(mcp: &Path, server: &str, folder: &str, sha256: &str) -> Result<PathBuf, String> {
+/// The folder of an installed version, there and private to the user,
+/// without its hash: what loading the servers checks (the hash follows at
+/// every start).
+pub fn present(mcp: &Path, server: &str, folder: &str) -> Result<PathBuf, String> {
     let dir = version_dir(mcp, server, folder);
     let version = folder.rsplit_once('-').map_or(folder, |(v, _)| v);
     if std::fs::symlink_metadata(&dir).is_err() {
         return Err(format!("{server} {version} is not on the device any more"));
     }
     fsutil::owned_and_private(mcp, &dir)?;
+    Ok(dir)
+}
+
+/// Whether the installed version may run: its folders the user's own and
+/// private, and its hash the one recorded at install.
+pub fn verify(mcp: &Path, server: &str, folder: &str, sha256: &str) -> Result<PathBuf, String> {
+    let dir = present(mcp, server, folder)?;
+    let version = folder.rsplit_once('-').map_or(folder, |(v, _)| v);
     let got = fsutil::tree_hash(&dir)?;
     if got != sha256 {
         return Err(format!(

@@ -77,7 +77,6 @@ pub struct Options {
     /// `<state>/mcp`.
     pub dir: PathBuf,
     pub os: String,
-    pub arch: String,
     /// The client's environment, which the server's is cut from.
     pub base_env: Vec<(String, String)>,
     pub limits: Limits,
@@ -182,8 +181,9 @@ pub struct Service {
     pending: Mutex<Option<(BTreeMap<String, InstalledServer>, Document)>>,
     /// One reload at a time.
     applying: tokio::sync::Mutex<()>,
+    /// The last call's chat and server: a new chat, a new server or a gap
+    /// of a minute starts a burst. `panic` clears it.
     in_use: Mutex<Option<InUse>>,
-    last_call_ms: AtomicI64,
     /// Calls past their consent (`active`), and when the last one ended.
     acting: AtomicUsize,
     last_acted_ms: AtomicI64,
@@ -238,7 +238,6 @@ impl Service {
             pending: Mutex::new(None),
             applying: tokio::sync::Mutex::new(()),
             in_use: Mutex::new(None),
-            last_call_ms: AtomicI64::new(i64::MIN / 2),
             acting: AtomicUsize::new(0),
             last_acted_ms: AtomicI64::new(i64::MIN / 2),
             stop,
@@ -258,7 +257,7 @@ impl Service {
     }
 
     /// Applies a waiting reload unless a call is in flight (the last one out
-    /// starts it again). The changed servers' files are hashed off the
+    /// starts it again). The changed servers' folders are checked off the
     /// runtime; a call that comes meanwhile keeps the servers it found, and
     /// the swap waits for it.
     async fn apply_pending(&self) {
@@ -287,16 +286,13 @@ impl Service {
                 next.insert(name.clone(), s.clone());
                 continue;
             }
-            let (mcp, n, folder, sha) = (
-                self.opts.dir.clone(),
-                name.clone(),
-                rec.folder.clone(),
-                rec.sha256.clone(),
-            );
-            let checked =
-                tokio::task::spawn_blocking(move || install::verify(&mcp, &n, &folder, &sha))
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
+            // Only whether the folder is there and private: the hash of the
+            // whole tree comes before every start, and hashing every server
+            // here would hold up the client's start.
+            let (mcp, n, folder) = (self.opts.dir.clone(), name.clone(), rec.folder.clone());
+            let checked = tokio::task::spawn_blocking(move || install::present(&mcp, &n, &folder))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
             next.insert(
                 name.clone(),
                 Arc::new(self.load(name, rec, pin, dir, checked)),
@@ -305,7 +301,7 @@ impl Service {
         let stale: Vec<Arc<Server>> = {
             let mut servers = self.servers.lock().unwrap();
             if self.busy.load(Ordering::SeqCst) > 0 {
-                // A call came while the files were hashed: the last one out
+                // A call came while the folders were checked: the last one out
                 // applies this (unless a newer reload came too).
                 let mut pending = self.pending.lock().unwrap();
                 if pending.is_none() {
@@ -456,7 +452,14 @@ impl Service {
                             slot.client = None;
                         }
                     }
-                    Err(e) => slot.last_error = Some(e.message),
+                    // A failed start or a changed file is recorded already;
+                    // the backoff's own refusal quotes `last_error`, and
+                    // would nest it once more with every probe.
+                    Err(e) => {
+                        if slot.retry_at.is_none() && s.error().is_none() {
+                            slot.last_error = Some(e.message);
+                        }
+                    }
                 }
             }
             let running = slot.client.as_mut().is_some_and(|c| !c.is_dead());
@@ -728,10 +731,10 @@ impl Service {
             );
             return Err(RpcError::denied(e).with_reason(why::FOCUS));
         }
-        // The last moment before the input: a `panic` meanwhile wins.
-        if self.engine.is_paused() {
-            return Err(audited("denied", paused()));
-        }
+        // The last moment before the input: the start and the focus check
+        // may have taken a minute, and a `panic`, a consent switched off or
+        // run out, or the end of the hours meanwhile wins (in the audit log).
+        self.engine.screen_still_allowed(&call, &target, grant)?;
         self.indicate(&s.name, &p.ctx.chat);
         // From here the chat sees what is on the screen: untrusted content.
         self.engine.mark_tainted(&p.ctx.chat);
@@ -756,9 +759,14 @@ impl Service {
                     .with_reason(why::TIMED_OUT),
                     ClientError::Stopped => paused(),
                     ClientError::Crashed(m) => server_err(why::CRASHED, format!("{}: {m}", s.name)),
+                    // The server's own refusal of the call, arguments it
+                    // does not take, say: the call can be sent again, fixed.
+                    ClientError::Rpc(m) => server_err(why::TOOL_ERROR, format!("{}: {m}", s.name)),
                     other => server_err(why::BAD_ANSWER, format!("{}: {other}", s.name)),
                 };
-                if !matches!(e, ClientError::Rpc(_)) {
+                // The server keeps running after an error answer of its own
+                // and after one answer that was too large.
+                if !matches!(e, ClientError::Rpc(_) | ClientError::TooLarge(_)) {
                     slot.client = None;
                     if matches!(e, ClientError::Crashed(_) | ClientError::BadAnswer(_)) {
                         failed(&mut slot, &e.to_string());
@@ -789,15 +797,17 @@ impl Service {
 
     fn indicate(&self, server: &str, chat: &str) {
         let now = self.engine.now();
-        let last = self.last_call_ms.swap(now, Ordering::SeqCst);
-        if now - last >= BURST_GAP_MS {
-            self.opts.indicator.burst(server, chat);
-        }
-        *self.in_use.lock().unwrap() = Some(InUse {
+        let before = self.in_use.lock().unwrap().replace(InUse {
             chat: chat.to_string(),
             server: server.to_string(),
             last_ms: now,
         });
+        let same = before.is_some_and(|u| {
+            u.chat == chat && u.server == server && now - u.last_ms < BURST_GAP_MS
+        });
+        if !same {
+            self.opts.indicator.burst(server, chat);
+        }
     }
 
     /// Runs `f` on a server's client, started if need be, with the call slot
@@ -983,6 +993,10 @@ impl sync_connector::device::ComputerUse for Service {
 
     fn subscribe(&self) -> broadcast::Receiver<McpChanged> {
         self.changes.subscribe()
+    }
+
+    fn active(&self) -> bool {
+        Service::active(self)
     }
 }
 

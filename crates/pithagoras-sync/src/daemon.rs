@@ -241,7 +241,6 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         sync_mcp::service::Options {
             dir: dirs.mcp_dir(),
             os: sync_mcp::os().into(),
-            arch: sync_mcp::arch().into(),
             base_env: std::env::vars().collect(),
             limits: sync_mcp::Limits::default(),
             indicator,
@@ -549,29 +548,42 @@ impl Daemon {
         line
     }
 
-    /// `panic` takes an allow of computer use back: `unlock` does not give it
-    /// again.
+    /// `panic` takes an allow of computer use back, in the running client
+    /// and in the file each (an allow only the file holds, typed while a
+    /// reload was refused, would come live at the next start): `unlock` does
+    /// not give it again. An `ask` stays.
     fn consent_off_after_panic(&self) -> Result<(), String> {
-        if self.store.config().policy.computer_use.consent == Consent::Allow {
-            return self.consent_off("panic");
-        }
-        Ok(())
+        self.narrow_consent("panic", |cfg| {
+            cfg.policy.computer_use.consent == Consent::Allow
+        })
     }
 
     /// Switches computer use off in the running client, then in the file,
     /// taking nothing else from the file (it may hold what the agent typed
     /// into an editor while computer use was active). An error says the file
-    /// still holds the old consent: the running client is off all the same.
+    /// may still hold the old consent: the running client is off all the same.
     fn consent_off(&self, why: &str) -> Result<(), String> {
+        self.narrow_consent(why, |_| true)
+    }
+
+    /// Switches computer use off wherever `whether` says, in the running
+    /// client and in the file each.
+    fn narrow_consent(
+        &self,
+        why: &str,
+        whether: impl Fn(&DeviceConfig) -> bool,
+    ) -> Result<(), String> {
         let r = self.store.update(why, |cfg| {
-            cfg.policy.computer_use.consent = Consent::Off;
-            cfg.policy.computer_use.until_ms = None;
+            if whether(cfg) {
+                cfg.policy.computer_use.consent = Consent::Off;
+                cfg.policy.computer_use.until_ms = None;
+            }
         });
         self.mcp.announce();
         r.map_err(|e| {
             warn!("{why} could not switch computer use off in the config file: {e}");
             format!(
-                "computer use is off in the running client, but the config file could not be changed ({e}): it still allows computer use and would allow it again at the next start or reload. Fix the file, then run `pithagoras-sync computer-use off` again"
+                "the running client allows no computer use without asking now, but the config file could not be changed ({e}): it may still allow computer use and would allow it again at the next start or reload. Fix the file, then run `pithagoras-sync computer-use off` again"
             )
         })
     }
@@ -892,7 +904,8 @@ async fn watch_consent(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
 
 /// Once a day, at a random time, looks for new signed pins and updates the
 /// installed servers (`policy.computer_use.auto_update`). The new version is
-/// switched to once no call is in flight.
+/// switched to once no call is in flight. While the device is paused or
+/// computer use is off, the pins are taken but nothing is installed.
 async fn daily_pins(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
     let mut next = crate::computer_use::first_check_ms(now_ms());
     loop {
@@ -907,7 +920,8 @@ async fn daily_pins(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
         next = now_ms() + crate::computer_use::CHECK_EVERY_MS;
         let mut lines = Vec::new();
         let dirs = d.dirs.clone();
-        let r = crate::computer_use::update(&dirs, false, &mut |l| lines.push(l)).await;
+        let hold = crate::computer_use::hold_updates(d.device.engine.is_paused(), &cfg, now_ms());
+        let r = crate::computer_use::update(&dirs, false, hold, &mut |l| lines.push(l)).await;
         let summary = match r {
             Ok(u) if u.changed.is_empty() && u.notes.is_empty() => "up to date".to_string(),
             Ok(u) => u

@@ -74,6 +74,9 @@ pub enum ClientError {
     Timeout,
     /// The server broke the protocol or a limit; it was stopped.
     BadAnswer(String),
+    /// One answer over the line limit (a large screenshot, say): it was
+    /// dropped and the request failed, the server keeps running.
+    TooLarge(String),
     /// A JSON-RPC error answer to the request.
     Rpc(String),
     /// The device stopped it (`panic`, the client's end).
@@ -87,6 +90,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Crashed(m) => write!(f, "the server ended: {m}"),
             ClientError::Timeout => write!(f, "the server did not answer in time"),
             ClientError::BadAnswer(m) => write!(f, "the server's answer was refused: {m}"),
+            ClientError::TooLarge(m) => write!(f, "the server's answer was dropped: {m}"),
             ClientError::Rpc(m) => write!(f, "the server answered with an error: {m}"),
             ClientError::Stopped => write!(f, "the device stopped the server"),
         }
@@ -97,7 +101,9 @@ impl std::fmt::Display for ClientError {
 enum Line {
     Message(Map<String, Value>, usize),
     Garbage(usize),
-    TooLong,
+    /// A line over the limit, skipped to its end (this many bytes); `None`
+    /// when no end came within `max_output` and the reader stopped.
+    TooLong(Option<usize>),
     Closed,
 }
 
@@ -156,7 +162,7 @@ impl Client {
         // Little read ahead: what the server writes waits in its pipe, not in
         // the client's memory.
         let (tx, lines) = mpsc::channel(2);
-        tokio::spawn(read_lines(stdout, tx, limits.max_line));
+        tokio::spawn(read_lines(stdout, tx, limits.max_line, limits.max_output));
         let mut client = Client {
             child: c.child,
             group: c.group,
@@ -242,7 +248,8 @@ impl Client {
             match line {
                 Line::Message(m, _) => self.unsolicited(m).await?,
                 Line::Garbage(_) => debug!("the MCP server wrote a line that is not JSON-RPC"),
-                Line::TooLong => return self.broken("a line over the limit").await,
+                Line::TooLong(Some(_)) => debug!("an MCP line over the limit dropped"),
+                Line::TooLong(None) => return self.broken("a line without end").await,
                 Line::Closed => {
                     self.dead = Some("closed its output".into());
                     return Err(ClientError::Crashed("closed its output".into()));
@@ -335,7 +342,7 @@ impl Client {
                 Ok(Some(l)) => l,
             };
             let n = match &line {
-                Line::Message(_, n) | Line::Garbage(n) => *n,
+                Line::Message(_, n) | Line::Garbage(n) | Line::TooLong(Some(n)) => *n,
                 _ => 0,
             };
             bytes += n;
@@ -343,7 +350,16 @@ impl Client {
                 return self.broken("more output than one call may give").await;
             }
             match line {
-                Line::TooLong => return self.broken("a line over the limit").await,
+                // Most likely the answer itself: this request fails, and
+                // the server stays (an answer that comes after all goes to
+                // no request in flight and is dropped).
+                Line::TooLong(Some(n)) => {
+                    return Err(ClientError::TooLarge(format!(
+                        "a line of {n} bytes, over the limit of {}",
+                        self.limits.max_line
+                    )));
+                }
+                Line::TooLong(None) => return self.broken("a line without end").await,
                 Line::Garbage(_) => {
                     garbage += 1;
                     if garbage > self.limits.max_garbage {
@@ -442,13 +458,40 @@ impl Drop for Client {
     }
 }
 
+/// Reads to the end of a line without keeping it: the bytes read, or `None`
+/// when the output ended or `max` passed first.
+async fn skip_line<R: AsyncBufReadExt + Unpin>(r: &mut R, max: usize) -> Option<usize> {
+    let mut n = 0;
+    loop {
+        let buf = r.fill_buf().await.ok()?;
+        if buf.is_empty() {
+            return None;
+        }
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            r.consume(i + 1);
+            return Some(n + i + 1);
+        }
+        let len = buf.len();
+        r.consume(len);
+        n += len;
+        if n > max {
+            return None;
+        }
+    }
+}
+
 /// A server's text, as far as a log line should hold it.
 fn clip(s: &str) -> String {
     let s: String = s.chars().take(200).collect();
     sync_policy::approve::visible(&s)
 }
 
-async fn read_lines(stdout: tokio::process::ChildStdout, tx: mpsc::Sender<Line>, max_line: usize) {
+async fn read_lines(
+    stdout: tokio::process::ChildStdout,
+    tx: mpsc::Sender<Line>,
+    max_line: usize,
+    max_skip: usize,
+) {
     let mut r = BufReader::new(stdout);
     loop {
         let mut buf = Vec::new();
@@ -464,8 +507,11 @@ async fn read_lines(stdout: tokio::process::ChildStdout, tx: mpsc::Sender<Line>,
             return;
         }
         if !buf.ends_with(b"\n") && buf.len() > max_line {
-            let _ = tx.send(Line::TooLong).await;
-            return;
+            let skipped = skip_line(&mut r, max_skip).await.map(|k| k + n);
+            if tx.send(Line::TooLong(skipped)).await.is_err() || skipped.is_none() {
+                return;
+            }
+            continue;
         }
         let text = buf.trim_ascii();
         if text.is_empty() {

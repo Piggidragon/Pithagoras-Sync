@@ -393,10 +393,12 @@ pub struct Updated {
 /// `update` and the daily look: the newest signed pins, and every installed
 /// server moved to what they pin, into a new folder; consent, allow-list
 /// settings and the rest of the config stay. A failure leaves the old
-/// version as it is.
+/// version as it is. With `hold` (why), the pins are taken but no new
+/// version is installed: an install starts the server once.
 pub async fn update(
     dirs: &Dirs,
     check: bool,
+    hold: Option<&str>,
     say: &mut (dyn FnMut(String) + Send),
 ) -> Result<Updated, String> {
     let mut out = Updated::default();
@@ -484,6 +486,13 @@ pub async fn update(
                 pin.version, rec.version
             ));
             out.changed.push(name.clone());
+            continue;
+        }
+        if let Some(why) = hold {
+            out.notes.push(format!(
+                "computer use: {name} {} waits, {why} (installed: {})",
+                pin.version, rec.version
+            ));
             continue;
         }
         say(format!(
@@ -589,6 +598,19 @@ pub fn check_tick() -> std::time::Duration {
     std::time::Duration::from_secs(60)
 }
 
+/// Why the daily look installs nothing now: an install starts the new
+/// version once (on Windows with a screenshot), which neither a paused device
+/// nor a consent that is off allows. The pins are taken all the same.
+pub fn hold_updates(paused: bool, cfg: &DeviceConfig, now_ms: i64) -> Option<&'static str> {
+    if paused {
+        Some("the device is paused")
+    } else if cfg.policy.computer_use.effective(now_ms) == sync_policy::Consent::Off {
+        Some("computer use is off")
+    } else {
+        None
+    }
+}
+
 /// Whether the daily look is due: switched on, a server installed, its time
 /// come.
 pub fn check_due(cfg: &DeviceConfig, now_ms: i64, next_ms: i64) -> bool {
@@ -661,6 +683,28 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn the_daily_look_installs_nothing_while_paused_or_off() {
+        let mut cfg = DeviceConfig::default();
+        assert_eq!(hold_updates(false, &cfg, 0), Some("computer use is off"));
+        cfg.policy
+            .computer_use
+            .set(sync_policy::Consent::Ask, None, 0)
+            .unwrap();
+        assert_eq!(hold_updates(false, &cfg, 0), None);
+        assert_eq!(hold_updates(true, &cfg, 0), Some("the device is paused"));
+        cfg.policy
+            .computer_use
+            .set(sync_policy::Consent::Allow, Some(10), 0)
+            .unwrap();
+        assert_eq!(hold_updates(false, &cfg, 1), None);
+        assert_eq!(
+            hold_updates(false, &cfg, 10 * 60_000),
+            Some("computer use is off"),
+            "an allow that ran out"
+        );
     }
 
     #[test]

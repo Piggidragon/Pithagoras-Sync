@@ -513,6 +513,13 @@ async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| unknown(method))?;
             let p: ApprovalAnswerParams = parse(params)?;
+            // The agent may be clicking in the owner's browser, on the
+            // portal's Devices tab too: what only takes away goes through.
+            if p.answer != Choice::Deny
+                && shared.device.computer_use().is_some_and(|cu| cu.active())
+            {
+                return Err(RpcError::new(code::DENIED, COMPUTER_USE_ACTIVE));
+            }
             queue
                 .answer(p.id, p.answer, p.minutes, "portal")
                 .map_err(|e| match e {
@@ -573,6 +580,9 @@ async fn dispatch(
         _ => Err(unknown(method)),
     }
 }
+
+/// Why an answer other than `deny` is refused while computer use is active.
+pub const COMPUTER_USE_ACTIVE: &str = "computer use is active (a call within the last minute), and the agent could be clicking this answer: only deny is taken until it has been idle for a minute";
 
 fn unknown(method: &str) -> RpcError {
     RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {method}"))

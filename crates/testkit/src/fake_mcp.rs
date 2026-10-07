@@ -19,7 +19,7 @@
 //! window list fails), `sync-window` (a window titled `Pithagoras Sync: ...` is
 //! open), `pages` (lists tools two per page), `child` (starts a child process
 //! that sleeps, its pid in the pid file), `audio` (answers a call with audio
-//! content).
+//! content), `rpc-error` (answers a tool call with a JSON-RPC error).
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -222,6 +222,10 @@ pub fn main_with(args: &[String]) {
                 }
                 if fake.has("crash") {
                     std::process::exit(9);
+                }
+                if fake.has("rpc-error") {
+                    fake.send(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "invalid coordinates"}}));
+                    continue;
                 }
                 if fake.has("garbage") {
                     for _ in 0..3 {

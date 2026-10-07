@@ -1875,7 +1875,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let client = update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await;
             // The computer-use server moves with its own pins, also when there
             // is no newer client (or this build cannot update itself).
-            let mcp = crate::computer_use::update(&dirs, check, &mut |l| println!("{l}")).await;
+            let mcp =
+                crate::computer_use::update(&dirs, check, None, &mut |l| println!("{l}")).await;
             if let Ok(u) = &mcp
                 && !check
                 && !u.changed.is_empty()
@@ -2067,7 +2068,7 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
         }
         ComputerUseCmd::Update { check } => {
             owner::not_from_own_command(dirs).await?;
-            let u = cu::update(dirs, check, &mut |l| println!("{l}")).await?;
+            let u = cu::update(dirs, check, None, &mut |l| println!("{l}")).await?;
             if !check && !u.changed.is_empty() {
                 reload_running(dirs).await;
             }

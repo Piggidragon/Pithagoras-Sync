@@ -117,7 +117,7 @@ pub fn tree_hash(dir: &Path) -> Result<String, String> {
     let mut lines = String::new();
     for rel in files(dir)? {
         let path = rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
-        let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let sum = file_sha256(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         #[cfg(unix)]
         let x = {
             use std::os::unix::fs::PermissionsExt;
@@ -129,9 +129,31 @@ pub fn tree_hash(dir: &Path) -> Result<String, String> {
         };
         #[cfg(not(unix))]
         let x = "-";
-        lines.push_str(&format!("{rel}\t{x}\t{}\n", sha256_hex(&data)));
+        lines.push_str(&format!("{rel}\t{x}\t{sum}\n"));
     }
     Ok(sha256_hex(lines.as_bytes()))
+}
+
+/// The sha256 of a file in lowercase hex, read in pieces: a server's
+/// folder may hold files of many megabytes.
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    Ok(ctx
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// On Unix: `dir` and every folder from `base` down to it belong to this user
