@@ -163,6 +163,11 @@ pub trait Host {
     async fn owner_password(&self, pw: &Secret) -> Result<bool, String>;
     /// `install`; returns its notes.
     async fn install(&self) -> Result<Vec<String>, String>;
+    /// Whether the window offers computer use: a server is pinned for this
+    /// platform and it is not installed yet.
+    fn computer_use_offered(&self) -> bool;
+    /// `computer-use install`; returns what it installed.
+    async fn install_computer_use(&self) -> Result<String, String>;
     /// `pair <link>`; returns its notes.
     async fn pair(&self, link: &str) -> Result<Vec<String>, String>;
     /// Waits up to `LINK_WAIT` for the client to connect.
@@ -461,13 +466,22 @@ async fn install_now(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Result<Vec<Stri
     if !owner_ok(d, h, t).await {
         return Err(Outcome::Failed);
     }
-    match h.install().await {
-        Ok(notes) => Ok(notes.iter().map(|n| shown(n)).collect()),
+    let mut notes: Vec<String> = match h.install().await {
+        Ok(notes) => notes.iter().map(|n| shown(n)).collect(),
         Err(e) => {
             d.error(&t.install_failed(&shown(&e)));
-            Err(Outcome::Failed)
+            return Err(Outcome::Failed);
         }
+    };
+    // Its own question, after the client is in place; a failure here leaves
+    // the client installed and says why.
+    if h.computer_use_offered() && d.question(t.computer_use_question()) {
+        notes.push(match h.install_computer_use().await {
+            Ok(what) => t.computer_use_installed(&shown(&what)),
+            Err(e) => t.computer_use_failed(&shown(&e)),
+        });
     }
+    Ok(notes)
 }
 
 /// The window that asks for the link (`install`: and says what installing
@@ -1224,6 +1238,22 @@ impl Host for RealHost {
         crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)
     }
 
+    fn computer_use_offered(&self) -> bool {
+        let store = crate::computer_use::store(&self.dirs);
+        let installable = crate::computer_use::pinned(&store.current())
+            .is_some_and(|p| p.unpinned(sync_mcp::arch()).is_none());
+        let installed = crate::cli::load_config(&self.dirs).is_ok_and(|c| !c.mcp.is_empty());
+        // With the release key a newer signed document may pin it.
+        !installed && (installable || store.key.is_some())
+    }
+
+    async fn install_computer_use(&self) -> Result<String, String> {
+        let mut lines = Vec::new();
+        let r = crate::computer_use::install_now(&self.dirs, &mut |l| lines.push(l)).await;
+        let _ = crate::control::send(&self.dirs.socket(), crate::control::Request::Reload).await;
+        r
+    }
+
     async fn pair(&self, link: &str) -> Result<Vec<String>, String> {
         let cfg = crate::cli::load_config(&self.dirs)?;
         crate::cli::pair_device(&self.dirs, cfg, link, None)
@@ -1535,6 +1565,8 @@ mod tests {
         log_fails: Option<&'static str>,
         /// This build has the release key.
         updates: bool,
+        /// The install window offers computer use.
+        computer_use: bool,
         /// The release `update --check` offers; `None`: up to date.
         release: Option<&'static str>,
         /// The running client's version, older than the program's file.
@@ -1582,6 +1614,7 @@ mod tests {
                 log: LogPlace::Journal("pithagoras-sync.service"),
                 log_fails: None,
                 updates: true,
+                computer_use: false,
                 release: None,
                 stale_client: None,
                 no_restart: false,
@@ -1679,6 +1712,13 @@ mod tests {
             self.step("install")?;
             *self.installed.lock().unwrap() = true;
             Ok(self.install_notes.clone())
+        }
+        fn computer_use_offered(&self) -> bool {
+            self.computer_use
+        }
+        async fn install_computer_use(&self) -> Result<String, String> {
+            self.step("install computer use")?;
+            Ok("fake 1.0.0".into())
         }
         async fn pair(&self, link: &str) -> Result<Vec<String>, String> {
             self.step(&format!("pair {link}"))?;
@@ -2211,6 +2251,71 @@ mod tests {
 
     /// Windows without a link at hand: install, then the box that reads the
     /// link from the clipboard; the install's notes in that box's text.
+    #[tokio::test]
+    async fn the_install_offers_computer_use_after_the_client() {
+        // Yes to the install, yes to computer use, then no link.
+        let h = FakeHost {
+            computer_use: true,
+            ..FakeHost::default()
+        };
+        let (o, seen) = run_as(
+            Style::Boxes,
+            Lang::En,
+            &h,
+            &["yes", "yes", "cancel"],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(h.did(), ["install", "install computer use"]);
+        assert!(
+            seen[1].starts_with("question: Also install computer use?"),
+            "{seen:#?}"
+        );
+        assert!(seen[1].contains("as strong as Full mode"), "{seen:#?}");
+        assert!(
+            seen[2].contains("Computer use (fake 1.0.0) is installed and off"),
+            "{seen:#?}"
+        );
+        // No: the client alone.
+        let h = FakeHost {
+            computer_use: true,
+            ..FakeHost::default()
+        };
+        let (_, seen) = run_as(
+            Style::Boxes,
+            Lang::De,
+            &h,
+            &["yes", "no", "cancel"],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(h.did(), ["install"]);
+        assert!(seen[1].contains("Computersteuerung"), "{seen:#?}");
+        // A failure leaves the client installed and says so.
+        let h = FakeHost {
+            computer_use: true,
+            fail: Some("install computer use"),
+            ..FakeHost::default()
+        };
+        let (o, seen) = run_as(
+            Style::Boxes,
+            Lang::En,
+            &h,
+            &["yes", "yes", "cancel"],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Done);
+        assert!(
+            seen[2].contains("Computer use was not installed"),
+            "{seen:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn windows_without_a_link_keeps_the_two_steps() {
         let h = FakeHost {
