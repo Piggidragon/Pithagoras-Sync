@@ -315,20 +315,56 @@ pub fn desktop_plan(data_home: &Path, program: &Path, cache: bool) -> Result<Vec
     Ok(plan)
 }
 
-/// Undoes `desktop_plan`. The `x-scheme-handler` line `xdg-mime` wrote to
-/// `mimeapps.list` stays: the file is the desktop's, and the line leads nowhere
-/// once the entry is gone. `cache`: as for `desktop_plan`; the cache is
-/// rebuilt without the icon, and stays.
-pub fn desktop_uninstall_plan(data_home: &Path, cache: bool) -> Vec<Action> {
+/// The desktop's list of default programs, in its config home: where
+/// `xdg-mime default` wrote the link handler.
+pub fn mimeapps_file(config_home: &Path) -> PathBuf {
+    config_home.join("mimeapps.list")
+}
+
+/// The type `xdg-mime default` set the handler for.
+fn scheme_mime() -> String {
+    format!("x-scheme-handler/{SCHEME}")
+}
+
+/// Whether the desktop's list of default programs still names the program as
+/// the handler of its links.
+pub fn mime_handler_left(config_home: &Path) -> bool {
+    std::fs::read_to_string(mimeapps_file(config_home)).is_ok_and(|t| {
+        crate::actions::without_mime_handler(&t, &scheme_mime(), DESKTOP_FILE).is_some()
+    })
+}
+
+/// Undoes `desktop_plan`: the entry, the icons and the folders that held
+/// them, and the program as the handler of its links in the desktop's list
+/// of default programs (`config_home/mimeapps.list`): that line only, and no
+/// other program's. `cache`: as for `desktop_plan`; the cache is rebuilt
+/// without the icon, and stays.
+pub fn desktop_uninstall_plan(data_home: &Path, config_home: &Path, cache: bool) -> Vec<Action> {
     let apps = data_home.join("applications");
     let mut plan = vec![Action::Remove {
         path: apps.join(DESKTOP_FILE),
     }];
+    let icons = icon_paths(data_home);
     plan.extend(
-        icon_paths(data_home)
-            .into_iter()
-            .map(|path| Action::Remove { path }),
+        icons
+            .iter()
+            .map(|path| Action::Remove { path: path.clone() }),
     );
+    // `<size>x<size>/apps` and then `<size>x<size>`: made by the install, and
+    // left empty by it. The folders of the icon theme above them are the
+    // desktop's, and a folder with anything else in it stays.
+    for icon in &icons {
+        for dir in icon.ancestors().skip(1).take(2) {
+            plan.push(Action::RemoveEmptyDir {
+                path: dir.to_path_buf(),
+            });
+        }
+    }
+    plan.push(Action::DropMimeHandler {
+        path: mimeapps_file(config_home),
+        mime: scheme_mime(),
+        desktop: DESKTOP_FILE.into(),
+    });
     if cache {
         plan.push(icon_cache_update(
             data_home,
@@ -1123,7 +1159,12 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert!(hints[0].contains("generic icon"), "{hints:?}");
         let uninstall = Fake::default();
-        apply(&desktop_uninstall_plan(data, true), r, &uninstall).unwrap();
+        apply(
+            &desktop_uninstall_plan(data, Path::new("/home/someone/.config"), true),
+            r,
+            &uninstall,
+        )
+        .unwrap();
         assert!(!entry.exists() && !icon.exists());
         for p in icon_paths(data) {
             assert!(!crate::actions::rooted(r, &p).exists(), "{}", p.display());
@@ -1133,7 +1174,12 @@ mod tests {
         // made here would hide icons other programs add later.
         let fake = Fake::default();
         apply(&desktop_plan(data, program, false).unwrap(), r, &fake).unwrap();
-        apply(&desktop_uninstall_plan(data, false), r, &fake).unwrap();
+        apply(
+            &desktop_uninstall_plan(data, Path::new("/home/someone/.config"), false),
+            r,
+            &fake,
+        )
+        .unwrap();
         let ran = fake.ran.lock().unwrap().clone();
         assert!(
             ran.iter().all(|a| a[0] != "gtk-update-icon-cache"),
@@ -1167,6 +1213,71 @@ mod tests {
                 .any(|l| l.contains("gtk-update-icon-cache -f -t")),
             "{listed:?}"
         );
+    }
+
+    /// Uninstalling takes back what installing made: the icon folders it left
+    /// empty (never one with something else in it, and never the icon theme's
+    /// own `hicolor`), and the program as the handler of its links in the
+    /// desktop's list of default programs (never another entry).
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_leaves_no_empty_icon_folders_and_no_handler_line() {
+        let root = tempfile::tempdir().unwrap();
+        let (data, config) = (root.path().join("share"), root.path().join("config"));
+        let program = root.path().join("bin/pithagoras-sync");
+        let hicolor = data.join("icons/hicolor");
+        let list = config.join("mimeapps.list");
+        // Another program's icon in one of the sizes.
+        let other = hicolor.join("48x48/apps/other.png");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "png").unwrap();
+        let fake = Fake::default();
+        apply(
+            &desktop_plan(&data, &program, false).unwrap(),
+            Path::new("/"),
+            &fake,
+        )
+        .unwrap();
+        // What `xdg-mime default` wrote, among the owner's own entries.
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            &list,
+            "[Default Applications]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\nx-scheme-handler/https=browser.desktop\n",
+        )
+        .unwrap();
+        assert!(mime_handler_left(&config));
+        for dir in [
+            "64x64/apps",
+            "128x128/apps",
+            "256x256/apps",
+            "scalable/apps",
+        ] {
+            assert!(hicolor.join(dir).is_dir(), "{dir}");
+        }
+        let plan = desktop_uninstall_plan(&data, &config, false);
+        // `--print` lists what it would do.
+        assert!(plan.iter().any(|a| a.describe().contains(&format!(
+            "remove {} if it is empty",
+            hicolor.join("64x64/apps").display()
+        ))));
+        assert!(plan.iter().any(|a| a.describe().contains(&format!(
+            "take pithagoras-sync.desktop out of the handlers of x-scheme-handler/pithagoras-sync in {}",
+            list.display()
+        ))));
+        apply(&plan, Path::new("/"), &fake).unwrap();
+        for dir in ["64x64", "128x128", "256x256", "scalable"] {
+            assert!(!hicolor.join(dir).exists(), "{dir}");
+        }
+        // The other program's icon keeps its folders, and the theme stays.
+        assert!(other.is_file());
+        assert!(hicolor.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&list).unwrap(),
+            "[Default Applications]\nx-scheme-handler/https=browser.desktop\n"
+        );
+        assert!(!mime_handler_left(&config));
+        // Again, with nothing left: no error.
+        apply(&plan, Path::new("/"), &fake).unwrap();
     }
 
     /// Ending a logon task that does not run (on every first install) is no

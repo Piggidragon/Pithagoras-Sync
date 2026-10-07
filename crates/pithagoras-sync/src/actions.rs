@@ -182,6 +182,20 @@ pub enum Action {
     Remove {
         path: PathBuf,
     },
+    /// Removes a folder that is empty. One that is not, or is gone, stays: an
+    /// install made it, and something else may have put files in it since.
+    RemoveEmptyDir {
+        path: PathBuf,
+    },
+    /// Takes `desktop` out of the handlers `mime` has in the desktop's
+    /// `mimeapps.list` (`xdg-mime default` wrote it there), and nothing else:
+    /// every other line, section and handler stays. A file that holds
+    /// nothing else afterwards goes. Best effort, with a hint when it fails.
+    DropMimeHandler {
+        path: PathBuf,
+        mime: String,
+        desktop: String,
+    },
     Run {
         argv: Vec<String>,
     },
@@ -216,6 +230,17 @@ impl Action {
                 format!("copy {} to {}", from.display(), to.display())
             }
             Action::Remove { path } => format!("remove {}", path.display()),
+            Action::RemoveEmptyDir { path } => {
+                format!("remove {} if it is empty", path.display())
+            }
+            Action::DropMimeHandler {
+                path,
+                mime,
+                desktop,
+            } => format!(
+                "take {desktop} out of the handlers of {mime} in {}",
+                path.display()
+            ),
             Action::Run { argv } => format!("run: {}", shell_words(argv)),
             Action::Try { argv, .. } => format!("run (may fail): {}", shell_words(argv)),
             Action::RegSet { key, name, value } => format!(
@@ -289,6 +314,23 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
                     _ => {}
                 }
             }
+            Action::RemoveEmptyDir { path } => {
+                // Not empty, or gone already: left as it is.
+                let _ = std::fs::remove_dir(rooted(root, path));
+            }
+            Action::DropMimeHandler {
+                path,
+                mime,
+                desktop,
+            } => {
+                let p = rooted(root, path);
+                if let Err(e) = drop_mime_handler(&p, mime, desktop) {
+                    hints.push(format!(
+                        "{}: {e}: take {desktop} out of the handlers of {mime} there by hand",
+                        p.display()
+                    ));
+                }
+            }
             Action::Run { argv } => {
                 runner.run(argv)?;
             }
@@ -312,6 +354,85 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
         }
     }
     Ok(hints)
+}
+
+/// `text` of a `mimeapps.list` without `desktop` among the handlers of `mime`
+/// in its `[Default Applications]` and `[Added Associations]`; `None` when it
+/// had none. A line that lists other handlers as well keeps them, in their
+/// order; everything else is copied as it was, line ends included.
+pub fn without_mime_handler(text: &str, mime: &str, desktop: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut section = "";
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let end = &line[body.len()..];
+        let head = body.trim();
+        if head.starts_with('[') && head.ends_with(']') {
+            section = &head[1..head.len() - 1];
+        }
+        let listed = matches!(section, "Default Applications" | "Added Associations");
+        let Some((key, value)) = body
+            .split_once('=')
+            .filter(|(key, _)| listed && key.trim() == mime)
+        else {
+            out.push_str(line);
+            continue;
+        };
+        let ids: Vec<&str> = value
+            .split(';')
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .collect();
+        if !ids.contains(&desktop) {
+            out.push_str(line);
+            continue;
+        }
+        changed = true;
+        let kept: Vec<&str> = ids.into_iter().filter(|i| *i != desktop).collect();
+        if !kept.is_empty() {
+            let semicolon = if value.trim_end().ends_with(';') {
+                ";"
+            } else {
+                ""
+            };
+            out.push_str(&format!("{key}={}{semicolon}{end}", kept.join(";")));
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Whether `text` says nothing but section headers and blank lines.
+fn only_headers(text: &str) -> bool {
+    text.lines().all(|l| {
+        let l = l.trim();
+        l.is_empty() || (l.starts_with('[') && l.ends_with(']'))
+    })
+}
+
+/// `Action::DropMimeHandler`: the file that is not there is done.
+fn drop_mime_handler(path: &Path, mime: &str, desktop: &str) -> std::io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))?;
+    let Some(new) = without_mime_handler(&text, mime, desktop) else {
+        return Ok(());
+    };
+    if only_headers(&new) {
+        return std::fs::remove_file(path);
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)?.permissions().mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    write_file(path, new.as_bytes(), mode)
 }
 
 /// Writes through a temporary file and a rename, so a running program is replaced
@@ -385,6 +506,111 @@ impl Runner for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIME: &str = "x-scheme-handler/pithagoras-sync";
+    const DESKTOP: &str = "pithagoras-sync.desktop";
+
+    /// Only the program's own handler goes out of `mimeapps.list`: other
+    /// types, other programs' handlers (also for the same type), comments,
+    /// the order of the rest and the line ends stay.
+    #[test]
+    fn only_our_handler_leaves_the_list_of_default_programs() {
+        let text = "# mine\n[Default Applications]\nx-scheme-handler/https=firefox.desktop\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\ntext/html=a.desktop;pithagoras-sync.desktop;\n\n[Added Associations]\nx-scheme-handler/pithagoras-sync=other.desktop;pithagoras-sync.desktop;third.desktop\n[Other]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\n";
+        let new = without_mime_handler(text, MIME, DESKTOP).unwrap();
+        assert_eq!(
+            new,
+            "# mine\n[Default Applications]\nx-scheme-handler/https=firefox.desktop\ntext/html=a.desktop;pithagoras-sync.desktop;\n\n[Added Associations]\nx-scheme-handler/pithagoras-sync=other.desktop;third.desktop\n[Other]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\n"
+        );
+        // Nothing of ours (another program is the handler): nothing changes.
+        let other = "[Default Applications]\nx-scheme-handler/pithagoras-sync=other.desktop\n";
+        assert_eq!(without_mime_handler(other, MIME, DESKTOP), None);
+        assert_eq!(without_mime_handler("", MIME, DESKTOP), None);
+        // Line ends and a last line without one stay as they were.
+        let crlf = "[Default Applications]\r\nx-scheme-handler/pithagoras-sync = a.desktop;pithagoras-sync.desktop\r\nb=c";
+        assert_eq!(
+            without_mime_handler(crlf, MIME, DESKTOP).unwrap(),
+            "[Default Applications]\r\nx-scheme-handler/pithagoras-sync =a.desktop\r\nb=c"
+        );
+    }
+
+    /// `DropMimeHandler` on files: the other entries stay, a file left with
+    /// nothing but headers goes, a missing one is done, and a failure is a
+    /// hint, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_handler_edits_the_file_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimeapps.list");
+        let drop = || Action::DropMimeHandler {
+            path: path.clone(),
+            mime: MIME.into(),
+            desktop: DESKTOP.into(),
+        };
+        let run = |a: Action| apply(&[a], Path::new("/"), &Fake::default()).unwrap();
+        // No file: nothing to do.
+        assert!(run(drop()).is_empty());
+        std::fs::write(
+            &path,
+            "[Default Applications]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\nx-scheme-handler/mailto=m.desktop\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(run(drop()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[Default Applications]\nx-scheme-handler/mailto=m.desktop\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Again: nothing of ours left, the file is not touched.
+        run(drop());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("mailto"));
+        // Only our line in it: nothing is left to keep.
+        std::fs::write(
+            &path,
+            "[Default Applications]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\n",
+        )
+        .unwrap();
+        run(drop());
+        assert!(!path.exists());
+        // A comment is something to keep.
+        std::fs::write(
+            &path,
+            "# keep\n[Default Applications]\nx-scheme-handler/pithagoras-sync=pithagoras-sync.desktop\n",
+        )
+        .unwrap();
+        run(drop());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# keep\n[Default Applications]\n"
+        );
+        // A file that is no text is left alone, with a hint.
+        std::fs::write(&path, [0xff, 0xfe, b'[']).unwrap();
+        let hints = run(drop());
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("by hand"), "{hints:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, b'[']);
+    }
+
+    /// `RemoveEmptyDir` removes what is empty and nothing else.
+    #[test]
+    fn only_an_empty_folder_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (empty, full) = (dir.path().join("empty"), dir.path().join("full"));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("x"), "x").unwrap();
+        let plan: Vec<Action> = [&empty, &full, &dir.path().join("gone")]
+            .iter()
+            .map(|p| Action::RemoveEmptyDir { path: (*p).clone() })
+            .collect();
+        apply(&plan, Path::new("/"), &Fake::default()).unwrap();
+        assert!(!empty.exists());
+        assert!(full.join("x").exists());
+    }
 
     /// A program that fails says why in the error, which a window shows: it
     /// has no console its text could go to.

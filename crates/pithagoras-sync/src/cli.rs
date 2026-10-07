@@ -798,7 +798,9 @@ fn status_text(s: &Status) -> String {
         let _ = writeln!(
             out,
             "Folder:    {} ({}{x})",
-            visible(&f.path),
+            // The client reports it in the portal's form; the owner reads
+            // the folder as `folder list` shows it.
+            visible(&sync_policy::paths::wire_for_display(&f.path)),
             access_text(f.access)
         );
     }
@@ -1188,17 +1190,23 @@ pub(crate) async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Re
     Ok(
         match control::send(&dirs.socket(), Request::Status).await? {
             Some(r) => r.status.is_some_and(|s| s.elevation_password),
-            None => match storage {
-                SecretStorage::Memory => false,
-                SecretStorage::File => crate::secrets::file(dirs).exists(),
-                // Without unlocking it: a status is no reason for a prompt.
-                SecretStorage::Keyring => sync_policy::keyring::system(dirs)
-                    .has(crate::secrets::ELEVATION)
-                    .await
-                    .unwrap_or(false),
-            },
+            None => password_kept(dirs, storage).await,
         },
     )
+}
+
+/// Whether the file or the keyring has the password the client loads at its
+/// next start; with memory storage it has none to load.
+pub(crate) async fn password_kept(dirs: &Dirs, storage: SecretStorage) -> bool {
+    match storage {
+        SecretStorage::Memory => false,
+        SecretStorage::File => crate::secrets::file(dirs).exists(),
+        // Without unlocking it: a status is no reason for a prompt.
+        SecretStorage::Keyring => sync_policy::keyring::system(dirs)
+            .has(crate::secrets::ELEVATION)
+            .await
+            .unwrap_or(false),
+    }
 }
 
 /// Takes the password from the terminal (or stdin) and gives it to the running
@@ -1885,12 +1893,23 @@ pub fn data_home(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".local/share"))
 }
 
-/// Whether `install` left a desktop entry or icon here.
-fn desktop_installed(data: &Path) -> bool {
+/// `$XDG_CONFIG_HOME`, or `~/.config`: where the desktop keeps its list of
+/// default programs.
+pub fn config_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+/// Whether `install` left a desktop entry, an icon or the link handler in the
+/// desktop's list of default programs here.
+fn desktop_installed(data: &Path, config: &Path) -> bool {
     data.join("applications")
         .join(install::DESKTOP_FILE)
         .exists()
         || install::icon_paths(data).iter().any(|p| p.exists())
+        || install::mime_handler_left(config)
 }
 
 pub(crate) fn install_plan(
@@ -1961,10 +1980,11 @@ pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     }
     let home = info::home().ok_or("cannot find the home directory")?;
     let mut plan = install::user_uninstall_plan(&home);
-    let data = data_home(&home);
-    if desktop_installed(&data) {
+    let (data, config) = (data_home(&home), config_home(&home));
+    if desktop_installed(&data, &config) {
         plan.extend(install::desktop_uninstall_plan(
             &data,
+            &config,
             install::icon_cache(&data).exists(),
         ));
     }
@@ -2008,6 +2028,10 @@ fn stop_note(
     };
     if deleted {
         "\nThe unit or task is deleted already: `install` sets it up again.".into()
+    } else if windows && !before.enabled && before.running {
+        // Nothing can start it: a switched-off task cannot be run, and the
+        // client was not the task's.
+        "\nThe logon task stays switched off, as it was before. The client that was running was stopped, and nothing starts it while the task is off: `pithagoras-sync run` starts it again.".into()
     } else if windows && !before.enabled {
         "\nThe logon task stays switched off, as it was before.".into()
     } else if windows {
@@ -2176,13 +2200,17 @@ pub(crate) async fn purge(
         if crate::registry::exists(install::WINDOWS_CLASS_KEY) {
             links = install::windows_link_uninstall_plan();
         }
-        if let Some(data) = home
+        if let Some((data, config)) = home
             .as_ref()
             .filter(|_| linux && !system)
-            .map(|h| data_home(h))
-            && desktop_installed(&data)
+            .map(|h| (data_home(h), config_home(h)))
+            && desktop_installed(&data, &config)
         {
-            links = install::desktop_uninstall_plan(&data, install::icon_cache(&data).exists());
+            links = install::desktop_uninstall_plan(
+                &data,
+                &config,
+                install::icon_cache(&data).exists(),
+            );
         }
         (Vec::new(), links)
     } else if cfg!(windows) {
@@ -2677,7 +2705,9 @@ mod tests {
         let n = after_stop_note(Some(idle), true, true, false, &fake);
         assert_eq!(n, "\nThe logon task was switched on again.");
         assert_eq!(*fake.ran.lock().unwrap(), [enable.clone()]);
-        // Switched off before: it stays so, whether a client ran beside it or not.
+        // Switched off before: it stays so, whether a client ran beside it or
+        // not. One that did was stopped and nothing can start it (a switched
+        // off task cannot be run): the note says so and how to start it.
         for running in [false, true] {
             let fake = Fake::default();
             let b = Before {
@@ -2685,7 +2715,17 @@ mod tests {
                 running,
             };
             let n = after_stop_note(Some(b), true, true, false, &fake);
-            assert_eq!(n, "\nThe logon task stays switched off, as it was before.");
+            let off = "\nThe logon task stays switched off, as it was before.";
+            if running {
+                assert!(n.starts_with(off), "{n}");
+                assert!(
+                    n.contains("The client that was running was stopped")
+                        && n.contains("`pithagoras-sync run` starts it again"),
+                    "{n}"
+                );
+            } else {
+                assert_eq!(n, off);
+            }
             assert!(fake.ran.lock().unwrap().is_empty());
         }
         let fake = Fake {
@@ -2784,6 +2824,13 @@ mod tests {
         let w = stop_note(b(true, true), false, true, false);
         assert!(w.contains("/TN \"Pithagoras Sync\" /ENABLE"), "{w}");
         assert!(stop_note(b(false, false), false, true, false).contains("stays switched off"));
+        // A client that was running beside the switched-off task was stopped
+        // too, and nothing starts it again.
+        let n = stop_note(b(false, true), false, true, false);
+        assert!(n.contains("stays switched off"), "{n}");
+        assert!(n.contains("was stopped"), "{n}");
+        assert!(n.contains("`pithagoras-sync run`"), "{n}");
+        assert!(!stop_note(b(false, false), false, true, false).contains("was stopped"));
         // As it was: switched on and started, only one of them, or neither.
         for (system, sc) in [(false, "systemctl --user"), (true, "sudo systemctl")] {
             for (enabled, running, what) in [
@@ -2810,12 +2857,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn portal_text_cannot_redraw_the_status() {
-        // The portal's close reason conceals what follows, a folder path it set
-        // moves the cursor up and erases the line above, its device id clears the
-        // screen.
-        let s = Status {
+    /// A status of a client with one folder, whose texts hold what the portal
+    /// may not use to redraw the screen.
+    fn status_for_test() -> Status {
+        Status {
             pid: 1,
             version: "0.1.0".into(),
             profile: sync_policy::Profile::Headless,
@@ -2845,7 +2890,15 @@ mod tests {
             config_file: "/c".into(),
             audit_file: "/a".into(),
             exe: "/usr/local/bin/pithagoras-sync".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn portal_text_cannot_redraw_the_status() {
+        // The portal's close reason conceals what follows, a folder path it set
+        // moves the cursor up and erases the line above, its device id clears the
+        // screen.
+        let s = status_for_test();
         let text = status_text(&s);
         assert!(
             !text
@@ -2857,6 +2910,25 @@ mod tests {
         assert!(text.contains("device dev\\u{1b}[2J"), "{text}");
         assert!(text.contains("\nPAUSED:"), "{text}");
         assert!(text.contains("\nMode:      ask\n"), "{text}");
+    }
+
+    /// The running client reports its folders in the portal's form
+    /// (`/c/pst/work`); the owner reads them as `folder list` shows them from
+    /// the config (`C:\pst\work`). Windows only: elsewhere the two are one.
+    #[cfg(windows)]
+    #[test]
+    fn status_shows_a_windows_folder_as_windows_writes_it() {
+        let mut s = status_for_test();
+        s.folders = vec![FolderInfo {
+            path: "/c/pst/work/fx".into(),
+            access: Access::Ro,
+            execute: false,
+        }];
+        let text = status_text(&s);
+        assert!(
+            text.contains("\nFolder:    C:\\pst\\work\\fx (ro)\n"),
+            "{text}"
+        );
     }
 
     #[test]

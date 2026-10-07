@@ -47,6 +47,8 @@ The confirmation shows the portal it would pair with and the name your computer 
 
 Below it says what the agent may do right after pairing: this computer's mode, which pairing keeps. Normally that is "every call asks you first"; if you switched this computer to `folders` or `full` earlier, the window says so, and for `full` that the agent then acts with your rights right away. For a portal on this computer over plain `http` it adds who else could answer on its port, as `pair` does ([windows.md](windows.md#plain-http-to-a-local-portal)).
 
+A long portal address is shortened in the windows: its start stays, the end of its path is replaced by "…" (a window is as wide as its longest line). The scheme, host and port always show whole; the pairing uses the full address.
+
 Check that this is your portal. A link that is not a valid pairing link, that names a portal on another machine over plain `http`, or whose portal address has spaces or other characters a real address does not need (it could make the question read differently) is refused before anything happens; typed into the form, the form comes back with why at its top.
 
 The login password (Linux desktop) is checked with `su` and not kept: pairing decides whose agent may use this computer, and a program of the agent that clicks through the windows does not know it. When `su` fails for another reason (an expired password, say), the window shows what it said instead of calling the password wrong. A password `su` refused is asked for again, three times at most per start of the program (an empty one counts, and Pair again in the menu does not start the count anew): after the third the program closes, so a program clicking through the windows cannot go on guessing. If it cannot be checked (some login setups ask for a fingerprint or a security key instead), pair in a terminal: `pithagoras-sync pair '<link>'`.
@@ -57,7 +59,7 @@ From now on the portal's agent can ask to use this computer. Until you change it
 
 ## 4. Later: the menu
 
-Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows one window: at the top whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on, read anew each time the window opens (a client that does not answer within two seconds shows as running but not answering, with the rest from the settings); below it the actions. **Open** runs the one you picked; **Close** (or closing the window) ends the program, and the client keeps running in the background. (On KDE the two buttons keep kdialog's own labels, OK and Cancel.)
+Open Pithagoras Sync again (from the menu on Linux, or by double clicking the program). Once it is installed and paired, it shows one window: at the top whether it runs, the portal, the mode, the folders it may use, approvals waiting for you and (Linux) whether sudo access is on, read anew each time the window opens (a client that does not answer within two seconds shows as running but not answering, with the rest from the settings; right after an update restarted the client, one that has not answered yet shows as restarting, for up to a minute, instead of not running); below it the actions. **Open** runs the one you picked; **Close** (or closing the window) ends the program, and the client keeps running in the background. (On KDE the two buttons keep kdialog's own labels, OK and Cancel.)
 
 - **Pair again:** pair with another portal, or again with the same one: the link (and on GNOME the login password) in one window, then the question, which says it replaces the pairing.
 - **Sudo access** (Linux only): see below.
@@ -81,7 +83,7 @@ What happened (sudo access is on, the password is forgotten, why sudo refused th
 
 If `sudo` asks you no password on this computer (a rule in sudoers says so), there is nothing to store and the window says so; switching sudo access on then is a terminal command, `pithagoras-sync sudo activate --no-password`, because the window cannot tell that you are the one asking.
 
-By default the client keeps the password in its memory only, so after a restart (a reboot, an update) enter it again. Without the client running it cannot take it then: the window says to start the client first. [permissions.md](permissions.md) explains the other places (`policy.privilege.secret_storage`).
+By default the client keeps the password in its memory only, so after a restart (a reboot, an update) enter it again; until you do, sudo access stays switched on and the menu says "Sudo access: on, but no password is stored". Without the client running it cannot take it then: the window says to start the client first. [permissions.md](permissions.md) explains the other places (`policy.privilege.secret_storage`).
 
 ## 6. Uninstall
 
@@ -90,9 +92,9 @@ Choose **Uninstall** in the menu. Where the system unit runs the client (`instal
 1. "Uninstall Pithagoras Sync?" **No** changes nothing.
 2. "Also remove the pairing and all settings?" **Yes** removes everything the client keeps: the pairing, the settings with their folders, the logs, a password or token in the keyring. **No** keeps them, so a later install picks up where you left off.
 
-Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login, or a folder that stays because something in it is not the client's). Remove the device in the portal as well (Settings, Devices).
+Either way the client stops, no longer starts at login, the menu entry goes and pairing links no longer open it. On Linux that includes what installing made besides the files: the icon's folders under `~/.local/share/icons/hicolor` when they are empty (one that holds another program's icon stays), and the line that makes Pithagoras Sync the handler of its links in `~/.config/mimeapps.list` (only that line, and only where it names Pithagoras Sync; every other entry stays, and the file goes only if nothing else is in it). The program file itself stays where it is, and the window says where, so you can delete it. Notes of the steps come with it, as the command line prints them (for example that the menu may show the entry until the next login, or a folder that stays because something in it is not the client's). Remove the device in the portal as well (Settings, Devices).
 
-If removing fails halfway, the window says what failed and that uninstalling again goes on with what is left. Where the unit or logon task is still there, it is first put back as it was before: switched on again if it was on, and started again if a client was running, so the computer does not stay offline. A unit or task you had switched off stays off, and a client that was not running is not started; the message says which.
+If removing fails halfway, the window says what failed and that uninstalling again goes on with what is left. Where the unit or logon task is still there, it is first put back as it was before: switched on again if it was on, and started again if a client was running, so the computer does not stay offline. A unit or task you had switched off stays off, and a client that was not running is not started; the message says which. On Windows a client you started by hand beside a logon task you had switched off cannot be started again by the task (a switched-off task cannot be run), so it stays stopped; the message says that it was stopped and that `pithagoras-sync run` starts it again.
 
 ## What the windows never do
 
