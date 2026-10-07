@@ -8,7 +8,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-They use temp dirs, fake roots, fake `sudo` scripts and the mock portal in `crates/testkit`; they never touch the real config, systemd, the user's notification service, a real keyring, the registry or a real portal. `crates/pithagoras-sync/tests/e2e.rs` runs the real binary against the mock portal, `tests/update.rs` runs the updater against releases in temp dirs and on a loopback HTTP server. The Windows tests run on a Windows machine with `scripts/windows-vm-test.sh <host>`.
+They use temp dirs, fake roots, fake `sudo` scripts, the mock portal and the fake MCP server in `crates/testkit`; they never touch the real config, systemd, the user's notification service, a real keyring, the registry or a real portal. `crates/pithagoras-sync/tests/e2e.rs` runs the real binary against the mock portal, `tests/update.rs` runs the updater against releases in temp dirs and on a loopback HTTP server, and `tests/computer_use.rs` installs the fake MCP server from signed test pins and a loopback file server and drives computer use through the mock portal.
+
+The client refuses to run as root, so the end-to-end tests that start it need an ordinary user; run as root (a container), they fail for that reason alone. The Windows tests run on a Windows machine with `scripts/windows-vm-test.sh <host>`.
 
 ## Tools for trying a real client by hand
 
@@ -31,6 +33,26 @@ PITHAGORAS_SYNC_UPDATE_KEY="$pub" cargo build --release -p pithagoras-sync
 ```
 
 next to `manifest.json.minisig` (`sync-test-sign sign test.key manifest.json`) and the binary. `url` is relative to the manifest or absolute. `released` is the time the manifest was made (Unix seconds, now unless `--released` names one); a client refuses a manifest released before the newest one it saw for that program (`~/.local/state/pithagoras-sync/update-released-<hash of the program's path>`) or the newest one this user installed (`update-released` beside it), with `update --check` as well, so a test folder made again needs a later time, or those files removed. `pithagoras-sync uninstall --purge --yes` removes them together with the rest of the client's files (config, pairing, logs) and leaves the program, so a test machine starts afresh between versions; run it as each user that ran the client, and with `sudo … uninstall --system --purge --yes` for root and the system unit.
+
+## Computer use without a screen
+
+`sync-fake-mcp` (in `crates/testkit`) is a fake MCP server on stdin and stdout: the same JSON-RPC lines as a real one, tools named like `computer-use-linux`'s (`screenshot`, `list_windows`, `get_cursor_position`, `mouse_move`, `mouse_click`, `type_text`, `press_key`, and `set_value` and `PowerShell` that must never be reached), a pointer it keeps in memory, and switches (`--mode`) for every way a server can misbehave: `hang`, `crash`, `garbage`, `long-line`, `flood`, `unknown-id`, `sampling` (asks the client for `sampling/createMessage` and `roots/list`), `no-move`, `new-tool`, `bad-version`, `slow-start`, `exit-at-start`, `windows-error`, `sync-window` (a window titled `Pithagoras Sync: ...` is open), `pages`, `child`, `audio`. `--record <file>` writes every request it gets; `--pid-file` its pid (and its child's). The tests of `crates/mcp` start it through `sync_testkit::fake_mcp::binary()`, which builds it when it is missing or older than its source.
+
+To try a real client with it by hand: make signed test pins that name `sync-fake-mcp` (served by any loopback HTTP server, or the test kit's `files::FileServer`) and point a debug build at them; the debug build alone reads these variables:
+
+```sh
+pub=$(sync-test-sign keygen test.key)
+# mcp.json as in docs/mcp-pins.md, one "linux" server whose file is sync-fake-mcp at http://127.0.0.1:<port>/fake-mcp
+sync-test-sign sign test.key mcp.json
+export PITHAGORAS_SYNC_TEST_MCP_PINS=$PWD/mcp.json PITHAGORAS_SYNC_TEST_MCP_KEY="$pub"
+pithagoras-sync computer-use install && pithagoras-sync computer-use allow --minutes 10
+```
+
+Then `sync-mock-portal`'s `mcp-list` and `mcp-call <server> <tool> [json]` list and call it (approvals are answered per `approve`). `PITHAGORAS_SYNC_TEST_MCP_CHECK_MS=<ms>` makes the daily look for new pins come that many milliseconds after the start.
+
+### The real server, by hand
+
+On a GNOME desktop with a signed pins document that pins `computer-use-linux` (docs/mcp-updates.md): `pithagoras-sync computer-use install`, `computer-use setup` (step by step, with the commands), `computer-use test --verbose` (a screenshot, the pointer moved 10 px and read back, every tool the server offers and which are allowed). Then a chat with a granted device: `computer-use ask`, and a screenshot, a click and typed text from the chat, each answer of the question once; `allow --minutes 5` and its end; a click while a Pithagoras Sync window is open (refused). GNOME can also run headless with a virtual monitor (`dbus-run-session gnome-shell --headless --virtual-monitor 1280x720`, with `gnome-shell`, `mutter`, `xdg-desktop-portal-gnome` and `at-spi2-core` installed), which was not tried here.
 
 ## The graphical flow and the keyring without a desktop
 

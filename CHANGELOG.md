@@ -2,6 +2,25 @@
 
 What changed in each release of Pithagoras Sync, newest first. Every release has a section here: the release workflow stops a version tag whose section is missing, and uses the section as the release notes. How to write one: [docs/releasing.md](docs/releasing.md).
 
+## 0.0.3 - unreleased
+
+Computer use: the agent of a granted chat can see the screen and use the pointer and keyboard, through an MCP server the client installs, checks and runs itself, behind a consent of its own.
+
+### Added
+
+- **Computer use** on Linux (`computer-use-linux`) and Windows 10/11 (Windows-MCP, with an embeddable Python the client brings, so no Python setup). `pithagoras-sync computer-use install` (or `install --computer-use`, or "Also install computer use?" in the install window) downloads the pinned server, checks every file's sha256 before writing it, tests that it starts, and records a hash of its folder that is checked before every start. `uninstall` and `uninstall --purge` remove it.
+- **A consent of its own**, off by default and set on the device only: `computer-use ask` (each chat asks: once, for this chat, or deny), `allow --minutes N` (at most 8 hours, then off), `off`. The portal can read it, never change it. `panic` stops every call and turns an allow into off.
+- **What holds while it is on:** an allow-list of exact tool names per server version (default deny, and a built-in deny-list no pins can open), arguments checked against the tool's schema, no clicks or keys while a Pithagoras Sync window is open (or when the client cannot tell), every call marks its chat as having seen untrusted content (so its next command asks in Full mode), a desktop notification at the start of each burst of calls (Linux), and `status` naming the chat.
+- **`computer-use setup`, `test` and `status`**: the steps the server needs on GNOME (with the commands, run only after a yes), a screenshot and a pointer moved 10 px and read back, and how it all stands.
+- **Updates of the server without a new client:** a pins document signed with the release key; `pithagoras-sync update` takes it and moves the server, and the client looks once a day at a random time (`policy.computer_use.auto_update`). `computer-use rollback` goes back one version. `sync-release mcp` makes the document ([docs/mcp-updates.md](docs/mcp-updates.md)).
+- **The protocol** for the portal side: `mcp.list`, `mcp.call`, `mcp.changed`, the `mcp` capability ([docs/protocol.md](docs/protocol.md)); the mock portal speaks it.
+
+### Known limits
+
+- The built-in pins hold `TODO-PIN` values (versions, URLs, hashes, Windows' Python and wheels): until the owner publishes a signed pins document, `computer-use install` installs nothing. The allowed tool names are not yet checked against the pinned releases.
+- Tried against a fake MCP server only. Not tried: the real servers, GNOME 46 (upstream validated GNOME 50), KDE Plasma (not validated upstream either), and anything of it on Windows (cross-built, its pure parts tested).
+- The screenshot is passed on as the server makes it; there is no downscaling on the device yet.
+
 ## 0.0.2 - 2026-10-07
 
 The graphical install: a person who never opens a terminal can install, pair, set up sudo access and uninstall the client. A server install stays command-line only and works as before.
