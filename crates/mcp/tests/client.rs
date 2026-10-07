@@ -182,6 +182,11 @@ async fn requests_from_the_server_are_refused_not_served() {
     let mut c = start(t.path(), &["sampling"], limits()).await;
     let r = c.call("screenshot", &Map::new()).await.unwrap();
     assert!(sync_mcp::content::convert(&r).is_ok());
+    // The server reads its input in order: once it answered the next request,
+    // it has read both refusals.
+    c.request("ping", json!({}), Duration::from_secs(5))
+        .await
+        .unwrap();
     c.kill().await;
     let rec = record(t.path());
     let answers: Vec<&str> = rec.lines().filter(|l| l.starts_with("answer ")).collect();

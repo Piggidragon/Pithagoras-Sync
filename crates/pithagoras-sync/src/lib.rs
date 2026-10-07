@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod cli;
+pub mod computer_use;
 pub mod config_cmd;
 pub mod control;
 pub mod daemon;

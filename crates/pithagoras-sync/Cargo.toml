@@ -18,6 +18,7 @@ sync-proto.workspace = true
 sync-policy.workspace = true
 sync-ops.workspace = true
 sync-connector.workspace = true
+sync-mcp.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

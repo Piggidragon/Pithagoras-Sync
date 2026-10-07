@@ -75,14 +75,15 @@ fn own(kind: Kind, name: &OsStr) -> bool {
             matches!(n, "config.toml" | "token" | "elevation.secret")
         }),
         Kind::State => {
-            // The commands' temporary folders.
+            // The commands' temporary folders, and the computer-use servers.
             name == "tmp"
+            || name == "mcp"
             // The logon task's XML, written by `install` with `.tmp<pid>`.
             || name.strip_prefix("logon-task.tmp").is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
             || written(name, |n| {
                 matches!(
                     n,
-                    "audit.jsonl" | "audit.jsonl.1" | "client.log" | "client.log.1" | "gui.log" | "gui.log.1" | "journal.log" | "paused" | "logon-task.xml"
+                    "audit.jsonl" | "audit.jsonl.1" | "client.log" | "client.log.1" | "gui.log" | "gui.log.1" | "journal.log" | "paused" | "logon-task.xml" | "mcp-pins-serial"
                 ) || update_record(n)
             })
         }

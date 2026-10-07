@@ -275,8 +275,16 @@ pub fn binary() -> PathBuf {
         .to_path_buf();
     let name = format!("sync-fake-mcp{}", std::env::consts::EXE_SUFFIX);
     let path = dir.join(&name);
+    // Built again only when its source is newer (a test run of one crate does
+    // not build another crate's programs).
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fake_mcp.rs");
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let current = matches!((modified(&path), modified(&source)), (Some(b), Some(s)) if b >= s);
     static BUILT: std::sync::Once = std::sync::Once::new();
     BUILT.call_once(|| {
+        if current {
+            return;
+        }
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let status = std::process::Command::new(cargo)
             .args([

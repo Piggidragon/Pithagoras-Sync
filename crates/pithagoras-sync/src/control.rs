@@ -45,6 +45,31 @@ pub enum Request {
     /// Exit for the unit (or logon task) to start the client again: after an
     /// update.
     Restart,
+    /// Computer use: the servers as the client runs them; with `probe`, each
+    /// is started if need be and asked whether it answers.
+    McpStatus {
+        #[serde(default)]
+        probe: bool,
+    },
+    /// Computer use: `computer-use test` on the running client's server.
+    McpTest {
+        #[serde(default)]
+        verbose: bool,
+    },
+}
+
+/// Computer use as the running client sees it (`computer-use status`, `test`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct McpReport {
+    pub servers: Vec<sync_mcp::service::ServerStatus>,
+    #[serde(default)]
+    pub in_use: Option<sync_mcp::service::InUse>,
+    /// The steps of `computer-use test`.
+    #[serde(default)]
+    pub test: Vec<sync_mcp::selftest::Step>,
+    /// How the last look for new pins went (the daily check or `update`).
+    #[serde(default)]
+    pub last_update: Option<String>,
 }
 
 /// How long the CLI waits for the client's answer.
@@ -89,6 +114,10 @@ impl Request {
         match self {
             Request::SecretSet { .. } | Request::SecretClear { .. } | Request::Unlock => {
                 KEYRING_REPLY_WAIT
+            }
+            // A server's start, the screenshot and the pointer steps.
+            Request::McpTest { .. } | Request::McpStatus { probe: true } => {
+                Duration::from_secs(240)
             }
             _ => REPLY_WAIT,
         }
@@ -137,6 +166,9 @@ pub struct Status {
     /// task starts again, and so what `update` replaces.
     #[serde(default)]
     pub exe: String,
+    /// Computer use in one line: the consent, the servers, who uses the screen.
+    #[serde(default)]
+    pub computer_use: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +183,8 @@ pub struct Reply {
     /// Approvals left out of `approvals` to keep the answer small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_out: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpReport>,
 }
 
 impl Reply {
@@ -161,6 +195,7 @@ impl Reply {
             status: None,
             approvals: None,
             left_out: None,
+            mcp: None,
         }
     }
 
@@ -171,6 +206,7 @@ impl Reply {
             status: None,
             approvals: None,
             left_out: None,
+            mcp: None,
         }
     }
 }

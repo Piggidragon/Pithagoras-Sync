@@ -25,6 +25,10 @@ pub fn private_dirs(base: &Path, dir: &Path) -> Result<(), String> {
     let rel = dir
         .strip_prefix(base)
         .map_err(|_| format!("{} is outside {}", dir.display(), base.display()))?;
+    // The client's own state folder above it may not be there yet.
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
     let mut at = base.to_path_buf();
     make_private(&at)?;
     for c in rel.components() {

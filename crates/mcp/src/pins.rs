@@ -682,7 +682,6 @@ impl PinStore {
         if doc.serial == seen && self.kept().is_some() {
             return Ok(Taken::Same(doc));
         }
-        crate::fsutil::private_dirs(self.dir.parent().unwrap_or(&self.dir), &self.dir)?;
         sync_policy::config::write_private(&self.doc_file(), data)
             .and_then(|()| {
                 sync_policy::config::write_private(
@@ -727,6 +726,26 @@ pub async fn fetch(url: &str, max: usize, hosts_checked: bool) -> Result<Vec<u8>
         return Err(format!("{}: too large", path.display()));
     }
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Fetches and checks the signed document at `url` as `check` does, without
+/// keeping anything: what `install --print` shows.
+pub async fn peek(store: &PinStore, url: &str) -> Result<Document, String> {
+    let key = store
+        .key
+        .as_deref()
+        .ok_or("this build has no release key")?;
+    let data = fetch(url, MAX_DOCUMENT, false).await?;
+    let sig = fetch(&format!("{url}.minisig"), 4096, false).await?;
+    let sig = String::from_utf8(sig).map_err(|_| "the pins signature is not text".to_string())?;
+    let doc = verify(&data, &sig, key)?;
+    if doc.serial < store.seen_serial() {
+        return Err(format!(
+            "the pins document has serial {}, older than one taken before",
+            doc.serial
+        ));
+    }
+    Ok(doc)
 }
 
 /// Fetches the signed document at `url` and takes it into `store`.

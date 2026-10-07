@@ -154,7 +154,19 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SudoCmd,
     },
-    /// Replace this program with a newer signed release, and restart the client.
+    /// Let the portal's agent see the screen and use the pointer and keyboard.
+    ///
+    /// Computer use goes through an MCP server the client installs and runs
+    /// itself (computer-use-linux on Linux, Windows-MCP on Windows). It is as
+    /// strong as Full mode: the agent can click and type anything you can, a
+    /// terminal included. It is off until you say `ask` or `allow`.
+    #[command(name = "computer-use", arg_required_else_help = true)]
+    ComputerUse {
+        #[command(subcommand)]
+        cmd: ComputerUseCmd,
+    },
+    /// Replace this program with a newer signed release, and restart the
+    /// client; update the computer-use server to the newest signed pins too.
     Update {
         /// Only say whether there is one.
         #[arg(long)]
@@ -174,6 +186,9 @@ pub enum Cmd {
         /// Do not enable lingering for a user unit on a machine without a desktop.
         #[arg(long)]
         no_linger: bool,
+        /// Install the computer-use server too (`computer-use install`).
+        #[arg(long)]
+        computer_use: bool,
         /// Only show what would be done.
         #[arg(long)]
         print: bool,
@@ -283,6 +298,54 @@ pub enum SudoCmd {
     /// Show whether sudo access is on, whether a password is stored, and what
     /// to do next.
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum ComputerUseCmd {
+    /// Download the pinned server, check its hash, test that it starts.
+    Install {
+        /// Only show what would be done.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Remove the server (the rest of the client stays).
+    Uninstall,
+    /// The server, its pin, whether it answers, the consent and the setup.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// The steps the server needs on this desktop, one by one; nothing changes
+    /// without your yes.
+    Setup {
+        /// Carry out every step that can be, without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Take a screenshot and move the pointer 10 px and back.
+    Test {
+        /// Every tool the server offers, and which are allowed.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Allow computer use without asking, for at most 8 hours; then it is off.
+    Allow {
+        #[arg(long)]
+        minutes: u32,
+    },
+    /// Ask in each chat before its first computer-use call (once, for this
+    /// chat, or deny).
+    Ask,
+    /// Refuse every computer-use call (the default).
+    Off,
+    /// Move the server to the newest signed pins.
+    Update {
+        /// Only say whether there is a newer version.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Go back to the version before the last update.
+    Rollback,
 }
 
 #[derive(Subcommand)]
@@ -833,6 +896,9 @@ fn status_text(s: &Status) -> String {
         }
     );
     let _ = writeln!(out, "Elevation: {}", s.elevation);
+    if !s.computer_use.is_empty() {
+        let _ = writeln!(out, "Computer use: {}", s.computer_use);
+    }
     let _ = writeln!(
         out,
         "Commands:  {} running; own cgroup per command: {}; Landlock: {}",
@@ -1598,6 +1664,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             None => {
                 sync_policy::config::write_private(&dirs.paused_file(), b"")
                     .map_err(|e| e.to_string())?;
+                // An allow of computer use ends with the pause, as in the client.
+                if let Ok(mut cfg) = DeviceConfig::load(&dirs.config_file())
+                    && cfg.policy.computer_use.consent == sync_policy::Consent::Allow
+                {
+                    cfg.policy.computer_use.consent = sync_policy::Consent::Off;
+                    cfg.policy.computer_use.until_ms = None;
+                    cfg.save(&dirs.config_file())?;
+                }
                 println!("The client is not running; it will start paused.");
             }
         },
@@ -1795,24 +1869,53 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Sudo { cmd } => sudo_cmd(&dirs, cmd).await?,
         Cmd::Update { check, manifest } => {
             let asked = if check { Asked::Check } else { Asked::Anything };
-            update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await?;
+            let client = update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await;
+            // The computer-use server moves with its own pins, also when there
+            // is no newer client (or this build cannot update itself).
+            let mcp = crate::computer_use::update(&dirs, check, &mut |l| println!("{l}")).await;
+            if let Ok(u) = &mcp
+                && !check
+                && !u.changed.is_empty()
+            {
+                reload_running(&dirs).await;
+            }
+            match (client, mcp) {
+                (Err(e), Ok(u)) if !u.changed.is_empty() || dirs_have_mcp(&dirs) => {
+                    eprintln!("pithagoras-sync: {e}");
+                }
+                (Err(e), _) => return Err(e),
+                (Ok(_), Err(e)) => return Err(e),
+                _ => {}
+            }
         }
+        Cmd::ComputerUse { cmd } => return computer_use_cmd(&dirs, cmd).await,
         Cmd::Install {
             system,
             user,
             no_linger,
+            computer_use,
             print,
         } => {
             let exe = this_program()?;
             let plan = install_plan(system, user.as_deref(), !no_linger, &exe)?;
             println!("Install:");
             show_plan(&plan);
+            if computer_use {
+                for l in
+                    crate::computer_use::plan(&dirs, &crate::computer_use::store(&dirs).current())?
+                {
+                    println!("  {l}");
+                }
+            }
             if !print {
                 apply_plan(&plan)?;
                 println!("Installed. `pithagoras-sync status` shows the running client.");
                 if system && let Some(w) = crate::update::installed_warning(&crate::update::RealFs)
                 {
                     eprintln!("{w}");
+                }
+                if computer_use {
+                    install_computer_use(&dirs).await?;
                 }
             }
         }
@@ -1833,8 +1936,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             let plan = uninstall_plan(system)?;
             println!("Uninstall:");
             show_plan(&plan);
+            if dirs_have_mcp(&dirs) {
+                println!(
+                    "  remove the computer-use server in {}",
+                    dirs.mcp_dir().display()
+                );
+            }
             if !print {
                 apply_plan(&plan)?;
+                if dirs_have_mcp(&dirs) {
+                    crate::computer_use::uninstall_all(&dirs)?;
+                }
                 println!("Uninstalled.");
             }
         }
@@ -1883,6 +1995,292 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a computer-use server is installed (or its folder is left).
+fn dirs_have_mcp(dirs: &Dirs) -> bool {
+    DeviceConfig::load(&dirs.config_file()).is_ok_and(|c| !c.mcp.is_empty())
+        || dirs.mcp_dir().exists()
+}
+
+async fn install_computer_use(dirs: &Dirs) -> Result<(), String> {
+    owner::not_from_own_command(dirs).await?;
+    let installed = crate::computer_use::install_now(dirs, &mut |l| println!("  {l}")).await?;
+    println!("Computer use: {installed} is installed.");
+    reload_running(dirs).await;
+    let cfg = load_config(dirs)?;
+    if cfg.policy.computer_use.consent == sync_policy::Consent::Off {
+        println!(
+            "Computer use stays off until you allow it: `pithagoras-sync computer-use ask` (each chat asks) or `computer-use allow --minutes N`."
+        );
+    }
+    println!("Next: `pithagoras-sync computer-use setup`, then `computer-use test`.");
+    Ok(())
+}
+
+async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, String> {
+    use crate::computer_use as cu;
+    use sync_policy::Consent;
+    match cmd {
+        ComputerUseCmd::Install { print } => {
+            if print {
+                let store = cu::store(dirs);
+                let mut doc = store.current();
+                if store.key.is_some() {
+                    match sync_mcp::pins::peek(&store, &sync_mcp::pins::pins_url()).await {
+                        Ok(d) if d.serial > doc.serial => doc = d,
+                        Ok(_) => {}
+                        Err(e) => println!("note: no newer pins: {e}"),
+                    }
+                }
+                for l in cu::plan(dirs, &doc)? {
+                    println!("{l}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            owner_edit(dirs).await?;
+            install_computer_use(dirs).await?;
+        }
+        ComputerUseCmd::Uninstall => {
+            owner::not_from_own_command(dirs).await?;
+            let removed = cu::uninstall_all(dirs)?;
+            reload_running(dirs).await;
+            if removed.is_empty() {
+                println!("No computer-use server was installed.");
+            } else {
+                println!("Removed {}.", removed.join(", "));
+            }
+        }
+        ComputerUseCmd::Update { check } => {
+            owner::not_from_own_command(dirs).await?;
+            let u = cu::update(dirs, check, &mut |l| println!("{l}")).await?;
+            if !check && !u.changed.is_empty() {
+                reload_running(dirs).await;
+            }
+            if load_config(dirs)?.mcp.is_empty() {
+                println!("No computer-use server is installed.");
+            }
+        }
+        ComputerUseCmd::Rollback => {
+            owner_edit(dirs).await?;
+            let r = cu::rollback(dirs)?;
+            println!("Computer use: back to {r}.");
+            reload_running(dirs).await;
+        }
+        ComputerUseCmd::Allow { minutes } => {
+            let mut cfg = owner_edit(dirs).await?;
+            cfg.policy
+                .computer_use
+                .set(Consent::Allow, Some(minutes), now_ms())?;
+            cfg.save(&dirs.config_file())?;
+            println!(
+                "Computer use is allowed without asking until {}, then off. That is as strong as Full mode: the agent can see your screen and click and type anything you can, a terminal included. `pithagoras-sync computer-use off` or `panic` ends it.",
+                cu::consent_text(&cfg, now_ms()).trim_start_matches("allow until ")
+            );
+            reload_running(dirs).await;
+        }
+        ComputerUseCmd::Ask => {
+            let mut cfg = owner_edit(dirs).await?;
+            cfg.policy.computer_use.set(Consent::Ask, None, now_ms())?;
+            cfg.save(&dirs.config_file())?;
+            println!(
+                "Computer use asks in each chat before its first call (once, for this chat, or deny), in the portal or with `pithagoras-sync approvals`. Allowing it is as strong as Full mode."
+            );
+            reload_running(dirs).await;
+        }
+        ComputerUseCmd::Off => {
+            let mut cfg = load_config(dirs)?;
+            cfg.policy.computer_use.set(Consent::Off, None, now_ms())?;
+            cfg.save(&dirs.config_file())?;
+            println!("Computer use is off: every call is refused.");
+            reload_running(dirs).await;
+        }
+        ComputerUseCmd::Status { json } => return computer_use_status(dirs, json).await,
+        ComputerUseCmd::Setup { yes } => computer_use_setup(dirs, yes)?,
+        ComputerUseCmd::Test { verbose } => {
+            owner::not_from_own_command(dirs).await?;
+            let steps = match control::send(&dirs.socket(), Request::McpTest { verbose }).await? {
+                Some(r) if r.ok => {
+                    println!("(on the running client's server)");
+                    r.mcp.map(|m| m.test).unwrap_or_default()
+                }
+                Some(r) => return Err(r.error.unwrap_or_default()),
+                None => cu::test_here(dirs, verbose).await?,
+            };
+            let mut ok = true;
+            for s in &steps {
+                ok &= s.ok;
+                println!("{} {}", if s.ok { "ok    " } else { "FAILED" }, s.text);
+            }
+            if !ok {
+                println!(
+                    "Not every step passed: `pithagoras-sync computer-use setup` lists what the server needs."
+                );
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn computer_use_status(dirs: &Dirs, json: bool) -> Result<ExitCode, String> {
+    use crate::computer_use as cu;
+    let cfg = load_config(dirs)?;
+    let doc = cu::store(dirs).current();
+    let running = match control::send(&dirs.socket(), Request::McpStatus { probe: true }).await {
+        Ok(Some(r)) if r.ok => r.mcp,
+        _ => None,
+    };
+    let pinned = cu::pinned(&doc);
+    let installed = cfg.mcp.iter().next();
+    let files = installed.map(|(n, r)| {
+        sync_mcp::install::verify(&dirs.mcp_dir(), n, &r.version, &r.sha256).map(|_| ())
+    });
+    let setup = cu::installed(dirs, &cfg)
+        .map(|(_, dir, pin)| cu::setup_state(&dir, &pin))
+        .unwrap_or_default();
+    if json {
+        let v = serde_json::json!({
+            "consent": cu::consent_text(&cfg, now_ms()),
+            "installed": installed.map(|(n, r)| serde_json::json!({"name": n, "version": r.version, "serial": r.serial, "previous": r.previous.as_ref().map(|p| &p.version)})),
+            "files": files.as_ref().map(|f| f.clone().err().unwrap_or_else(|| "checked".into())),
+            "pinned": pinned.map(|p| serde_json::json!({"name": p.name, "version": p.version, "serial": doc.serial, "unpinned": p.unpinned(sync_mcp::arch())})),
+            "running": running,
+            "setup": setup,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("Consent: {}", cu::consent_text(&cfg, now_ms()));
+    match pinned {
+        Some(p) => println!(
+            "Pinned: {} {} ({} pins, serial {}){}",
+            p.name,
+            p.version,
+            if doc.serial == 0 {
+                "built-in"
+            } else {
+                "signed"
+            },
+            doc.serial,
+            p.unpinned(sync_mcp::arch())
+                .map(|w| format!("; not installable yet: {w}"))
+                .unwrap_or_default()
+        ),
+        None => println!("Pinned: nothing for this platform"),
+    }
+    match installed {
+        None => println!("Installed: nothing (`pithagoras-sync computer-use install`)"),
+        Some((n, r)) => {
+            println!(
+                "Installed: {n} {}{}",
+                r.version,
+                r.previous
+                    .as_ref()
+                    .map(|p| format!(" (rollback to {})", p.version))
+                    .unwrap_or_default()
+            );
+            match files.unwrap_or(Ok(())) {
+                Ok(()) => println!("Files: as installed (hash checked)"),
+                Err(e) => println!("Files: {e}"),
+            }
+        }
+    }
+    match &running {
+        None => println!("Server: the client is not running, so nothing runs the server"),
+        Some(m) => {
+            for s in &m.servers {
+                let state = match (&s.error, s.running, &s.last_error) {
+                    (Some(e), _, _) => format!("unavailable: {e}"),
+                    (None, true, _) => "answers".to_string(),
+                    (None, false, Some(e)) => format!(
+                        "does not answer: {e}{}",
+                        s.retry_in_secs
+                            .map(|r| format!(" (tried again in {r}s)"))
+                            .unwrap_or_default()
+                    ),
+                    (None, false, None) => "not started".to_string(),
+                };
+                println!("Server: {} {}: {state}", s.name, s.version);
+                println!("Allowed tools: {}", s.tools.join(", "));
+            }
+            if let Some(u) = &m.in_use {
+                println!(
+                    "In use: chat {} (last call {})",
+                    sync_policy::approve::visible(&u.chat),
+                    crate::update::utc((u.last_ms / 1000).max(0) as u64)
+                );
+            }
+            if let Some(u) = &m.last_update {
+                println!("Last look for new pins: {u}");
+            }
+        }
+    }
+    if !setup.is_empty() {
+        println!("Setup ({}):", sync_mcp::setup::desktop());
+        for (t, st) in setup {
+            println!("  {t}: {st}");
+        }
+    }
+    println!(
+        "Daily look for new pins: {}",
+        if cfg.policy.computer_use.auto_update {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn computer_use_setup(dirs: &Dirs, yes: bool) -> Result<(), String> {
+    use crate::computer_use as cu;
+    let cfg = load_config(dirs)?;
+    let (name, dir, pin) = cu::installed(dirs, &cfg)?;
+    let desktop = sync_mcp::setup::desktop();
+    let steps = sync_mcp::setup::steps_for(&pin, &desktop);
+    println!(
+        "Setup of {name} on this desktop ({}):",
+        if desktop.is_empty() {
+            "unknown"
+        } else {
+            &desktop
+        }
+    );
+    if desktop == "kde" {
+        println!("KDE Plasma is not validated: the steps follow the server's README, untried.");
+    }
+    for (i, s) in steps.iter().enumerate() {
+        println!("\n{}. {}", i + 1, s.title);
+        println!("{}", s.text);
+        let done = match sync_mcp::setup::check(s, &dir) {
+            Some(Ok(true)) => {
+                println!("Done.");
+                continue;
+            }
+            Some(Ok(false)) => false,
+            Some(Err(e)) => {
+                println!("Could not check it: {e}");
+                false
+            }
+            None => false,
+        };
+        let Some(run) = &s.run else {
+            println!("This step is done by hand.");
+            continue;
+        };
+        let argv = sync_mcp::setup::argv(run, &dir).join(" ");
+        if !done && (yes || ask(&format!("Run `{argv}` now?"))) {
+            match sync_mcp::setup::apply(s, &dir) {
+                Ok(()) => println!("Done: {argv}"),
+                Err(e) => println!("It failed: {e}"),
+            }
+        } else {
+            println!("Not changed. By hand: {argv}");
+        }
+    }
+    println!("\nThen: `pithagoras-sync computer-use test`.");
+    Ok(())
 }
 
 /// `$XDG_DATA_HOME`, or `~/.local/share`: where desktop entries and icons go.
@@ -2890,6 +3288,7 @@ mod tests {
             config_file: "/c".into(),
             audit_file: "/a".into(),
             exe: "/usr/local/bin/pithagoras-sync".into(),
+            computer_use: String::new(),
         }
     }
 

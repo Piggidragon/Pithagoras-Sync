@@ -897,6 +897,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sync-connector",
+ "sync-mcp",
  "sync-ops",
  "sync-policy",
  "sync-proto",
