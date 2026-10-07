@@ -290,7 +290,7 @@ async fn an_allowed_call_runs_taints_and_shows_the_indicator_once_per_burst() {
         rec.contains("tools/call type_text {\"text\":\"hello\"}"),
         "{rec}"
     );
-    // The server got the pin's environment and no other of the client's.
+    // The decision is in the audit log.
     let audit = std::fs::read_to_string(f.root.join("audit.jsonl")).unwrap();
     assert!(audit.contains("\"tool\":\"computer_use\""), "{audit}");
 }
