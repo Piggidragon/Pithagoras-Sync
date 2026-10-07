@@ -1313,11 +1313,21 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
     let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
     assert_eq!(shown.len(), 3, "{shown:#?}");
     assert!(shown[0].contains("--question"), "{shown:#?}");
+    // zenity's form, after the question, for the password alone: the link
+    // is the one confirmed.
+    let flat = |s: &str| s.replace('\n', " ");
     assert!(
-        shown[1].contains("--hide-text") && shown[1].contains("needs your password ("),
+        shown[1].contains("--add-password=Login password")
+            && !shown[1].contains("--add-entry")
+            && flat(&shown[1]).contains("needs your login password ("),
         "{shown:#?}"
     );
-    assert!(shown[2].contains("--error"), "{shown:#?}");
+    // su refused it: the form again, saying so (then cancelled); or su could
+    // not check it at all: the error.
+    assert!(
+        flat(&shown[2]).contains("su did not accept this password") || shown[2].contains("--error"),
+        "{shown:#?}"
+    );
     assert!(!env.config().exists());
     assert!(!env.home.join(".config/pithagoras-sync/token").exists());
     assert_eq!(
@@ -1516,13 +1526,11 @@ async fn the_sudo_password_can_be_set_in_the_window() {
             "0|sudo",
             "0|set",
             "0|not the password",
-            "0|",
             "0|set",
             &pw_answer,
             "0|",
-            "0|",
-            "0|back",
-            "0|quit",
+            "1|",
+            "1|",
         ],
     );
     let out = env
@@ -1538,21 +1546,27 @@ async fn the_sudo_password_can_be_set_in_the_window() {
         String::from_utf8_lossy(&out.stderr)
     );
     let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
-    assert_eq!(shown.len(), 10, "{shown:#?}");
+    // The menu, the sudo menu, the password; the sudo menu again with why
+    // sudo refused it at its top; the password, the question; the sudo menu
+    // saying it is on; the menu, closed. No window of its own for a message.
+    assert_eq!(shown.len(), 8, "{shown:#?}");
     assert!(shown[2].contains("--hide-text"), "{shown:#?}");
     assert!(
         shown[3].contains("sudo did not accept this password (sudo: 1 incorrect password attempt)"),
         "{shown:#?}"
     );
+    assert!(shown[3].contains("--list"), "{shown:#?}");
     assert!(
-        shown[6].contains("The password is stored in the running client."),
+        shown[5].contains("The password is stored in the running client."),
         "{shown:#?}"
     );
-    assert!(shown[7].contains("Sudo access is on."), "{shown:#?}");
+    assert!(shown[6].contains("Sudo access is on."), "{shown:#?}");
     assert!(
-        shown[8].contains("Sudo access: on. Password: stored."),
+        shown[6].contains("Sudo access: on. Password: stored."),
         "{shown:#?}"
     );
+    assert!(shown[6].contains("--cancel-label=Back"), "{shown:#?}");
+    assert!(shown[7].contains("--cancel-label=Close"), "{shown:#?}");
     // Checked with -k, the password on stdin: two checks, each asking first
     // whether sudo needs one at all.
     let validated = std::fs::read_to_string(env.root.join("fakesudo.validated")).unwrap();

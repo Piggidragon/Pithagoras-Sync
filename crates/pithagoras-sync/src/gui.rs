@@ -26,8 +26,10 @@ use sync_policy::{Dirs, Mode};
 use sync_proto::methods::FolderInfo;
 
 use crate::cli::Kept;
-use crate::dialogs::{Dialogs, MAX_ANSWER, shown, shown_lines};
-use crate::i18n::Lang;
+use crate::dialogs::{
+    Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines,
+};
+use crate::i18n::{InstallPair, Lang};
 use crate::secrets::SudoCheck;
 
 /// How long the flow waits for a new pairing to connect.
@@ -73,7 +75,7 @@ fn journal_args(place: &LogPlace) -> Option<Vec<&'static str>> {
     Some(args)
 }
 
-/// What the menu's Status shows. Text in it is escaped (`shown`).
+/// The status the menu shows in its text. Text in it is escaped (`shown`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusView {
     /// The running client's link state and detail; `None` when it does not run.
@@ -202,8 +204,114 @@ async fn owner_ok(d: &dyn Dialogs, h: &impl Host, t: Lang) -> bool {
     }
 }
 
+/// The dialogs as the flow uses them: a message that asks nothing (a result,
+/// a note, an error after which the flow goes on) is held back and shown at
+/// the top of the next window, instead of a window of its own. A question is
+/// never made longer (a confirmation shows all of itself): held messages get
+/// their own window before it, as they do when they would not fit, and at the
+/// end (`flush`).
+struct Later<'a> {
+    d: &'a dyn Dialogs,
+    /// The messages held back; `true` for an error.
+    held: std::cell::RefCell<Vec<(bool, String)>>,
+}
+
+impl<'a> Later<'a> {
+    fn new(d: &'a dyn Dialogs) -> Later<'a> {
+        Later {
+            d,
+            held: Default::default(),
+        }
+    }
+
+    /// Shows what is held in a window of its own: an error's if one is.
+    fn flush(&self) {
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        if held.is_empty() {
+            return;
+        }
+        let error = held.iter().any(|(e, _)| *e);
+        let text = held
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if error {
+            self.d.error(&text);
+        } else {
+            self.d.info(&text);
+        }
+    }
+
+    /// `text` with the held messages above it, when all of it fits a window.
+    fn with_held(&self, text: &str) -> String {
+        let top: Vec<String> = self.held.borrow().iter().map(|(_, t)| t.clone()).collect();
+        if top.is_empty() {
+            return text.to_string();
+        }
+        let top = top.join("\n\n");
+        if top.chars().count() + 2 + text.chars().count() > MAX_TEXT {
+            self.flush();
+            return text.to_string();
+        }
+        self.held.borrow_mut().clear();
+        format!("{top}\n\n{text}")
+    }
+}
+
+impl Dialogs for Later<'_> {
+    fn style(&self) -> Style {
+        self.d.style()
+    }
+
+    fn info(&self, text: &str) {
+        self.held.borrow_mut().push((false, text.to_string()));
+    }
+
+    fn error(&self, text: &str) {
+        self.held.borrow_mut().push((true, text.to_string()));
+    }
+
+    fn question(&self, text: &str) -> bool {
+        self.flush();
+        self.d.question(text)
+    }
+
+    fn entry(&self, text: &str, buttons: Buttons) -> Option<String> {
+        self.d.entry(&self.with_held(text), buttons)
+    }
+
+    fn password(&self, text: &str) -> Option<Secret> {
+        self.d.password(&self.with_held(text))
+    }
+
+    fn menu(
+        &self,
+        text: &str,
+        items: &[(&'static str, &str)],
+        buttons: Buttons,
+    ) -> Option<&'static str> {
+        self.d.menu(&self.with_held(text), items, buttons)
+    }
+
+    fn form(&self, text: &str, form: Form, buttons: Buttons) -> Option<Filled> {
+        self.d.form(&self.with_held(text), form, buttons)
+    }
+
+    fn at_hand(&self) -> Option<String> {
+        self.d.at_hand()
+    }
+}
+
 /// Runs the flow. `link` is the pairing link the OS started the program with.
 pub async fn flow(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<&str>) -> Outcome {
+    let later = Later::new(d);
+    let o = flow_in(&later, h, t, link).await;
+    later.flush();
+    o
+}
+
+async fn flow_in(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<&str>) -> Outcome {
     // A command of the client's own gets no further than this, so it cannot
     // put questions on the owner's screen either. Each step checks again.
     if !owner_ok(d, h, t).await {
@@ -219,58 +327,164 @@ pub async fn flow(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<&str>) -
         }
     };
     if !h.installed() {
-        let (user, path) = h.install_target();
-        let q = t.install_question(&shown(&user), path.map(|p| shown(&p)).as_deref());
-        if !d.question(&q) {
-            return Outcome::Cancelled;
-        }
-        if !owner_ok(d, h, t).await {
-            return Outcome::Failed;
-        }
-        match h.install().await {
-            Ok(notes) if !notes.is_empty() => {
-                let notes: Vec<String> = notes.iter().map(|n| shown(n)).collect();
-                d.info(&t.notes(&notes));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                d.error(&t.install_failed(&shown(&e)));
-                return Outcome::Failed;
-            }
-        }
-        if link.is_none() && h.paired().is_some() {
-            return after(d, h, t, &[]).await;
-        }
+        return install(d, h, t, link).await;
     }
     if let Some(u) = link {
-        return pair(d, h, t, &u).await;
+        return confirm_and_pair(d, h, t, &u, false, None).await;
     }
     if h.paired().is_none() {
-        return ask_and_pair(d, h, t).await;
+        return ask_link(d, h, t, false).await;
     }
     menu(d, h, t).await
 }
 
-/// Asks for the link until one parses or the owner cancels, then pairs.
-async fn ask_and_pair(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+/// Installs, and pairs where a link comes. With the link known before the
+/// first window (opened from the portal, or on Windows a valid one in the
+/// clipboard) one question asks for both; else the first window asks for the
+/// link, which may stay empty (zenity's form with the login password beside
+/// it, kdialog's entry). Windows, without a link at hand, asks to install and
+/// then for the link. Nothing changes before a Yes.
+async fn install(d: &dyn Dialogs, h: &impl Host, t: Lang, link: Option<PairUri>) -> Outcome {
+    let (user, path) = h.install_target();
+    let (user, path) = (shown(&user), path.map(|p| shown(&p)));
+    // The clipboard's text is taken only as a link that parses; anything
+    // else in it is dropped unseen.
+    let link = link.or_else(|| d.at_hand().and_then(|c| parse(t, c.trim()).ok()));
+    if let Some(u) = link {
+        let portal = shown(&u.portal.to_string());
+        let name = shown(&h.device_name());
+        let old = h.paired().map(|o| shown(&o));
+        let mut q = t.install_pair_question(
+            &user,
+            path.as_deref(),
+            &InstallPair {
+                portal: &portal,
+                name: &name,
+                pinned: u.spki.is_some(),
+                mode: h.pair_mode(),
+                old: old.as_deref(),
+            },
+        );
+        if !u.portal.tls {
+            q = format!("{q}\n\n{}", t.plain_http_note());
+        }
+        if !d.question(&q) {
+            return Outcome::Cancelled;
+        }
+        return pair_after_yes(d, h, t, &u, true, None).await;
+    }
+    if d.style() == Style::Boxes {
+        if !d.question(&t.install_question(&user, path.as_deref())) {
+            return Outcome::Cancelled;
+        }
+        let notes = match install_now(d, h, t).await {
+            Ok(n) => n,
+            Err(o) => return o,
+        };
+        if h.paired().is_some() {
+            return after(d, h, t, &notes).await;
+        }
+        if !notes.is_empty() {
+            d.info(&t.notes(&notes));
+        }
+        return ask_link(d, h, t, false).await;
+    }
+    ask_link(d, h, t, true).await
+}
+
+/// `install`; its notes (escaped), or the outcome after its error was shown.
+async fn install_now(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Result<Vec<String>, Outcome> {
+    if !owner_ok(d, h, t).await {
+        return Err(Outcome::Failed);
+    }
+    match h.install().await {
+        Ok(notes) => Ok(notes.iter().map(|n| shown(n)).collect()),
+        Err(e) => {
+            d.error(&t.install_failed(&shown(&e)));
+            Err(Outcome::Failed)
+        }
+    }
+}
+
+/// The window that asks for the link (`install`: and says what installing
+/// does; an empty link then installs only), with the login password beside
+/// it where pairing needs it and the dialog program has forms. Asked again,
+/// with what was wrong at the top, until a link parses or the owner cancels.
+async fn ask_link(d: &dyn Dialogs, h: &impl Host, t: Lang, install: bool) -> Outcome {
+    let account =
+        (d.style() == Style::Forms && h.owner_password_needed()).then(|| shown(&h.account()));
+    let text = if install {
+        let (user, path) = h.install_target();
+        let old = h.paired().map(|o| shown(&o));
+        t.install_form_text(
+            &shown(&user),
+            path.map(|p| shown(&p)).as_deref(),
+            old.as_deref(),
+            account.as_deref(),
+        )
+    } else {
+        t.pair_form_text(account.as_deref())
+    };
+    let form = Form {
+        entry: Some(t.link_label()),
+        password: account.as_ref().map(|_| t.password_label()),
+    };
+    let buttons = Buttons {
+        ok: if install {
+            t.install_and_pair_button()
+        } else {
+            t.pair_button()
+        },
+        cancel: t.cancel_button(),
+    };
     loop {
-        let Some(text) = d.entry(t.entry_text()) else {
+        let Some(filled) = d.form(&text, form, buttons) else {
             return Outcome::Cancelled;
         };
-        if text.trim().is_empty() {
+        let link = filled.entry.unwrap_or_default();
+        let link = link.trim();
+        if link.is_empty() {
+            if install {
+                return install_only(d, h, t).await;
+            }
             d.error(t.no_link());
             continue;
         }
-        match parse(t, text.trim()) {
-            Ok(u) => return pair(d, h, t, &u).await,
+        match parse(t, link) {
+            Ok(u) => return confirm_and_pair(d, h, t, &u, install, filled.password).await,
             Err(e) => d.error(&e),
         }
     }
 }
 
-/// Confirms with the parsed values and the mode the agent gets, checks the
-/// owner's password where `pair` would, then pairs as `pair` does.
-async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome {
+/// The install with the link left empty: then how it stands.
+async fn install_only(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
+    let notes = match install_now(d, h, t).await {
+        Ok(n) => n,
+        Err(o) => return o,
+    };
+    if h.paired().is_some() {
+        return after(d, h, t, &notes).await;
+    }
+    let mut text = t.installed_not_paired().to_string();
+    if !notes.is_empty() {
+        text = format!("{text}\n\n{}", t.notes(&notes));
+    }
+    d.info(&text);
+    Outcome::Done
+}
+
+/// Confirms with the parsed values and the mode the agent gets, then pairs
+/// (`pair_after_yes`). `password`: the login password typed into the form
+/// beside the link, checked only after the Yes.
+async fn confirm_and_pair(
+    d: &dyn Dialogs,
+    h: &impl Host,
+    t: Lang,
+    uri: &PairUri,
+    install: bool,
+    password: Option<Secret>,
+) -> Outcome {
     let portal = shown(&uri.portal.to_string());
     let name = shown(&h.device_name());
     let pinned = uri.spki.is_some();
@@ -286,19 +500,46 @@ async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome
     if !d.question(&q) {
         return Outcome::Cancelled;
     }
+    pair_after_yes(d, h, t, uri, install, password).await
+}
+
+/// After the owner's Yes: the login password where `pair` would ask for it,
+/// then (`install`) the install, then the pairing as `pair` does it, then how
+/// it stands, with the notes of both.
+async fn pair_after_yes(
+    d: &dyn Dialogs,
+    h: &impl Host,
+    t: Lang,
+    uri: &PairUri,
+    install: bool,
+    password: Option<Secret>,
+) -> Outcome {
     if !owner_ok(d, h, t).await {
         return Outcome::Failed;
     }
     if h.owner_password_needed() {
-        match owner_password(d, h, t).await {
+        match owner_password(d, h, t, uri, install, password).await {
             Outcome::Done => {}
             other => return other,
         }
     }
+    let mut notes = Vec::new();
+    if install {
+        match install_now(d, h, t).await {
+            Ok(n) => notes = n,
+            Err(o) => return o,
+        }
+    }
+    if !owner_ok(d, h, t).await {
+        return Outcome::Failed;
+    }
     // Rebuilt from what was parsed and shown, so only that is acted on.
     let link = link_of(uri);
     match h.pair(&link).await {
-        Ok(notes) => after(d, h, t, &notes).await,
+        Ok(n) => {
+            notes.extend(n.iter().map(|n| shown(n)));
+            after(d, h, t, &notes).await
+        }
         Err(e) => {
             d.error(&t.pair_failed(&shown(&e)));
             Outcome::Failed
@@ -308,24 +549,62 @@ async fn pair(d: &dyn Dialogs, h: &impl Host, t: Lang, uri: &PairUri) -> Outcome
 
 /// The user's password, checked with `su`: on a desktop the command line asks
 /// for it in a terminal before `pair`, and a command of the agent that clicks
-/// through the windows does not know it.
-async fn owner_password(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
-    let Some(pw) = d.password(&t.owner_password_prompt(&shown(&h.account()))) else {
-        return Outcome::Cancelled;
-    };
-    if pw.expose().is_empty() {
-        d.error(t.password_empty());
-        return Outcome::Failed;
-    }
-    match h.owner_password(&pw).await {
-        Ok(true) => Outcome::Done,
-        Ok(false) => {
-            d.error(t.owner_password_wrong());
-            Outcome::Failed
+/// through the windows does not know it. `typed`: the one from the form, if
+/// it had a field for it. One `su` refused is asked for again, with why at
+/// the top: zenity's form again, the link kept (shown as parsed), or the
+/// password window.
+async fn owner_password(
+    d: &dyn Dialogs,
+    h: &impl Host,
+    t: Lang,
+    uri: &PairUri,
+    install: bool,
+    typed: Option<Secret>,
+) -> Outcome {
+    let account = shown(&h.account());
+    let mut typed = typed;
+    loop {
+        let pw = match typed.take() {
+            Some(pw) => pw,
+            None if d.style() == Style::Forms => {
+                let text = t.password_again_text(
+                    &shown(&uri.portal.to_string()),
+                    &shown(&h.device_name()),
+                    &account,
+                );
+                let form = Form {
+                    entry: None,
+                    password: Some(t.password_label()),
+                };
+                let buttons = Buttons {
+                    ok: if install {
+                        t.install_and_pair_button()
+                    } else {
+                        t.pair_button()
+                    },
+                    cancel: t.cancel_button(),
+                };
+                match d.form(&text, form, buttons).and_then(|f| f.password) {
+                    Some(pw) => pw,
+                    None => return Outcome::Cancelled,
+                }
+            }
+            None => match d.password(&t.owner_password_prompt(&account)) {
+                Some(pw) => pw,
+                None => return Outcome::Cancelled,
+            },
+        };
+        if pw.expose().is_empty() {
+            d.error(t.password_empty());
+            continue;
         }
-        Err(e) => {
-            d.error(&t.owner_password_failed(&shown(&e)));
-            Outcome::Failed
+        match h.owner_password(&pw).await {
+            Ok(true) => return Outcome::Done,
+            Ok(false) => d.error(t.owner_password_wrong()),
+            Err(e) => {
+                d.error(&t.owner_password_failed(&shown(&e)));
+                return Outcome::Failed;
+            }
         }
     }
 }
@@ -354,8 +633,9 @@ fn link_of(u: &PairUri) -> String {
     l
 }
 
-/// Waits for the link, then says how things stand, with the notes of `pair`
-/// (the token in a file where the keyring did not take it).
+/// Waits for the link, then says how things stand, with the notes (escaped)
+/// of `install` and `pair` (the token in a file where the keyring did not
+/// take it).
 async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang, notes: &[String]) -> Outcome {
     let log = shown(&t.log_place(&h.log_place()));
     let mut text = match h.wait_for_link().await {
@@ -366,31 +646,34 @@ async fn after(d: &dyn Dialogs, h: &impl Host, t: Lang, notes: &[String]) -> Out
         }
     };
     if !notes.is_empty() {
-        let notes: Vec<String> = notes.iter().map(|n| shown(n)).collect();
-        text = format!("{text}\n\n{}", t.notes(&notes));
+        text = format!("{text}\n\n{}", t.notes(notes));
     }
     d.info(&text);
     Outcome::Done
 }
 
+/// The menu of a paired device: the status in its text, read anew each time
+/// it shows, one item per action and no item to quit (Close, or closing the
+/// window, ends it; the client keeps running).
 async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
-    let mut keys = vec!["status", "pair"];
+    let mut keys = vec!["pair"];
     if h.sudo_available() {
         keys.push("sudo");
     }
-    keys.extend(["log", "uninstall", "quit"]);
+    keys.extend(["log", "uninstall"]);
     let items: Vec<(&'static str, &str)> = keys.iter().map(|k| (*k, t.label(k))).collect();
+    let buttons = Buttons {
+        ok: t.open_button(),
+        cancel: t.close_button(),
+    };
     loop {
-        let text = t.menu_text(&shown(&h.paired().unwrap_or_default()));
-        match d.menu(&text, &items) {
-            None | Some("quit") => return Outcome::Done,
-            Some("status") => {
-                // Every value in it is escaped already.
-                let s = h.status().await;
-                d.info(&t.status(&s));
-            }
+        // Every value in the status is escaped already.
+        let status = t.status(&h.status().await);
+        let text = t.menu_text(&shown(&h.paired().unwrap_or_default()), &status);
+        match d.menu(&text, &items, buttons) {
+            None => return Outcome::Done,
             Some("pair") => {
-                ask_and_pair(d, h, t).await;
+                ask_link(d, h, t, false).await;
             }
             Some("sudo") => {
                 sudo_menu(d, h, t).await;
@@ -430,9 +713,13 @@ async fn sudo_menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         if st.password {
             keys.push("forget");
         }
-        keys.push("back");
         let items: Vec<(&'static str, &str)> = keys.iter().map(|k| (*k, t.label(k))).collect();
-        match d.menu(&t.sudo_text(st), &items) {
+        // Back is the window's own button, no item of the list.
+        let buttons = Buttons {
+            ok: t.choose_button(),
+            cancel: t.back_button(),
+        };
+        match d.menu(&t.sudo_text(st), &items, buttons) {
             Some("set") => {
                 set_password(d, h, t).await;
             }
@@ -1180,68 +1467,424 @@ mod tests {
         }
     }
 
+    /// A Linux desktop: pairing asks for the login password ("my login").
+    fn desktop(h: FakeHost) -> FakeHost {
+        FakeHost { desktop: true, ..h }
+    }
+
+    /// The flow with dialogs of `style` (`Entries` is kdialog's) and what the
+    /// clipboard holds (Windows); the windows shown.
+    async fn run_as(
+        style: Style,
+        t: Lang,
+        h: &FakeHost,
+        answers: &[&str],
+        link: Option<&str>,
+        at_hand: Option<&str>,
+    ) -> (Outcome, Vec<String>) {
+        let d = Fake {
+            at_hand: at_hand.map(String::from),
+            ..Fake::styled(style, answers)
+        };
+        let o = flow(&d, h, t, link).await;
+        (o, d.seen())
+    }
+
     async fn run_in(
         t: Lang,
         h: &FakeHost,
         answers: &[&str],
         link: Option<&str>,
     ) -> (Outcome, Vec<String>) {
-        let d = Fake::with(answers);
-        let o = flow(&d, h, t, link).await;
-        (o, d.seen())
+        run_as(Style::Entries, t, h, answers, link, None).await
     }
 
     async fn run(h: &FakeHost, answers: &[&str], link: Option<&str>) -> (Outcome, Vec<String>) {
         run_in(Lang::En, h, answers, link).await
     }
 
+    async fn zenity(h: &FakeHost, answers: &[&str], link: Option<&str>) -> (Outcome, Vec<String>) {
+        run_as(Style::Forms, Lang::En, h, answers, link, None).await
+    }
+
+    fn pair_did() -> String {
+        format!("pair {LINK}")
+    }
+
+    /// GNOME: one form for the link and the login password, the
+    /// confirmation, the result. Nothing is checked, installed or paired
+    /// before the confirmation's Yes.
     #[tokio::test]
-    async fn not_installed_installs_then_asks_for_the_link_and_pairs() {
-        let h = FakeHost::default();
-        let (o, seen) = run(&h, &["yes", &format!("text:{LINK}"), "yes"], None).await;
+    async fn zenity_installs_and_pairs_with_a_form_a_confirmation_and_a_result() {
+        let h = desktop(FakeHost::default());
+        let form = format!("form:{LINK}|my login");
+        let (o, seen) = zenity(&h, &[&form, "yes"], None).await;
         assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 3, "{seen:#?}");
         assert!(
-            seen[0].starts_with("question: Install Pithagoras Sync for alice?"),
-            "{seen:?}"
+            seen[0].starts_with(
+                "form [Pairing link, Login password] [Install and pair]: Install Pithagoras Sync for alice?"
+            ),
+            "{seen:#?}"
         );
         assert!(seen[0].contains("/home/alice/.local/bin/pithagoras-sync"));
+        assert!(seen[0].contains("Left empty, it installs without pairing."));
+        assert!(seen[0].contains("your login password (alice)"), "{seen:#?}");
+        // The confirmation shows what was parsed, never the raw link.
         assert!(
-            seen[1].starts_with("entry: Paste the pairing link"),
-            "{seen:?}"
+            seen[1].starts_with(
+                "question: Pair this computer with the Pithagoras portal https://portal.example as \"laptop\"?"
+            ),
+            "{seen:#?}"
         );
-        // The confirmation shows what was parsed.
+        assert!(!seen[1].contains("AB12CD34"), "{seen:#?}");
         assert!(
-            seen[2].contains("Pithagoras portal https://portal.example as \"laptop\"?"),
-            "{seen:?}"
-        );
-        assert!(
-            seen[3].starts_with(
+            seen[2].starts_with(
                 "info: Pithagoras Sync is running, connected to https://portal.example"
             ),
-            "{seen:?}"
+            "{seen:#?}"
         );
         assert!(
-            seen[3].contains("Log: the journal (journalctl --user -u pithagoras-sync.service)")
+            seen[2].contains("Log: the journal (journalctl --user -u pithagoras-sync.service)")
         );
-        assert_eq!(h.did()[0], "install");
-        assert!(h.did()[1].starts_with(
-            "pair pithagoras-sync://pair?portal=https%3A%2F%2Fportal.example&code=AB12CD34"
-        ));
+        assert_eq!(h.did(), ["owner password", "install", &pair_did()]);
+        assert!(seen.iter().all(|s| !s.contains("my login")), "{seen:#?}");
+        // No at the confirmation: the password was never checked, nothing
+        // installed or paired.
+        let h = desktop(FakeHost::default());
+        let (o, seen) = zenity(&h, &[&form, "no"], None).await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert!(h.did().is_empty(), "{:?}", h.did());
+        // Cancel at the form.
+        let h = desktop(FakeHost::default());
+        assert_eq!(zenity(&h, &["cancel"], None).await.0, Outcome::Cancelled);
+        assert!(h.did().is_empty());
+        // No login password asked for where pairing asks none: the form has
+        // the link alone.
+        let h = FakeHost::default();
+        let (o, seen) = zenity(&h, &[&format!("form:{LINK}"), "yes"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert!(seen[0].starts_with("form [Pairing link] "), "{seen:#?}");
+        assert!(!seen[0].contains("password"), "{seen:#?}");
+        assert_eq!(h.did(), ["install", &pair_did()]);
+    }
+
+    /// The link left empty installs only: the form, then the result. A
+    /// password typed beside it is not checked.
+    #[tokio::test]
+    async fn an_empty_link_installs_without_pairing() {
+        let h = desktop(FakeHost {
+            install_notes: vec!["pairing links may not open Pithagoras Sync".into()],
+            ..FakeHost::default()
+        });
+        let (o, seen) = zenity(&h, &["form:  |typed anyway"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert!(
+            seen[1].starts_with(
+                "info: Pithagoras Sync is installed and starts at login. It is not paired yet"
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[1].ends_with("\n\nNote: pairing links may not open Pithagoras Sync"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["install"]);
+        // A pairing kept from an earlier install stays, and says how it stands.
+        let h = FakeHost {
+            paired: Mutex::new(Some("https://old.example".into())),
+            ..FakeHost::default()
+        };
+        let (_, seen) = zenity(&h, &["form:"], None).await;
+        assert!(
+            seen[0].contains(
+                "Left empty, it installs and keeps the pairing with https://old.example."
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[1].starts_with("info: Pithagoras Sync is running"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["install"]);
+    }
+
+    /// A login password su refuses: the form again, with why at its top and
+    /// the link kept (shown as parsed), asking for the password alone; no
+    /// second confirmation. Nothing is installed until su took one.
+    #[tokio::test]
+    async fn a_wrong_login_password_shows_the_form_again_with_the_link_kept() {
+        let h = desktop(FakeHost::default());
+        let first = format!("form:{LINK}|guess");
+        let (o, seen) = zenity(&h, &[&first, "yes", "form:my login"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 4, "{seen:#?}");
+        assert!(
+            seen[2].starts_with(
+                "form [Login password] [Install and pair]: su did not accept this password. Nothing changed.\n\nPairing with the Pithagoras portal https://portal.example as \"laptop\" needs your login password (alice)."
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[3].starts_with("info: Pithagoras Sync is running"),
+            "{seen:#?}"
+        );
+        assert_eq!(
+            h.did(),
+            ["owner password", "owner password", "install", &pair_did()]
+        );
+        // Cancelled the second time: nothing installed or paired.
+        let h = desktop(FakeHost::default());
+        let (o, _) = zenity(&h, &[&first, "yes", "cancel"], None).await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert_eq!(h.did(), ["owner password"]);
+        assert!(!h.installed() && h.paired().is_none());
+        // An empty one is not even tried.
+        let h = desktop(FakeHost::default());
+        let (_, seen) = zenity(&h, &[&format!("form:{LINK}|"), "yes", "cancel"], None).await;
+        assert!(seen[2].contains("The password is empty."), "{seen:#?}");
+        assert!(h.did().is_empty());
+        // su that cannot check it (a login that wants a fingerprint) ends it.
+        let h = desktop(FakeHost {
+            fail: Some("owner password"),
+            ..FakeHost::default()
+        });
+        let (o, seen) = zenity(&h, &[&first, "yes"], None).await;
+        assert_eq!(o, Outcome::Failed);
+        assert!(
+            seen.last()
+                .unwrap()
+                .starts_with("error: Your password could not be checked"),
+            "{seen:#?}"
+        );
+        assert!(!h.installed());
+    }
+
+    /// A link that does not parse: the form again with why at its top.
+    #[tokio::test]
+    async fn a_bad_link_in_the_form_is_asked_for_again() {
+        let h = desktop(FakeHost::default());
+        let (o, seen) = zenity(
+            &h,
+            &["form:https://portal.example|my login", "cancel"],
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert!(
+            seen[1].starts_with(
+                "form [Pairing link, Login password] [Install and pair]: This pairing link cannot be used:"
+            ),
+            "{seen:#?}"
+        );
+        assert!(h.did().is_empty());
+    }
+
+    /// KDE: the install question and the link are one entry; then the
+    /// confirmation, the password window, the result.
+    #[tokio::test]
+    async fn kdialog_asks_install_and_link_in_one_entry() {
+        let h = desktop(FakeHost::default());
+        let (o, seen) = run(&h, &[&format!("text:{LINK}"), "yes", "pw:my login"], None).await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 4, "{seen:#?}");
+        assert!(
+            seen[0].starts_with("entry [Install and pair]: Install Pithagoras Sync for alice?"),
+            "{seen:#?}"
+        );
+        assert!(seen[0].contains("Left empty, it installs without pairing."));
+        // No password in the entry's text: kdialog asks it in a window of
+        // its own, after the confirmation.
+        assert!(!seen[0].contains("login password"), "{seen:#?}");
+        assert!(
+            seen[1].starts_with("question: Pair this computer"),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[2].starts_with("password: Pairing decides"),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[3].starts_with("info: Pithagoras Sync is running"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["owner password", "install", &pair_did()]);
+        // A wrong password: the password window again, with why at its top.
+        let h = desktop(FakeHost::default());
+        let (o, seen) = run(
+            &h,
+            &[&format!("text:{LINK}"), "yes", "pw:guess", "cancel"],
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert!(
+            seen[3].starts_with(
+                "password: su did not accept this password. Nothing changed.\n\nPairing decides"
+            ),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["owner password"]);
+        // Empty: installs only.
+        let h = FakeHost::default();
+        let (_, seen) = run(&h, &["text:"], None).await;
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert_eq!(h.did(), ["install"]);
+    }
+
+    /// Windows with a valid pairing link in the clipboard: one box asks to
+    /// install and pair, with the facts of both questions.
+    #[tokio::test]
+    async fn windows_with_a_link_in_the_clipboard_asks_once() {
+        for t in [Lang::En, Lang::De] {
+            let h = FakeHost::default();
+            let (o, seen) = run_as(Style::Boxes, t, &h, &["yes"], None, Some(LINK)).await;
+            assert_eq!(o, Outcome::Done);
+            assert_eq!(seen.len(), 2, "{seen:#?}");
+            let q = &seen[0];
+            let expect = match t {
+                Lang::En => {
+                    "question: Install Pithagoras Sync for alice and pair it with the Pithagoras portal https://portal.example as \"laptop\"?"
+                }
+                Lang::De => {
+                    "question: Pithagoras Sync für alice installieren und mit dem Pithagoras-Portal https://portal.example als „laptop“ koppeln?"
+                }
+            };
+            assert!(q.starts_with(expect), "{q}");
+            assert!(q.contains("/home/alice/.local/bin/pithagoras-sync"), "{q}");
+            // What the agent may do, as the pairing question says it.
+            assert!(
+                q.contains(match t {
+                    Lang::En => "every call asks you first",
+                    Lang::De => "fragt dich jeder Aufruf",
+                }),
+                "{q}"
+            );
+            assert!(!q.contains("AB12CD34"), "{q}");
+            assert_eq!(h.did(), ["install", &pair_did()]);
+            // No: nothing at all.
+            let h = FakeHost::default();
+            let (o, _) = run_as(Style::Boxes, t, &h, &["no"], None, Some(LINK)).await;
+            assert_eq!(o, Outcome::Cancelled);
+            assert!(h.did().is_empty());
+        }
+        // Anything else in the clipboard (a password, a link that is refused)
+        // is dropped unseen: the two steps as before.
+        for other in [
+            "hunter2 secret",
+            "pithagoras-sync://pair?portal=http://192.168.1.5:3000&code=AB",
+        ] {
+            let h = FakeHost::default();
+            let (o, seen) = run_as(Style::Boxes, Lang::En, &h, &["no"], None, Some(other)).await;
+            assert_eq!(o, Outcome::Cancelled);
+            assert_eq!(seen.len(), 1, "{seen:#?}");
+            assert!(
+                seen[0].starts_with("question: Install Pithagoras Sync for alice?"),
+                "{seen:#?}"
+            );
+            assert!(seen.iter().all(|s| !s.contains("hunter2")), "{seen:#?}");
+            assert!(seen.iter().all(|s| !s.contains("192.168")), "{seen:#?}");
+        }
+    }
+
+    /// Windows without a link at hand: install, then the box that reads the
+    /// link from the clipboard; the install's notes in that box's text.
+    #[tokio::test]
+    async fn windows_without_a_link_keeps_the_two_steps() {
+        let h = FakeHost {
+            install_notes: vec!["the logon task did not start".into()],
+            ..FakeHost::default()
+        };
+        let (o, seen) = run_as(
+            Style::Boxes,
+            Lang::En,
+            &h,
+            &["yes", &format!("text:{LINK}"), "yes"],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(o, Outcome::Done);
+        assert_eq!(seen.len(), 4, "{seen:#?}");
+        assert!(seen[0].starts_with("question: Install Pithagoras Sync for alice?"));
+        assert!(
+            seen[1].starts_with(
+                "entry [Pair]: Note: the logon task did not start\n\nPaste the pairing link"
+            ),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[2].starts_with("question: Pair this computer"),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[3].starts_with("info: Pithagoras Sync is running"),
+            "{seen:#?}"
+        );
+        assert_eq!(h.did(), ["install", &pair_did()]);
+        // Cancelled at the link: installed, not paired.
+        let h = FakeHost::default();
+        let (o, _) = run_as(Style::Boxes, Lang::En, &h, &["yes", "cancel"], None, None).await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert_eq!(h.did(), ["install"]);
+    }
+
+    /// Opened from the portal's link before installing: one question for both
+    /// on every desktop; then the password where pairing needs it.
+    #[tokio::test]
+    async fn a_link_from_the_os_installs_and_pairs_after_one_question() {
+        for style in [Style::Forms, Style::Entries] {
+            let h = FakeHost::default();
+            let (o, seen) = run_as(style, Lang::En, &h, &["yes"], Some(LINK), None).await;
+            assert_eq!(o, Outcome::Done);
+            assert_eq!(seen.len(), 2, "{seen:#?}");
+            assert!(
+                seen[0].starts_with("question: Install Pithagoras Sync for alice and pair it"),
+                "{seen:#?}"
+            );
+            assert_eq!(h.did(), ["install", &pair_did()]);
+            let h = desktop(FakeHost::default());
+            let pw = if style == Style::Forms {
+                "form:my login"
+            } else {
+                "pw:my login"
+            };
+            let (o, seen) = run_as(style, Lang::En, &h, &["yes", pw], Some(LINK), None).await;
+            assert_eq!(o, Outcome::Done, "{seen:#?}");
+            assert_eq!(seen.len(), 3, "{seen:#?}");
+            assert_eq!(h.did(), ["owner password", "install", &pair_did()]);
+        }
+        // Paired from an earlier install: the question says it replaces that.
+        let h = FakeHost {
+            paired: Mutex::new(Some("https://old.example".into())),
+            ..FakeHost::default()
+        };
+        let (_, seen) = run(&h, &["no"], Some(LINK)).await;
+        assert!(seen[0].starts_with("question: Install Pithagoras Sync for alice?"));
+        assert!(
+            seen[0].contains("This computer is paired with https://old.example."),
+            "{seen:#?}"
+        );
+        assert!(h.did().is_empty());
     }
 
     #[tokio::test]
     async fn every_no_or_cancel_changes_nothing() {
-        // No to the install.
-        let h = FakeHost::default();
-        assert_eq!(run(&h, &["no"], None).await.0, Outcome::Cancelled);
-        assert!(h.did().is_empty());
-        // The install, then cancel at the link.
-        let h = FakeHost::default();
-        assert_eq!(
-            run(&h, &["yes", "cancel"], None).await.0,
-            Outcome::Cancelled
-        );
-        assert_eq!(h.did(), ["install"]);
+        // Cancel at the first window, in each style.
+        for style in [Style::Forms, Style::Entries, Style::Boxes] {
+            let h = FakeHost::default();
+            let a = if style == Style::Boxes {
+                "no"
+            } else {
+                "cancel"
+            };
+            let (o, _) = run_as(style, Lang::En, &h, &[a], None, None).await;
+            assert_eq!(o, Outcome::Cancelled);
+            assert!(h.did().is_empty());
+        }
         // No to the pairing.
         let h = installed();
         assert_eq!(
@@ -1256,14 +1899,13 @@ mod tests {
         // The menu closed.
         let h = paired();
         assert_eq!(run(&h, &["cancel"], None).await.0, Outcome::Done);
-        assert_eq!(run(&h, &["pick:quit"], None).await.0, Outcome::Done);
         assert!(h.did().is_empty());
         // Uninstall, then no; and "pair again" cancelled at the link.
         let h = paired();
         let (o, _) = run(&h, &["pick:uninstall", "no"], None).await;
         assert_eq!(o, Outcome::Cancelled);
-        let (_, seen) = run(&h, &["pick:pair", "cancel", "pick:quit"], None).await;
-        assert!(seen[1].starts_with("entry:"), "{seen:?}");
+        let (_, seen) = run(&h, &["pick:pair", "cancel", "cancel"], None).await;
+        assert!(seen[1].starts_with("entry [Pair]:"), "{seen:?}");
         assert!(h.did().is_empty());
         // Sudo access: the password cancelled, forgetting refused, the menu left.
         let h = paired();
@@ -1276,8 +1918,8 @@ mod tests {
                 "cancel",
                 "pick:forget",
                 "no",
-                "pick:back",
-                "pick:quit",
+                "cancel",
+                "cancel",
             ],
             None,
         )
@@ -1291,18 +1933,17 @@ mod tests {
     }
 
     /// OK with nothing in it (on Windows: no text in the clipboard) says so
-    /// and asks again; it is not a cancel.
+    /// at the top of the next one; it is not a cancel.
     #[tokio::test]
     async fn no_link_at_all_is_asked_for_again() {
         for t in [Lang::En, Lang::De] {
             let h = installed();
             let (o, seen) = run_in(t, &h, &["text:", "text:  \r\n", "cancel"], None).await;
             assert_eq!(o, Outcome::Cancelled);
-            assert_eq!(seen.len(), 5, "{seen:?}");
-            for i in [1, 3] {
-                assert_eq!(seen[i], format!("error: {}", t.no_link()), "{seen:?}");
+            assert_eq!(seen.len(), 3, "{seen:?}");
+            for s in &seen[1..] {
+                assert!(s.contains(&format!(": {}\n\n", t.no_link())), "{seen:?}");
             }
-            assert!(seen[4].starts_with("entry:"), "{seen:?}");
             assert!(h.did().is_empty());
         }
     }
@@ -1319,7 +1960,7 @@ mod tests {
             seen[0].starts_with("question: Pair this computer"),
             "{seen:?}"
         );
-        assert_eq!(h.did(), [format!("pair {LINK}")]);
+        assert_eq!(h.did(), [pair_did()]);
     }
 
     #[tokio::test]
@@ -1338,10 +1979,11 @@ mod tests {
         .await;
         assert_eq!(o, Outcome::Cancelled);
         assert!(h.did().is_empty());
-        let errors: Vec<&String> = seen.iter().filter(|s| s.starts_with("error:")).collect();
-        assert_eq!(errors.len(), 3, "{seen:?}");
-        assert!(errors[1].contains("over plain http"), "{seen:?}");
-        assert!(errors[2].contains("unknown key"), "{seen:?}");
+        // Each reason at the top of the next entry.
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert!(seen[1].contains("cannot be used"), "{seen:?}");
+        assert!(seen[2].contains("over plain http"), "{seen:?}");
+        assert!(seen[3].contains("unknown key"), "{seen:?}");
         // A portal on this computer may use plain http; the question says
         // who else could answer there, as `pair` does.
         for t in [Lang::En, Lang::De] {
@@ -1358,6 +2000,10 @@ mod tests {
             assert!(seen[0].ends_with(t.plain_http_note()), "{seen:?}");
             let (_, seen) = run_in(t, &h, &["no"], Some(LINK)).await;
             assert!(!seen[0].contains(t.plain_http_note()), "{seen:?}");
+            // And so does the question that installs too.
+            let h = FakeHost::default();
+            let (_, seen) = run_in(t, &h, &["no"], Some(local)).await;
+            assert!(seen[0].ends_with(t.plain_http_note()), "{seen:?}");
         }
     }
 
@@ -1372,16 +2018,18 @@ mod tests {
         ] {
             // Not installed: no question about installing comes first.
             for t in [Lang::En, Lang::De] {
-                let h = FakeHost::default();
-                let (o, seen) = run_in(t, &h, &["yes", "yes"], Some(&bad)).await;
-                assert_eq!(o, Outcome::Failed, "{bad}");
-                assert_eq!(seen.len(), 1, "{seen:?}");
-                assert!(seen[0].starts_with("error: "), "{seen:?}");
-                assert!(
-                    !seen[0].chars().any(|c| c.is_control() && c != '\n'),
-                    "{seen:?}"
-                );
-                assert!(h.did().is_empty());
+                for style in [Style::Forms, Style::Entries, Style::Boxes] {
+                    let h = FakeHost::default();
+                    let (o, seen) = run_as(style, t, &h, &["yes", "yes"], Some(&bad), None).await;
+                    assert_eq!(o, Outcome::Failed, "{bad}");
+                    assert_eq!(seen.len(), 1, "{seen:?}");
+                    assert!(seen[0].starts_with("error: "), "{seen:?}");
+                    assert!(
+                        !seen[0].chars().any(|c| c.is_control() && c != '\n'),
+                        "{seen:?}"
+                    );
+                    assert!(h.did().is_empty());
+                }
             }
         }
     }
@@ -1464,22 +2112,29 @@ mod tests {
             en.contains("Replace the pairing") && en.contains("full mode"),
             "{en}"
         );
+        // So does the question that installs and pairs at once.
+        let h = FakeHost {
+            installed: Mutex::new(false),
+            ..ask(Mode::Full, None, 0)
+        };
+        let en = q(Lang::En, &h).await;
+        assert!(en.contains("and pair it with"), "{en}");
+        assert!(en.contains("full mode, with no expiry"), "{en}");
     }
 
     #[tokio::test]
     async fn pairing_on_a_desktop_needs_the_users_password() {
-        let desktop = || FakeHost {
-            installed: Mutex::new(true),
-            desktop: true,
-            ..FakeHost::default()
-        };
-        // A wrong one: nothing is paired.
+        let desktop = || desktop(installed());
+        // A wrong one: nothing is paired; asked again until cancelled.
         let h = desktop();
         let (o, seen) = run(&h, &["yes", "pw:guess"], Some(LINK)).await;
-        assert_eq!(o, Outcome::Failed);
+        assert_eq!(o, Outcome::Cancelled);
         assert!(seen[1].starts_with("password: Pairing decides"), "{seen:?}");
         assert!(seen[1].contains("(alice)"), "{seen:?}");
-        assert!(seen[2].starts_with("error: su did not accept"), "{seen:?}");
+        assert!(
+            seen[2].starts_with("password: su did not accept"),
+            "{seen:?}"
+        );
         assert_eq!(h.did(), ["owner password"]);
         assert_eq!(h.paired(), None);
         // Cancelled, or su could not check it: nothing either.
@@ -1507,23 +2162,29 @@ mod tests {
         );
         assert_eq!(h.did()[0], "owner password");
         assert!(h.did()[1].starts_with("pair "), "{:?}", h.did());
-        // The menu's "Pair again" asks as well.
+        // The menu's "Pair again" asks as well; on zenity in the form.
         let h = FakeHost {
             paired: Mutex::new(Some("https://old.example".into())),
             ..desktop()
         };
         run(
             &h,
-            &[
-                "pick:pair",
-                &format!("text:{LINK}"),
-                "yes",
-                "pw:guess",
-                "pick:quit",
-            ],
+            &["pick:pair", &format!("text:{LINK}"), "yes", "pw:guess"],
             None,
         )
         .await;
+        assert_eq!(h.paired().as_deref(), Some("https://old.example"));
+        let (_, seen) = zenity(
+            &h,
+            &["pick:pair", &format!("form:{LINK}|guess"), "yes"],
+            None,
+        )
+        .await;
+        assert!(
+            seen[1]
+                .starts_with("form [Pairing link, Login password] [Pair]: Paste the pairing link"),
+            "{seen:?}"
+        );
         assert_eq!(h.paired().as_deref(), Some("https://old.example"));
         // A headless machine asks none, as `pair` asks none there.
         let h = installed();
@@ -1533,22 +2194,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_notes_of_install_and_pair_are_shown() {
+    async fn the_notes_of_install_and_pair_are_shown_with_the_result() {
         let h = FakeHost {
             install_notes: vec!["pairing links may not open Pithagoras Sync\x1b[2K".into()],
             pair_notes: vec!["the keyring did not take the token; it is kept in /home/alice/.config/pithagoras-sync/token".into()],
             ..FakeHost::default()
         };
-        let (o, seen) = run(&h, &["yes", &format!("text:{LINK}"), "yes"], None).await;
+        let (o, seen) = run(&h, &[&format!("text:{LINK}"), "yes"], None).await;
         assert_eq!(o, Outcome::Done);
-        assert!(
-            seen[1].starts_with("info: Note: pairing links may not open Pithagoras Sync\\u{1b}[2K"),
-            "{seen:?}"
-        );
+        assert_eq!(seen.len(), 3, "{seen:?}");
         let last = seen.last().unwrap();
         assert!(last.contains("connected to"), "{seen:?}");
         assert!(
-            last.contains("Note: the keyring did not take the token; it is kept in"),
+            last.contains("\n\nNote: pairing links may not open Pithagoras Sync\\u{1b}[2K\nNote: the keyring did not take the token; it is kept in"),
             "{seen:?}"
         );
         let h = FakeHost {
@@ -1599,14 +2257,16 @@ mod tests {
                 }),
                 "{info}"
             );
-            // No lines: why that may be, not a claim it is the groups.
+            // No lines: why that may be, not a claim it is the groups; at the
+            // top of the menu shown next.
             let h = FakeHost {
                 log_fails: Some(NO_JOURNAL_LINES),
                 ..h
             };
             let (_, seen) = run_in(t, &h, &["pick:log", "cancel"], None).await;
+            assert_eq!(seen.len(), 2, "{seen:?}");
             let e = &seen[1];
-            assert!(e.starts_with("error: "), "{seen:?}");
+            assert!(e.starts_with("menu "), "{seen:?}");
             assert!(e.contains(t.no_journal_lines()), "{e}");
             assert!(
                 e.contains(match t {
@@ -1623,7 +2283,7 @@ mod tests {
                 seen[1].contains("only root can remove the system unit"),
                 "{seen:?}"
             );
-            assert_eq!(h.did(), [format!("pair {LINK}")]);
+            assert_eq!(h.did(), [pair_did()]);
         }
     }
 
@@ -1653,13 +2313,50 @@ mod tests {
         );
     }
 
+    /// The menu holds the status in its own text, has no item to quit (its
+    /// Cancel button is Close) and an OK button that says Open. What an
+    /// action reports, it reports at the top of the menu shown next.
     #[tokio::test]
-    async fn the_menu_shows_status_opens_the_log_pairs_again_and_uninstalls() {
+    async fn the_menu_shows_the_status_and_has_no_quit_item() {
+        for t in [Lang::En, Lang::De] {
+            let h = paired();
+            let (o, seen) = run_in(t, &h, &["cancel"], None).await;
+            assert_eq!(o, Outcome::Done);
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            let expect = match t {
+                Lang::En => {
+                    "menu [Pair again, Sudo access, Open log, Uninstall] [Close / Open]: Pithagoras Sync is installed and paired with https://old.example.\n\nClient: running, connected\nPortal: https://portal.example as \"laptop\"\nMode: ask"
+                }
+                Lang::De => {
+                    "menu [Neu koppeln, Sudo-Zugriff, Protokoll öffnen, Deinstallieren] [Schließen / Öffnen]: Pithagoras Sync ist installiert und mit https://old.example gekoppelt.\n\nClient: läuft, verbunden\nPortal: https://portal.example als „laptop“\nModus: ask"
+                }
+            };
+            assert!(seen[0].starts_with(expect), "{seen:?}");
+            assert!(
+                !seen[0].contains("Quit") && !seen[0].contains("Status,"),
+                "{seen:?}"
+            );
+        }
+        // Without sudo access to set up, no such item.
+        let h = FakeHost {
+            sudo: false,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:sudo"], None).await;
+        assert!(
+            seen[0].starts_with("menu [Pair again, Open log, Uninstall] [Close / Open]"),
+            "{seen:?}"
+        );
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(h.did().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_menu_opens_the_log_pairs_again_and_uninstalls() {
         let h = paired();
         let (o, seen) = run(
             &h,
             &[
-                "pick:status",
                 "pick:log",
                 "pick:pair",
                 &format!("text:{LINK}"),
@@ -1672,14 +2369,17 @@ mod tests {
         )
         .await;
         assert_eq!(o, Outcome::Done);
-        assert!(seen[0].starts_with(
-            "menu: Pithagoras Sync is installed and paired with https://old.example."
-        ));
+        // Menu, menu (the log opened, nothing to say), entry, question, menu
+        // (the pairing's result at its top), the two questions, the result.
+        assert_eq!(seen.len(), 8, "{seen:#?}");
+        assert!(seen[1].starts_with("menu "), "{seen:#?}");
         assert!(
-            seen[1].starts_with(
-                "info: Client: running, connected\nPortal: https://portal.example as \"laptop\""
-            ),
-            "{seen:?}"
+            seen[1].contains(": Pithagoras Sync is installed and paired"),
+            "{seen:#?}"
+        );
+        assert!(
+            seen[4].contains("]: Pithagoras Sync is running, connected to https://portal.example"),
+            "{seen:#?}"
         );
         assert_eq!(h.did()[0], "log");
         assert!(h.did()[1].starts_with("pair "));
@@ -1704,6 +2404,42 @@ mod tests {
             last.contains("\n\nNote: the menu may show Pithagoras Sync until the next login"),
             "{seen:?}"
         );
+    }
+
+    /// A held message that would make the next window's text too long gets
+    /// a window of its own; a question is never made longer.
+    #[tokio::test]
+    async fn held_messages_never_lengthen_a_question_or_overflow_a_window() {
+        let d = Fake::with(&["yes", "text:x", "text:y"]);
+        let l = Later::new(&d);
+        l.info("note one");
+        assert!(l.question("Pair?"));
+        l.error(&"e".repeat(MAX_TEXT));
+        l.entry(
+            "Paste it",
+            Buttons {
+                ok: "OK",
+                cancel: "Cancel",
+            },
+        );
+        l.info("short");
+        l.entry(
+            "Again",
+            Buttons {
+                ok: "OK",
+                cancel: "Cancel",
+            },
+        );
+        l.flush();
+        let seen = d.seen();
+        assert_eq!(
+            seen[..2],
+            ["info: note one".to_string(), "question: Pair?".to_string()]
+        );
+        assert!(seen[2].starts_with("error: eee"), "{seen:?}");
+        assert_eq!(seen[3], "entry [OK]: Paste it");
+        assert_eq!(seen[4], "entry [OK]: short\n\nAgain");
+        assert_eq!(seen.len(), 5, "{seen:?}");
     }
 
     #[tokio::test]
@@ -1762,14 +2498,17 @@ mod tests {
             own_command: true,
             ..h
         };
-        let h = own(FakeHost::default());
-        let (o, seen) = run(&h, &["yes"], None).await;
-        assert_eq!(o, Outcome::Failed);
-        assert!(
-            seen.last()
-                .unwrap()
-                .contains("cannot come from commands the client runs")
-        );
+        for style in [Style::Forms, Style::Entries, Style::Boxes] {
+            let h = own(FakeHost::default());
+            let (o, seen) = run_as(style, Lang::En, &h, &["yes"], None, Some(LINK)).await;
+            assert_eq!(o, Outcome::Failed);
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert!(
+                seen[0].contains("cannot come from commands the client runs"),
+                "{seen:?}"
+            );
+            assert!(h.did().is_empty());
+        }
         let h = own(installed());
         assert_eq!(run(&h, &["yes"], Some(LINK)).await.0, Outcome::Failed);
         let h = own(paired());
@@ -1778,14 +2517,21 @@ mod tests {
             Outcome::Failed
         );
         let h = own(paired());
-        run(
-            &h,
-            &["pick:pair", &format!("text:{LINK}"), "yes", "pick:quit"],
-            None,
-        )
-        .await;
+        run(&h, &["pick:pair", &format!("text:{LINK}"), "yes"], None).await;
         assert!(h.did().is_empty(), "{:?}", h.did());
         assert_eq!(h.paired().as_deref(), Some("https://old.example"));
+        // A command that took over after an earlier check: after the Yes,
+        // before installing and before pairing it checks again.
+        for passing in [1, 2, 3] {
+            let h = FakeHost {
+                own_from: Some(passing),
+                ..FakeHost::default()
+            };
+            let (o, _) = zenity(&h, &[&format!("form:{LINK}"), "yes"], None).await;
+            assert_eq!(o, Outcome::Failed);
+            assert!(h.paired().is_none());
+            assert_eq!(h.installed(), passing == 3, "{:?}", h.did());
+        }
     }
 
     /// The password, checked with sudo, then kept, then sudo access on: in that
@@ -1800,15 +2546,19 @@ mod tests {
                 "pick:set",
                 "pw:right pw",
                 "yes",
-                "pick:back",
-                "pick:quit",
+                "cancel",
+                "cancel",
             ],
             None,
         )
         .await;
         assert_eq!(h.did(), ["sudo check", "keep", "sudo on"]);
         assert_eq!(h.password.lock().unwrap().as_deref(), Some("right pw"));
-        assert!(seen[1].starts_with("menu: Sudo access lets"), "{seen:?}");
+        // Back is the window's button, no item.
+        assert!(
+            seen[1].starts_with("menu [Enter the password] [Back / Choose]: Sudo access lets"),
+            "{seen:?}"
+        );
         assert!(seen[1].contains("Sudo access: off. Password: not stored."));
         assert!(
             seen[2].starts_with("password: The password sudo asks alice for."),
@@ -1817,23 +2567,32 @@ mod tests {
         assert!(seen[3].starts_with(
             "question: The password is stored in the running client.\n\nSwitch sudo access on now?"
         ));
-        assert_eq!(seen[4], "info: Sudo access is on.");
+        // What happened, at the top of the sudo menu shown next.
         assert!(
-            seen[5].contains("Sudo access: on. Password: stored."),
+            seen[4].contains("]: Sudo access is on.\n\nSudo access lets"),
             "{seen:?}"
+        );
+        assert!(
+            seen[4].contains("Sudo access: on. Password: stored."),
+            "{seen:?}"
+        );
+        assert!(
+            seen[4].starts_with(
+                "menu [Enter the password, Switch sudo access off, Forget the password]"
+            )
         );
         assert!(seen.iter().all(|s| !s.contains("right pw")), "{seen:?}");
         // Already on: the password is replaced, no question.
         let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw"], None).await;
         assert_eq!(h.did()[3..], ["sudo check", "keep"]);
         assert!(
-            seen[3].ends_with("running client.\n\nSudo access is on."),
+            seen[3].contains("]: The password is stored in the running client.\n\nSudo access is on.\n\nSudo access lets"),
             "{seen:?}"
         );
         // Off, then the password forgotten.
         run(
             &h,
-            &["pick:sudo", "pick:off", "pick:forget", "yes", "pick:back"],
+            &["pick:sudo", "pick:off", "pick:forget", "yes", "cancel"],
             None,
         )
         .await;
@@ -1855,8 +2614,8 @@ mod tests {
         let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:wrong\x1b[2K"], None).await;
         assert_eq!(h.did(), ["sudo check"]);
         assert!(
-            seen[3].starts_with(
-                "error: sudo did not accept this password (sudo: 1 incorrect password attempt)"
+            seen[3].contains(
+                "]: sudo did not accept this password (sudo: 1 incorrect password attempt)"
             ),
             "{seen:?}"
         );
@@ -1873,7 +2632,7 @@ mod tests {
         let h = paired();
         for pw in ["pw:", "pw:a\nb"] {
             let (_, seen) = run(&h, &["pick:sudo", "pick:set", pw], None).await;
-            assert!(seen[3].starts_with("error: "), "{seen:?}");
+            assert!(seen[3].contains("Nothing changed."), "{seen:?}");
         }
         assert!(h.did().is_empty());
         // Not running and memory only: nothing stored, nothing switched on.
@@ -1883,10 +2642,7 @@ mod tests {
         };
         let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw", "yes"], None).await;
         assert_eq!(h.did(), ["sudo check", "keep"]);
-        assert!(
-            seen[3].starts_with("error: The client is not running"),
-            "{seen:?}"
-        );
+        assert!(seen[3].contains("]: The client is not running"), "{seen:?}");
         assert!(!*h.sudo_active.lock().unwrap());
     }
 
@@ -1899,6 +2655,7 @@ mod tests {
         };
         let (_, seen) = run(&h, &["pick:sudo", "pick:set", "pw:right pw", "yes"], None).await;
         assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("error: "), "{seen:?}");
         assert!(h.did().is_empty());
     }
 
@@ -1944,65 +2701,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_sudo_menu_where_there_is_no_sudo_access_to_set_up() {
-        let h = FakeHost {
-            sudo: false,
-            ..paired()
-        };
-        let (o, seen) = run(&h, &["pick:sudo"], None).await;
-        assert_eq!(o, Outcome::Done);
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[tokio::test]
     async fn the_windows_speak_german() {
-        let h = FakeHost::default();
-        let (_, seen) = run_in(Lang::De, &h, &["yes", &format!("text:{LINK}"), "yes"], None).await;
-        assert!(
-            seen[0].starts_with("question: Pithagoras Sync für alice installieren?"),
-            "{seen:?}"
-        );
-        assert!(
-            seen[1].starts_with("entry: Füge den Kopplungslink"),
-            "{seen:?}"
-        );
-        assert!(
-            seen[2].contains("Pithagoras-Portal https://portal.example als „laptop“ koppeln?"),
-            "{seen:?}"
-        );
-        assert!(
-            seen[3].starts_with(
-                "info: Pithagoras Sync läuft, ist mit https://portal.example verbunden"
-            )
-        );
-        assert!(seen[3].contains("Protokoll: das Journal"));
-        // The menu, the status and sudo access.
-        let (_, seen) = run_in(
+        let h = desktop(FakeHost::default());
+        let (_, seen) = run_as(
+            Style::Forms,
             Lang::De,
             &h,
-            &[
-                "pick:status",
-                "pick:sudo",
-                "pick:set",
-                "pw:wrong",
-                "pick:back",
-                "pick:quit",
-            ],
+            &[&format!("form:{LINK}|my login"), "yes"],
+            None,
             None,
         )
         .await;
-        assert!(seen[0].starts_with("menu: Pithagoras Sync ist installiert und mit"));
-        assert!(seen[1].contains("Client: läuft, verbunden"), "{seen:?}");
         assert!(
-            seen[1].contains("Modus: ask: Jeder Dateizugriff"),
+            seen[0].starts_with(
+                "form [Kopplungslink, Anmeldepasswort] [Installieren und koppeln]: Pithagoras Sync für alice installieren?"
+            ),
+            "{seen:?}"
+        );
+        assert!(seen[0].contains("Bleibt es leer, wird ohne Kopplung installiert."));
+        assert!(seen[0].contains("dein Anmeldepasswort (alice)"), "{seen:?}");
+        assert!(
+            seen[1].contains("Pithagoras-Portal https://portal.example als „laptop“ koppeln?"),
             "{seen:?}"
         );
         assert!(
-            seen[3].contains("Sudo-Zugriff: ausgeschaltet. Passwort: nicht gespeichert."),
+            seen[2].starts_with(
+                "info: Pithagoras Sync läuft, ist mit https://portal.example verbunden"
+            )
+        );
+        assert!(seen[2].contains("Protokoll: das Journal"));
+        // The menu with the status, and sudo access.
+        let (_, seen) = run_in(
+            Lang::De,
+            &h,
+            &["pick:sudo", "pick:set", "pw:wrong", "cancel", "cancel"],
+            None,
+        )
+        .await;
+        assert!(seen[0].contains("]: Pithagoras Sync ist installiert und mit"));
+        assert!(seen[0].contains("Client: läuft, verbunden"), "{seen:?}");
+        assert!(
+            seen[0].contains("Modus: ask: Jeder Dateizugriff"),
             "{seen:?}"
         );
-        assert!(seen[4].starts_with("password: Das Passwort, nach dem sudo alice fragt"));
-        assert!(seen[5].starts_with("error: sudo hat dieses Passwort nicht angenommen"));
+        assert!(
+            seen[1].starts_with("menu [Passwort eingeben] [Zurück / Auswählen]"),
+            "{seen:?}"
+        );
+        assert!(
+            seen[1].contains("Sudo-Zugriff: ausgeschaltet. Passwort: nicht gespeichert."),
+            "{seen:?}"
+        );
+        assert!(seen[2].starts_with("password: Das Passwort, nach dem sudo alice fragt"));
+        assert!(seen[3].contains("]: sudo hat dieses Passwort nicht angenommen"));
         // Refused from the client's own commands, in German too.
         let h = FakeHost {
             own_command: true,

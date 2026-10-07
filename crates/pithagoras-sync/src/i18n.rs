@@ -145,6 +145,152 @@ impl Lang {
         }
     }
 
+    /// The first window of an install (zenity's form, kdialog's entry): what
+    /// installing does, and that the link may stay empty. `paired`: the
+    /// portal of a pairing kept from an earlier install. `account`: whose
+    /// login password the form asks for too.
+    pub fn install_form_text(
+        self,
+        user: &str,
+        path: Option<&str>,
+        paired: Option<&str>,
+        account: Option<&str>,
+    ) -> String {
+        let install = self.install_question(user, path);
+        let empty = match (paired, self) {
+            (None, Lang::En) => "Left empty, it installs without pairing.".to_string(),
+            (None, Lang::De) => "Bleibt es leer, wird ohne Kopplung installiert.".to_string(),
+            (Some(old), Lang::En) => {
+                format!("Left empty, it installs and keeps the pairing with {old}.")
+            }
+            (Some(old), Lang::De) => format!(
+                "Bleibt es leer, wird installiert und die Kopplung mit {old} bleibt erhalten."
+            ),
+        };
+        let link = match self {
+            Lang::En => format!(
+                "To pair it now, paste the pairing link from the portal's Devices page (Settings, Devices, Pair a device). {empty}"
+            ),
+            Lang::De => format!(
+                "Um ihn gleich zu koppeln, füge den Kopplungslink von der Geräteseite des Portals ein (Einstellungen, Geräte, Gerät koppeln). {empty}"
+            ),
+        };
+        match account {
+            Some(a) => format!("{install}\n\n{link}\n\n{}", self.form_password_note(a)),
+            None => format!("{install}\n\n{link}"),
+        }
+    }
+
+    /// zenity's form for pairing an installed client: the link and, where
+    /// pairing asks for it, the login password of `account`.
+    pub fn pair_form_text(self, account: Option<&str>) -> String {
+        match account {
+            Some(a) => format!("{}\n\n{}", self.entry_text(), self.form_password_note(a)),
+            None => self.entry_text().to_string(),
+        }
+    }
+
+    /// Below a form that asks for the login password next to the link.
+    fn form_password_note(self, account: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pairing decides which portal's agent may use this computer, so it needs your login password ({account}), as `pithagoras-sync pair` does in a terminal. It is checked with su only after you confirmed the portal, and not kept."
+            ),
+            Lang::De => format!(
+                "Die Kopplung legt fest, welcher Agent eines Portals diesen Computer nutzen darf, daher braucht sie dein Anmeldepasswort ({account}), wie `pithagoras-sync pair` im Terminal. Es wird erst geprüft, nachdem du das Portal bestätigt hast, mit su, und nicht aufbewahrt."
+            ),
+        }
+    }
+
+    /// zenity's form again after the password was not taken: the link stays
+    /// (shown as what was parsed), only the password is asked for.
+    pub fn password_again_text(self, portal: &str, name: &str, account: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Pairing with the Pithagoras portal {portal} as \"{name}\" needs your login password ({account}). It is checked with su and not kept."
+            ),
+            Lang::De => format!(
+                "Die Kopplung mit dem Pithagoras-Portal {portal} als „{name}“ braucht dein Anmeldepasswort ({account}). Es wird mit su geprüft und nicht aufbewahrt."
+            ),
+        }
+    }
+
+    /// The labels of the form's fields.
+    pub fn link_label(self) -> &'static str {
+        self.pick("Pairing link", "Kopplungslink")
+    }
+
+    pub fn password_label(self) -> &'static str {
+        self.pick("Login password", "Anmeldepasswort")
+    }
+
+    /// Install and pair in one question, when the link is known before the
+    /// first window (opened from the portal, or on Windows in the
+    /// clipboard): the facts of both questions.
+    pub fn install_pair_question(
+        self,
+        user: &str,
+        path: Option<&str>,
+        pair: &InstallPair,
+    ) -> String {
+        let pin = self.pin_note(pair.pinned);
+        let mode = self.pair_mode(pair.mode);
+        let (portal, name) = (pair.portal, pair.name);
+        if let Some(old) = pair.old {
+            let install = self.install_question(user, path);
+            let replace = self.replace_question(old, portal, name, pair.pinned, pair.mode);
+            return format!("{install}\n\n{replace}");
+        }
+        match self {
+            Lang::En => format!(
+                "Install Pithagoras Sync for {user} and pair it with the Pithagoras portal {portal} as \"{name}\"?{pin}\n\nInstalling copies the program to {}, starts it at login, and opens pithagoras-sync:// links (the pairing link in the portal).\n\nThe portal's agent can then ask to use this computer's files and shell. {mode}",
+                path.unwrap_or("your programs folder")
+            ),
+            Lang::De => format!(
+                "Pithagoras Sync für {user} installieren und mit dem Pithagoras-Portal {portal} als „{name}“ koppeln?{pin}\n\nDas Programm wird nach {} kopiert, beim Anmelden gestartet und öffnet pithagoras-sync://-Links (den Kopplungslink im Portal).\n\nDer Agent des Portals kann dann darum bitten, die Dateien und die Shell dieses Computers zu nutzen. {mode}",
+                path.unwrap_or("deinen Programme-Ordner")
+            ),
+        }
+    }
+
+    /// Installed with the link left empty, and not paired.
+    pub fn installed_not_paired(self) -> &'static str {
+        self.pick(
+            "Pithagoras Sync is installed and starts at login. It is not paired yet: click the pairing link on the portal's Devices page (Settings, Devices, Pair a device), or open Pithagoras Sync again and paste it.",
+            "Pithagoras Sync ist installiert und startet beim Anmelden. Es ist noch nicht gekoppelt: Klicke auf den Kopplungslink auf der Geräteseite des Portals (Einstellungen, Geräte, Gerät koppeln), oder öffne Pithagoras Sync erneut und füge ihn ein.",
+        )
+    }
+
+    // Buttons.
+
+    pub fn install_and_pair_button(self) -> &'static str {
+        self.pick("Install and pair", "Installieren und koppeln")
+    }
+
+    pub fn pair_button(self) -> &'static str {
+        self.pick("Pair", "Koppeln")
+    }
+
+    pub fn cancel_button(self) -> &'static str {
+        self.pick("Cancel", "Abbrechen")
+    }
+
+    pub fn open_button(self) -> &'static str {
+        self.pick("Open", "Öffnen")
+    }
+
+    pub fn close_button(self) -> &'static str {
+        self.pick("Close", "Schließen")
+    }
+
+    pub fn choose_button(self) -> &'static str {
+        self.pick("Choose", "Auswählen")
+    }
+
+    pub fn back_button(self) -> &'static str {
+        self.pick("Back", "Zurück")
+    }
+
     /// The flow was started by a command the client runs for the portal.
     pub fn own_command(self) -> &'static str {
         self.pick(
@@ -365,17 +511,22 @@ impl Lang {
 
     // The menu of a paired device.
 
-    pub fn menu_text(self, portal: &str) -> String {
+    /// The menu's text: the pairing and the status (`status`, escaped).
+    pub fn menu_text(self, portal: &str, status: &str) -> String {
+        let status = status.trim_end();
         match self {
-            Lang::En => format!("Pithagoras Sync is installed and paired with {portal}."),
-            Lang::De => format!("Pithagoras Sync ist installiert und mit {portal} gekoppelt."),
+            Lang::En => {
+                format!("Pithagoras Sync is installed and paired with {portal}.\n\n{status}")
+            }
+            Lang::De => {
+                format!("Pithagoras Sync ist installiert und mit {portal} gekoppelt.\n\n{status}")
+            }
         }
     }
 
     /// The label of a menu item, by its key.
     pub fn label(self, key: &str) -> &'static str {
         match key {
-            "status" => "Status",
             "pair" => self.pick("Pair again", "Neu koppeln"),
             "sudo" => self.pick("Sudo access", "Sudo-Zugriff"),
             "log" => self.pick("Open log", "Protokoll öffnen"),
@@ -383,8 +534,7 @@ impl Lang {
             "set" => self.pick("Enter the password", "Passwort eingeben"),
             "off" => self.pick("Switch sudo access off", "Sudo-Zugriff ausschalten"),
             "forget" => self.pick("Forget the password", "Passwort vergessen"),
-            "back" => self.pick("Back", "Zurück"),
-            _ => self.pick("Close", "Schließen"),
+            _ => "?",
         }
     }
 
@@ -442,7 +592,7 @@ impl Lang {
         }
     }
 
-    /// What the menu's Status shows. Values in `s` are escaped.
+    /// The status the menu shows above its items. Values in `s` are escaped.
     pub fn status(self, s: &StatusView) -> String {
         use std::fmt::Write;
         let mut out = String::new();
@@ -761,22 +911,37 @@ impl Lang {
         )
     }
 
-    /// Windows: one item of a menu, as a Yes/No/Cancel question. After the
-    /// `last` one there is no next choice: No closes as well.
-    pub fn menu_step(self, text: &str, label: &str, last: bool) -> String {
-        match (self, last) {
+    /// Windows: one item of a menu, as a Yes/No/Cancel question; `text` (the
+    /// menu's, with the status) in the first box only. After the `last` one
+    /// there is no next choice: No closes as well.
+    pub fn menu_step(self, text: Option<&str>, label: &str, last: bool) -> String {
+        let ask = match (self, last) {
             (Lang::En, false) => {
-                format!("{text}\n\n{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
+                format!("{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
             }
-            (Lang::En, true) => format!("{text}\n\n{label}?\n\nYes: {label}. No or Cancel: close."),
-            (Lang::De, false) => format!(
-                "{text}\n\n{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen."
-            ),
+            (Lang::En, true) => format!("{label}?\n\nYes: {label}. No or Cancel: close."),
+            (Lang::De, false) => {
+                format!("{label}?\n\nJa: {label}. Nein: die nächste Auswahl. Abbrechen: schließen.")
+            }
             (Lang::De, true) => {
-                format!("{text}\n\n{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
+                format!("{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
             }
+        };
+        match text {
+            Some(t) => format!("{t}\n\n{ask}"),
+            None => ask,
         }
     }
+}
+
+/// What the question that installs and pairs at once shows of the pairing.
+pub struct InstallPair<'a> {
+    pub portal: &'a str,
+    pub name: &'a str,
+    pub pinned: bool,
+    pub mode: PairMode,
+    /// The portal of a pairing kept from an earlier install.
+    pub old: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -810,8 +975,13 @@ mod tests {
     #[test]
     fn the_last_menu_step_offers_no_next_choice() {
         for t in [Lang::En, Lang::De] {
-            let next = t.menu_step("Menu", "Status", false);
-            let last = t.menu_step("Menu", "Close", true);
+            let next = t.menu_step(Some("Menu"), "Pair again", false);
+            let last = t.menu_step(None, "Uninstall", true);
+            assert!(next.starts_with("Menu\n\n"), "{next}");
+            assert!(
+                last.starts_with(t.pick("Uninstall?", "Uninstall?")),
+                "{last}"
+            );
             assert!(
                 next.contains(t.pick("the next choice", "die nächste Auswahl")),
                 "{next}"
@@ -860,20 +1030,9 @@ mod tests {
 
     #[test]
     fn every_menu_label_has_both_languages() {
-        for key in [
-            "status",
-            "pair",
-            "sudo",
-            "log",
-            "uninstall",
-            "set",
-            "off",
-            "forget",
-            "back",
-            "quit",
-        ] {
-            assert!(!Lang::En.label(key).is_empty());
-            assert!(!Lang::De.label(key).is_empty());
+        for key in ["pair", "sudo", "log", "uninstall", "set", "off", "forget"] {
+            assert_ne!(Lang::En.label(key), "?");
+            assert_ne!(Lang::De.label(key), "?");
         }
         assert_eq!(Lang::De.label("uninstall"), "Deinstallieren");
     }
