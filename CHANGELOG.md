@@ -2,6 +2,31 @@
 
 What changed in each release of Pithagoras Sync, newest first. Every release has a section here: the release workflow stops a version tag whose section is missing, and uses the section as the release notes. How to write one: [docs/releasing.md](docs/releasing.md).
 
+## 0.0.2 - unreleased
+
+The graphical install: a person who never opens a terminal can install, pair, set up sudo access and uninstall the client. A server install stays command-line only and works as before.
+
+### Added
+
+- **Install by double click** on Windows 10/11, GNOME and KDE, in English and German: the downloaded file asks, installs, asks for the pairing link, pairs and shows whether it connected. `pithagoras-sync gui` starts the same flow; with no arguments, a start without a terminal does.
+- **Pairing by link.** The client registers itself for `pithagoras-sync://` links (a desktop entry and an icon on Linux, the registry under `HKCU` on Windows), so a click on the portal's pairing link opens it. The link is untrusted: it is parsed strictly and nothing is paired before a question that shows the parsed portal and device name and the current mode.
+- **A menu** for an installed and paired client: status, pair again, sudo access (Linux), open the log, uninstall (with or without `--purge`).
+- **Sudo access in a window** (Linux): the password goes into a hidden entry, is checked with `sudo`, and only then kept; the window can switch sudo access off and forget the password. Pairing in a window on a Linux desktop asks for the login password and checks it with `su`.
+- **The OS keyring.** `token_storage = keyring` keeps the connector token in the Secret Service (GNOME Keyring, KWallet) or, on Windows, in the Credential Manager, which is the Windows default with a fallback to the file. `policy.privilege.secret_storage = keyring` keeps the elevation password there (Linux). Neither falls back silently when you chose the keyring.
+- **`docs/install.md`** for people who are not at a terminal.
+
+### Changed
+
+- A portal URL path is limited to ASCII letters, digits and `-._~/` and `%XX`, with no `.` or `..` segment. A pairing saved by 0.0.1 with such a path no longer connects: pair again.
+- Every pairing records its time in the config (`paired_ms`), so a re-pairing with the same device id takes the new token at once. A client of 0.0.1 cannot read a config written by this version; going back needs a new pairing.
+- Keyring entries carry the config folder, so two clients of one user keep apart entries.
+
+### Known limits
+
+- A console window can flash when the logon task starts the client on Windows (Windows Terminal about 0.2 s, the classic console about 25 ms); a launcher without a console comes later (issue #6).
+- The window texts for the CLI's errors are English; SmartScreen warns about the unsigned Windows file (issue #7).
+- Tried with Edge on Windows 11, Ubuntu's GNOME tools and kdialog under a virtual screen; links from Chrome and Firefox, Windows 10 and a real Plasma session are not tried yet.
+
 ## 0.0.1 - 2026-10-06
 
 The first release: the background client, without a GUI (phase 1 of the desktop app). It is the device side of the portal's Devices add-on.
