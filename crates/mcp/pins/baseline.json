@@ -40,22 +40,26 @@
         "type_text",
         "press_key"
       ],
-      "input": [
-        "mouse_move",
-        "mouse_click",
-        "mouse_scroll",
-        "mouse_drag",
-        "type_text",
-        "press_key"
-      ],
       "focus": {
-        "windows": {"tool": "list_windows"}
+        "windows": {
+          "tool": "list_windows"
+        }
       },
       "selftest": {
-        "screenshot": {"tool": "screenshot"},
+        "screenshot": {
+          "tool": "screenshot"
+        },
         "pointer": {
-          "position": {"tool": "get_cursor_position"},
-          "move_to": {"tool": "mouse_move", "args": {"x": "$x", "y": "$y"}}
+          "position": {
+            "tool": "get_cursor_position"
+          },
+          "move_to": {
+            "tool": "mouse_move",
+            "args": {
+              "x": "$x",
+              "y": "$y"
+            }
+          }
         }
       },
       "setup": [
@@ -64,8 +68,22 @@
           "title": "Accessibility (AT-SPI)",
           "text": "The server reads the window list through the accessibility bus (AT-SPI). GNOME switches it on with the setting org.gnome.desktop.interface toolkit-accessibility; applications started before the change see it after their next start.",
           "desktop": "gnome",
-          "check": {"argv": ["/usr/bin/gsettings", "get", "org.gnome.desktop.interface", "toolkit-accessibility"], "expect": "true"},
-          "run": ["/usr/bin/gsettings", "set", "org.gnome.desktop.interface", "toolkit-accessibility", "true"]
+          "check": {
+            "argv": [
+              "/usr/bin/gsettings",
+              "get",
+              "org.gnome.desktop.interface",
+              "toolkit-accessibility"
+            ],
+            "expect": "true"
+          },
+          "run": [
+            "/usr/bin/gsettings",
+            "set",
+            "org.gnome.desktop.interface",
+            "toolkit-accessibility",
+            "true"
+          ]
         },
         {
           "id": "shell-extension",
@@ -85,6 +103,11 @@
           "text": "computer-use-linux was validated on GNOME only. On KDE Plasma follow its README; the pointer and keyboard permission comes from Plasma's remote desktop portal. Pithagoras Sync has not tried this.",
           "desktop": "kde"
         }
+      ],
+      "observe": [
+        "screenshot",
+        "list_windows",
+        "get_cursor_position"
       ]
     },
     {
@@ -117,7 +140,10 @@
       ],
       "run": {
         "program": "python/python.exe",
-        "args": ["-m", "windows_mcp"],
+        "args": [
+          "-m",
+          "windows_mcp"
+        ],
         "env": {
           "ANONYMIZED_TELEMETRY": "false",
           "PYTHONUTF8": "1"
@@ -131,18 +157,21 @@
         "Move",
         "Wait"
       ],
-      "input": [
-        "Click",
-        "Type",
-        "Scroll",
-        "Move"
-      ],
       "focus": {
-        "windows": {"tool": "Snapshot"}
+        "windows": {
+          "tool": "Snapshot"
+        }
       },
       "selftest": {
-        "screenshot": {"tool": "Snapshot", "args": {"use_vision": true}},
-        "imports": ["windows_mcp"]
+        "screenshot": {
+          "tool": "Snapshot",
+          "args": {
+            "use_vision": true
+          }
+        },
+        "imports": [
+          "windows_mcp"
+        ]
       },
       "setup": [
         {
@@ -150,6 +179,10 @@
           "title": "Your desktop session",
           "text": "Windows-MCP drives your own desktop through UI Automation and needs no setup. It reaches only the session you are logged into: not a UAC prompt (the secure desktop), not another user's session and not the lock screen. While the screen is locked, calls fail."
         }
+      ],
+      "observe": [
+        "Snapshot",
+        "Wait"
       ]
     }
   ]

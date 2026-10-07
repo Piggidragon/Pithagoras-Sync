@@ -401,7 +401,7 @@ Params: `{}`. Result:
 
 - `servers`: the MCP servers installed on the device (none until the owner ran `pithagoras-sync computer-use install`), each with its pinned `version`.
 - `tools`: only the tools on the device's allow-list for that exact server version (default deny, exact names). A tool the server offers but the list does not name is never listed and never called; the portal never sees it. Descriptions and schemas are what the server listed when the device installed and tested that version (not asked again per `mcp.list`, so listing never starts a server); a description is cut at 4 KiB.
-- `input`: the tool moves the pointer or types; before each call of such a tool the device checks that no window of Pithagoras Sync is open or focused (`mcp.call`).
+- `input`: the device checks before each call of the tool that no window of Pithagoras Sync is open or focused (`mcp.call`). That is every tool but the few the pins name as only looking (a screenshot, the window list).
 - `state`: `ready`, or `unavailable` when the server's files on the device no longer match what was installed (or are gone): then `error` says why and `tools` is empty.
 - `version`: a hash of `servers`. It changes when the owner installs, removes, updates or rolls back a server, or one becomes unavailable.
 - `consent`, `consent_expires_ms`: the owner's consent in force now (`policy.computer_use.consent`: `off`, `ask` or `allow`, an `allow` that ran out reads `off`), and when an `allow` ends (Unix ms). Tools are listed whatever the consent says; with `off` their calls are refused. So the list is the same for the whole grant, and the consent only decides whether a call goes through.
@@ -431,22 +431,25 @@ Result:
 
 How the device decides, in this order:
 
-1. Paused (`panic`): `DENIED`, `paused`. Outside `policy.hours`: `DENIED`, `hours`.
-2. Unknown server: `SERVER`, `not_installed`. A tool that is not listed (not on the allow-list of the installed version, or not offered by the server): `DENIED`, `tool_not_allowed`. Bad `args`: `INVALID_PARAMS` or `TOO_LARGE`.
+1. Paused (`panic`): `DENIED`, `paused`.
+2. Unknown server: `SERVER`, `not_installed` (or `changed` when it is unavailable). A tool that is not listed (not on the allow-list of the installed version, or not offered by the server): `DENIED`, `tool_not_allowed`. Bad `args`: `INVALID_PARAMS` or `TOO_LARGE`. More than 8 calls waiting for the server: `BUSY`. Outside `policy.hours`: `DENIED`, `hours`.
 3. The consent (`policy.computer_use.consent`, device only; the portal cannot set it in any way):
    - `off`, or an `allow` that ran out: `DENIED`, `consent_off`.
    - `allow`: goes through until it ends (at most 8 hours, then `off`).
-   - `ask`: once per chat, through the approval path of every other question (`approval.requested`, answered with `approval.answer` or on the device). The question has `tool: "computer_use"`, the server and tool and its arguments in `target` (typed text and keys included, control characters as visible escapes, cut), the reason that computer use is as strong as Full mode, and the choices `once`, `chat` (this chat, until its grant ends or `policy.approvals.remember_minutes` run out) and `deny`. A denial is `DENIED`, `consent_denied`; nobody answering in time is `DENIED`, `consent_timeout` (whatever `policy.approvals.on_timeout` says: an unanswered consent is never a yes).
-4. For an `input` tool: the focus check. The device asks the server for its window list and the focused window (with tools of its own that are not listed to the portal) and refuses while a window of Pithagoras Sync is open or focused, or when it cannot tell (the server did not answer, or answered something it does not understand): `DENIED`, `focus`. Input never reaches the client's own windows (its dialogs, an approval prompt).
-5. The call goes to the server. Calls to one server run one at a time, in the order they came (at most 8 waiting, else `BUSY`). The device waits at most 60 s for the answer, then stops the server (`TIMEOUT`, `timed_out`); it starts it again with the next call.
+      - `ask`: once per chat, through the approval path of every other question (`approval.requested`, answered with `approval.answer` or on the device). The question has `tool: "computer_use"`, the server and tool and its arguments in `target` (typed text and keys included, control characters as visible escapes), the reason that computer use is as strong as Full mode, and the choices `once`, `chat` (this chat, until its grant ends, `policy.approvals.remember_minutes` run out, or the owner changes the consent) and `deny`. A denial is `DENIED`, `consent_denied`; nobody answering in time is `DENIED`, `consent_timeout` (whatever `policy.approvals.on_timeout` says: an unanswered consent is never a yes). Arguments longer than the question can show (1000 characters) are not asked about at all: `DENIED`, `consent_denied`; send shorter ones.
+4. The call waits for its turn (one at a time per server). Then the pause, the hours and the consent are checked again: a consent switched off or run out meanwhile refuses the waiting calls too (`DENIED`, `consent_off`).
+5. For an `input` tool: the focus check. The device asks the server for its window list and the focused window (with tools of its own that are not listed to the portal) and refuses while a window of Pithagoras Sync is open or focused, or when it cannot tell (the server did not answer, or answered something it does not understand): `DENIED`, `focus`. Input never reaches the client's own windows (its dialogs, an approval prompt).
+6. The call goes to the server. Calls to one server run one at a time, in the order they came. The device waits at most 60 s for the answer, then stops the server (`TIMEOUT`, `timed_out`); it starts it again with the next call.
 
-Failures of the server: `SERVER` with `not_running` (it does not start, or waits out its backoff after a crash; the message says for how long), `crashed` (it ended during the call), `changed` (its files no longer match the hash recorded at install; it is not run) or `bad_answer`.
+Failures of the server: `SERVER` with `not_running` (it does not start, or waits out its backoff after a crash; the message says for how long), `crashed` (it ended during the call), `changed` (its files no longer match the hash recorded at install; it is not run, and from then on `mcp.list` lists it as `unavailable` and `mcp.changed` says so) or `bad_answer`.
 
 **Taint.** Computer use is always tainted: what is on the screen is untrusted content. Every `mcp.call` that reached the server marks the chat as having seen untrusted content on the device (section 6), as the portal's `tainted` flag does, so with `policy.full.taint_prompts` (the default) that chat's next command and write ask even in Full mode. The portal's flag still only adds.
 
 **Indicator.** At the start of a burst of calls (none for a minute before), the device shows a desktop notification (Linux, where a notification service runs) that a chat uses the screen; `pithagoras-sync status` shows the chat and the last call. `panic` ends every running call (`DENIED`, `paused`) and stops the servers.
 
-Every decision is in the device's audit log and mirrored (`audit`, with `tool: "computer_use"`); the arguments only as the question showed them.
+Every decision is in the device's audit log and mirrored (`audit`, with `tool: "computer_use"`), refusals of unknown tools and bad arguments included; the arguments only as the question showed them.
+
+**The owner's side while computer use is active.** From a call until a minute after the last one, the agent may be typing into a terminal or clicking in a browser of the owner's, which the device cannot tell from the owner. So the device then takes no approval answer, setting change, unlock or secret from its own command line and control channel, only `status`, `panic`, `computer-use off` and denials. Answers from the portal (`approval.answer`) are taken as always: the portal's own sessions are the portal's to keep apart.
 
 ## 8. Binary frames
 

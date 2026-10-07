@@ -25,6 +25,7 @@ struct Env {
     home: PathBuf,
     key: TestKey,
     files: FileServer,
+    active_ms: String,
 }
 
 impl Env {
@@ -41,6 +42,7 @@ impl Env {
             home,
             key: TestKey::generate(),
             files: FileServer::start().await,
+            active_ms: "0".into(),
         }
     }
 
@@ -61,6 +63,9 @@ impl Env {
                 self.root.join("pins/mcp.json"),
             )
             .env("PITHAGORAS_SYNC_TEST_MCP_KEY", self.key.public_base64())
+            // Active only while a call runs, so the owner's commands below go
+            // through; `while_active` tests the minute after a call.
+            .env("PITHAGORAS_SYNC_TEST_MCP_ACTIVE_MS", &self.active_ms)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         c
@@ -109,7 +114,7 @@ impl Env {
                            "sha256": sync_mcp::fsutil::sha256_hex(&data), "size": data.len()}],
                 "run": {"program": "fake-mcp", "args": ["--record", self.root.join("record").to_string_lossy()], "env": {"FAKE_TELEMETRY": "off"}},
                 "allow": ["screenshot", "list_windows", "get_cursor_position", "mouse_move", "type_text", "PowerShell"],
-                "input": ["mouse_move", "type_text"],
+                "observe": ["screenshot", "list_windows", "get_cursor_position"],
                 "focus": {"windows": {"tool": "list_windows"}},
                 "selftest": {"screenshot": {"tool": "screenshot"},
                              "pointer": {"position": {"tool": "get_cursor_position"}, "move_to": {"tool": "mouse_move", "args": {"x": "$x", "y": "$y"}}}},
@@ -398,5 +403,61 @@ async fn the_file_tools_never_reach_the_servers_folder() {
         .await
         .unwrap_err();
     assert_eq!(w.code, sync_proto::code::DENIED);
+    stop(daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn while_computer_use_is_active_the_owners_side_takes_nothing() {
+    let mut env = Env::new().await;
+    env.active_ms = "60000".into();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+    env.publish(1, "1.0.0");
+    env.ok(&["computer-use", "install"]).await;
+    env.ok(&["computer-use", "allow", "--minutes", "5"]).await;
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.expect("connects");
+    call(&dl, "c1", "screenshot", json!({})).await.unwrap();
+    // The agent could be typing these into a terminal now.
+    for args in [
+        &["approve", "1"][..],
+        &["computer-use", "ask"],
+        &["computer-use", "allow", "--minutes", "480"],
+        &["mode", "full"],
+        &["config", "set", "policy.tools.bash", "false"],
+        &["unlock"],
+    ] {
+        let (ok, out) = env.run(args).await;
+        assert!(
+            !ok && out.contains("computer use is active"),
+            "{args:?}: {out}"
+        );
+    }
+    // Straight to the control socket, past the CLI's own check: the same.
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let sock = env.state().join("run/control.sock");
+        let mut s = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        s.write_all(b"{\"cmd\":\"reload\"}\n").await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(s)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert!(line.contains("computer use is active"), "{line}");
+    }
+    // What only takes away still works.
+    let (_, out) = env.run(&["deny", "99"]).await;
+    assert!(out.contains("no approval 99"), "{out}");
+    let status = env.ok(&["status"]).await;
+    assert!(status.contains("Computer use:"), "{status}");
+    env.ok(&["computer-use", "off"]).await;
+    let e = call(&dl, "c1", "screenshot", json!({})).await.unwrap_err();
+    assert_eq!(reason(&e), "consent_off");
+    env.ok(&["panic"]).await;
     stop(daemon).await;
 }

@@ -27,6 +27,7 @@ What else holds while it is on:
 - **Not into Pithagoras Sync's own windows.** Before every click or key, the client asks the server which windows are open and which has the focus, and refuses while a window of Pithagoras Sync is open (its install and pairing windows, any question it shows). If it cannot tell, it refuses too.
 - **The chat counts as having seen untrusted content.** A screenshot can show anything, including text written to trick the agent. After a computer-use call, that chat's next command or write asks you even in Full mode (`policy.full.taint_prompts`, on by default).
 - **An indicator.** At the start of each burst of calls a desktop notification (Linux) says which chat uses the screen; `pithagoras-sync status` shows it too ("Computer use: ... in use by chat ..."). Every decision is in the audit log.
+- **Your own command line waits while it is active.** From a computer-use call until a minute after the last one, the agent could be typing into one of your terminals. So the client then takes no approval, setting, `unlock` or secret from its command line (`approve`, `config set`, `mode`, `computer-use ask` and the like say "computer use is active"); `status`, `panic`, `computer-use off` and `deny` work. Answer approvals in the portal meanwhile, or wait a minute.
 - **No way around the rest.** The file tools never reach the server's folder (in no mode, as the stored sudo password), so a portal cannot read or replace the server through them; and only the allowed tools above are ever called, never one that runs commands or reads files.
 
 ## Install
@@ -38,7 +39,7 @@ pithagoras-sync computer-use install
 
 or `pithagoras-sync install --computer-use` together with the client, or "Also install computer use?" in the install window. It downloads the pinned version of the server from its project's releases (GitHub, and on Windows python.org and PyPI), checks each file's size and sha256 against the pin before anything is written, puts it into the client's own folder (`~/.local/state/pithagoras-sync/mcp/<server>/<version>/`, `%LOCALAPPDATA%\pithagoras-sync\mcp\...` on Windows; private to you), starts it once to see that it answers and which tools it has, and records the version and a hash of the whole folder in `config.toml`. Before every start the client checks that hash again: a server changed after install is not run. Nothing comes from your `PATH`, and nothing is installed system-wide.
 
-Versions are exact pins, never "latest". The pins are built into the client and can be replaced by a newer list the owner of this project signs with the release key ([mcp-updates.md](mcp-updates.md)), without a new client.
+Each version goes into a folder of its own, named after the version and its pin. Versions are exact pins, never "latest". The pins are built into the client and can be replaced by a newer list the owner of this project signs with the release key ([mcp-updates.md](mcp-updates.md)), without a new client.
 
 ## Setup
 
@@ -77,7 +78,7 @@ These are settings (`policy.computer_use.consent`, [permissions.md](permissions.
 
 ## Updates
 
-`pithagoras-sync update` updates the server too, also when there is no newer client, and the running client looks once a day at a random time (off with `config set policy.computer_use.auto_update false`). A new version goes into a new folder, is tested there, and is switched to in one step once no call is running; the version before stays for `pithagoras-sync computer-use rollback`. A failed update keeps the old one and says why in `computer-use status`. Your consent and settings stay as they are; the allow-list is the new version's own.
+`pithagoras-sync update` updates the server too, also when there is no newer client, and the running client looks once a day at a random time (off with `config set policy.computer_use.auto_update false`). A new version goes into a new folder, is tested there, and is switched to in one step once no call is running; the version before stays for `pithagoras-sync computer-use rollback`. After a rollback, updates leave the server at that version until you run `computer-use install` again. A failed update keeps the old one and says why in `computer-use status`. Your consent and settings stay as they are; the allow-list is the new version's own.
 
 ```sh
 pithagoras-sync computer-use update [--check]
@@ -90,7 +91,7 @@ pithagoras-sync computer-use rollback
 pithagoras-sync computer-use uninstall          # the server only
 ```
 
-`pithagoras-sync uninstall` and `uninstall --purge` remove it too.
+`pithagoras-sync uninstall` and `uninstall --purge` remove it too. The record goes first, so a running client lets go of the server before its files are removed.
 
 ## What is validated
 

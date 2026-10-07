@@ -49,7 +49,7 @@ fn base_env() -> Vec<(String, String)> {
 /// What `install --print` lists.
 pub fn plan(dirs: &Dirs, doc: &Document) -> Result<Vec<String>, String> {
     let pin = pinned(doc).ok_or("there is no computer-use server for this platform")?;
-    let dir = install::version_dir(&dirs.mcp_dir(), &pin.name, &pin.version);
+    let dir = install::version_dir(&dirs.mcp_dir(), &pin.name, &install::folder_name(pin));
     let mut out = vec![format!(
         "computer use: {} {} from the {} pins (serial {})",
         pin.name,
@@ -99,9 +99,9 @@ pub fn plan(dirs: &Dirs, doc: &Document) -> Result<Vec<String>, String> {
         out.push(format!("  its environment: {k}={v}"));
     }
     out.push(format!(
-        "  allow only: {} (pointer and keyboard: {})",
+        "  allow only: {} (looking only, without the focus check: {})",
         pin.allowed().join(", "),
-        pin.input.join(", ")
+        pin.observe.join(", ")
     ));
     out.push(format!(
         "  record {} {} with the hash of its folder in {} ([mcp.{}])",
@@ -122,7 +122,7 @@ pub async fn install_pin(
     say: &mut (dyn FnMut(String) + Send),
 ) -> Result<(), String> {
     let mcp = dirs.mcp_dir();
-    let hash = install::install(
+    let done = install::install(
         &mcp,
         pin,
         sync_mcp::arch(),
@@ -136,8 +136,9 @@ pub async fn install_pin(
     let mut cfg = DeviceConfig::load(&dirs.config_file())?;
     let old = cfg.mcp.get(&pin.name).cloned();
     let previous = match &old {
-        Some(o) if o.version != pin.version => Some(InstalledVersion {
+        Some(o) if o.folder != done.folder => Some(InstalledVersion {
             version: o.version.clone(),
+            folder: o.folder.clone(),
             sha256: o.sha256.clone(),
         }),
         Some(o) => o.previous.clone(),
@@ -147,17 +148,25 @@ pub async fn install_pin(
         pin.name.clone(),
         InstalledServer {
             version: pin.version.clone(),
-            sha256: hash,
+            folder: done.folder.clone(),
+            sha256: done.sha256,
             serial,
             previous: previous.clone(),
+            held: false,
         },
     );
     cfg.save(&dirs.config_file())?;
-    let mut keep = vec![pin.version.as_str()];
+    // Older versions go; one that cannot go yet (Windows: still running)
+    // stays until the next install, and the install counts as done.
+    let mut keep = vec![done.folder.as_str()];
     if let Some(p) = &previous {
-        keep.push(p.version.as_str());
+        keep.push(p.folder.as_str());
     }
-    install::prune(&mcp, &pin.name, &keep)?;
+    if let Err(e) = install::prune(&mcp, &pin.name, &keep) {
+        say(format!(
+            "note: an older version could not be removed yet: {e}"
+        ));
+    }
     Ok(())
 }
 
@@ -187,11 +196,13 @@ pub async fn install_now(
     Ok(format!("{} {}", pin.name, pin.version))
 }
 
-/// `computer-use uninstall` (and `uninstall`): every server and its record.
-pub fn uninstall_all(dirs: &Dirs) -> Result<Vec<String>, String> {
+/// `computer-use uninstall` (and `uninstall`), first step: the record goes,
+/// so the running client lets go of the servers once it reloads. Returns
+/// the servers to remove (`remove_files`), a folder without a record (an
+/// install stopped halfway) among them.
+pub fn forget_all(dirs: &Dirs) -> Result<Vec<String>, String> {
     let mut cfg = DeviceConfig::load(&dirs.config_file())?;
     let mut names: Vec<String> = cfg.mcp.keys().cloned().collect();
-    // A server folder without a record (an install stopped halfway) goes too.
     if let Ok(rd) = std::fs::read_dir(dirs.mcp_dir()) {
         for e in rd.flatten() {
             if e.file_type().is_ok_and(|t| t.is_dir()) {
@@ -202,9 +213,6 @@ pub fn uninstall_all(dirs: &Dirs) -> Result<Vec<String>, String> {
             }
         }
     }
-    for n in &names {
-        install::uninstall(&dirs.mcp_dir(), n)?;
-    }
     if !cfg.mcp.is_empty() {
         cfg.mcp.clear();
         cfg.save(&dirs.config_file())?;
@@ -212,8 +220,33 @@ pub fn uninstall_all(dirs: &Dirs) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// The second step: the servers' files. A server the client still runs (a
+/// call in flight) holds its files on Windows for a moment: tried for up to
+/// ten seconds.
+pub async fn remove_files(dirs: &Dirs, names: &[String]) -> Result<(), String> {
+    for n in names {
+        let mut tries = 0;
+        loop {
+            match install::uninstall(&dirs.mcp_dir(), n) {
+                Ok(()) => break,
+                Err(e) if tries >= 20 => {
+                    return Err(format!(
+                        "{e}; the server is no longer recorded, and `computer-use uninstall` again removes the rest"
+                    ));
+                }
+                Err(_) => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `computer-use rollback`: the version before, if it is still there and
-/// unchanged.
+/// unchanged. Updates leave it alone from then on (`held`) until the owner
+/// installs again.
 pub fn rollback(dirs: &Dirs) -> Result<String, String> {
     let mut cfg = DeviceConfig::load(&dirs.config_file())?;
     let (name, rec) = cfg
@@ -228,17 +261,20 @@ pub fn rollback(dirs: &Dirs) -> Result<String, String> {
             rec.version
         )
     })?;
-    install::verify(&dirs.mcp_dir(), &name, &prev.version, &prev.sha256)?;
+    install::verify(&dirs.mcp_dir(), &name, &prev.folder, &prev.sha256)?;
     cfg.mcp.insert(
         name.clone(),
         InstalledServer {
             version: prev.version.clone(),
+            folder: prev.folder,
             sha256: prev.sha256,
             serial: rec.serial,
             previous: Some(InstalledVersion {
                 version: rec.version.clone(),
+                folder: rec.folder,
                 sha256: rec.sha256,
             }),
+            held: true,
         },
     );
     cfg.save(&dirs.config_file())?;
@@ -268,17 +304,33 @@ pub async fn update(
         return Ok(out);
     }
     let store = store(dirs);
+    let mut peeked = None;
     if store.key.is_none() {
         out.notes.push(
             "this build has no release key, so the computer-use server keeps its built-in pins"
                 .into(),
         );
     } else {
-        match pins::check(&store, &pins::pins_url()).await {
-            Ok(Taken::New(d)) => say(format!(
-                "Computer use: new signed pins, serial {}.",
-                d.serial
-            )),
+        // `--check` only looks: nothing is kept, no serial raised.
+        let found = if check {
+            pins::peek(&store, &pins::pins_url()).await.map(|d| {
+                if d.serial > store.seen_serial() {
+                    Taken::New(d)
+                } else {
+                    Taken::Same(d)
+                }
+            })
+        } else {
+            pins::check(&store, &pins::pins_url()).await
+        };
+        match found {
+            Ok(Taken::New(d)) => {
+                say(format!(
+                    "Computer use: new signed pins, serial {}.",
+                    d.serial
+                ));
+                peeked = Some(d);
+            }
             Ok(Taken::Same(d)) => say(format!(
                 "Computer use: the pins are current (serial {}).",
                 d.serial
@@ -286,7 +338,10 @@ pub async fn update(
             Err(e) => out.notes.push(format!("computer use: no newer pins: {e}")),
         }
     }
-    let doc = store.current();
+    let doc = match peeked {
+        Some(d) if check => d,
+        _ => store.current(),
+    };
     for (name, rec) in &cfg.mcp {
         let Some(pin) = doc.server(name, sync_mcp::os()) else {
             out.notes.push(format!(
@@ -294,8 +349,14 @@ pub async fn update(
             ));
             continue;
         };
-        let dir = install::version_dir(&dirs.mcp_dir(), name, &rec.version);
-        let same = pin.version == rec.version && install::kept_pin(&dir).is_ok_and(|k| &k == pin);
+        if rec.held {
+            out.notes.push(format!(
+                "computer use: {name} stays at {} after the rollback; `pithagoras-sync computer-use install` takes {}",
+                rec.version, pin.version
+            ));
+            continue;
+        }
+        let same = rec.folder == install::folder_name(pin);
         if same {
             say(format!(
                 "Computer use: {name} {} is up to date.",
@@ -346,7 +407,7 @@ pub fn installed(dirs: &Dirs, cfg: &DeviceConfig) -> Result<(String, PathBuf, Se
         .iter()
         .next()
         .ok_or("no computer-use server is installed: `pithagoras-sync computer-use install`")?;
-    let dir = install::verify(&dirs.mcp_dir(), name, &rec.version, &rec.sha256)?;
+    let dir = install::verify(&dirs.mcp_dir(), name, &rec.folder, &rec.sha256)?;
     let doc = store(dirs).current();
     let pin = match doc.server(name, sync_mcp::os()) {
         Some(p) if p.version == rec.version => p.clone(),
@@ -369,6 +430,23 @@ pub async fn test_here(
     let steps = sync_mcp::selftest::run(&mut c, &pin, verbose).await;
     c.kill().await;
     Ok(steps)
+}
+
+/// Set (debug builds only) to how long after a call computer use counts as
+/// active, in milliseconds: the tests' way past the minute. A release build
+/// ignores it.
+pub const TEST_ACTIVE_MS: &str = "PITHAGORAS_SYNC_TEST_MCP_ACTIVE_MS";
+
+/// How long after a call the client takes no change, answer or secret.
+pub fn active_ms() -> i64 {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TEST_ACTIVE_MS)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return ms;
+    }
+    sync_mcp::service::BURST_GAP_MS
 }
 
 /// How often the running client looks for new pins.
@@ -453,9 +531,11 @@ mod tests {
             "s".into(),
             InstalledServer {
                 version: "1".into(),
+                folder: "1-x".into(),
                 sha256: String::new(),
                 serial: 0,
                 previous: None,
+                held: false,
             },
         );
         assert!(check_due(&cfg, 10, 0));

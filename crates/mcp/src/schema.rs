@@ -42,10 +42,11 @@ fn check_value(schema: &Value, v: &Value, at: &str, depth: usize) -> Result<(), 
         return Err(format!("{at}: nested too deep"));
     }
     let Some(s) = schema.as_object() else {
-        // `true` takes anything; `false` nothing.
+        // `true` would take anything: here a plain value only, since an
+        // object or a list in it would carry properties nobody named.
         return match schema {
-            Value::Bool(false) => Err(format!("{at}: not allowed")),
-            _ => Ok(()),
+            Value::Bool(true) if !v.is_object() && !v.is_array() => Ok(()),
+            _ => Err(format!("{at}: not allowed")),
         };
     };
     match s.get("type") {
@@ -108,10 +109,10 @@ fn check_value(schema: &Value, v: &Value, at: &str, depth: usize) -> Result<(), 
         {
             return Err(format!("{at}: too few items"));
         }
-        if let Some(item) = s.get("items") {
-            for (i, x) in items.iter().enumerate() {
-                check_value(item, x, &format!("{at}[{i}]"), depth + 1)?;
-            }
+        // Without `items`, plain values only, as for `true`.
+        let item = s.get("items").unwrap_or(&Value::Bool(true));
+        for (i, x) in items.iter().enumerate() {
+            check_value(item, x, &format!("{at}[{i}]"), depth + 1)?;
         }
     }
     if let Some(obj) = v.as_object() {
@@ -182,6 +183,12 @@ mod tests {
         let schema = json!({"type": "object"});
         assert!(check(&schema, &Map::new()).is_ok());
         assert!(check(&schema, &args(json!({"a": 1}))).is_err());
+        // Nothing nested where the schema names nothing.
+        let loose =
+            json!({"type": "object", "properties": {"any": true, "list": {"type": "array"}}});
+        assert!(check(&loose, &args(json!({"any": 1, "list": [1, "a"]}))).is_ok());
+        assert!(check(&loose, &args(json!({"any": {"cmd": "rm"}}))).is_err());
+        assert!(check(&loose, &args(json!({"list": [{"cmd": "rm"}]}))).is_err());
         // additionalProperties does not open the door.
         let open = json!({"type": "object", "additionalProperties": true});
         assert!(check(&open, &args(json!({"a": 1}))).is_err());

@@ -261,7 +261,6 @@ impl Lang {
         }
     }
 
-    /// Installed with the link left empty, and not paired.
     /// After the install: whether the computer-use server comes too.
     pub fn computer_use_question(self) -> &'static str {
         self.pick(
@@ -286,6 +285,7 @@ impl Lang {
         }
     }
 
+    /// Installed with the link left empty, and not paired.
     pub fn installed_not_paired(self) -> &'static str {
         self.pick(
             "Pithagoras Sync is installed and starts at login. It is not paired yet: click the pairing link on the portal's Devices page (Settings, Devices, Pair a device), or open Pithagoras Sync again and paste it.",

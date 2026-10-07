@@ -64,7 +64,7 @@ const KEYRING_SLOW: &str = "the keyring did not finish in time (a prompt left op
 /// shown as a notification (Allow once / Deny) answering the same queue. Off by
 /// default; the device's own dialog replaces it in phase 2.
 #[cfg(unix)]
-async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
+async fn mirror_to_notifications(queue: Arc<ApprovalQueue>, computer_use: ComputerUseGate) -> bool {
     use std::collections::HashMap;
     use sync_policy::notify::NotifyApprover;
     let Some(n) = NotifyApprover::connect().await else {
@@ -78,7 +78,7 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
         loop {
             match events.recv().await {
                 Ok(ApprovalEvent::Requested(info)) => {
-                    let (n, q) = (n.clone(), queue.clone());
+                    let (n, q, cu) = (n.clone(), queue.clone(), computer_use.clone());
                     let id = info.id;
                     shown.insert(
                         id,
@@ -98,6 +98,11 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
                                 on_timeout_allow: false,
                             };
                             let choice = match n.ask(&req).await {
+                                // A click while computer use is active may be
+                                // the agent's own: it counts as no.
+                                _ if cu.get().is_some_and(|s| s.active()) => {
+                                    sync_proto::methods::Choice::Deny
+                                }
                                 Answer::Deny => sync_proto::methods::Choice::Deny,
                                 _ => sync_proto::methods::Choice::Once,
                             };
@@ -118,6 +123,10 @@ async fn mirror_to_notifications(queue: Arc<ApprovalQueue>) -> bool {
     });
     true
 }
+
+/// The computer-use service, once the client made it, for what answers
+/// approvals beside the control channel.
+type ComputerUseGate = Arc<std::sync::OnceLock<Arc<sync_mcp::Service>>>;
 
 fn now_ms() -> i64 {
     system_clock()()
@@ -150,13 +159,14 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         return Err(root_refusal(cfg!(windows)));
     }
     let queue = ApprovalQueue::new(system_clock());
+    let gate: ComputerUseGate = Arc::default();
     #[allow(unused_mut)]
     let mut approvals =
         "through the portal's Devices tab and `pithagoras-sync approve`".to_string();
     #[cfg(unix)]
     if cfg.policy.approvals.desktop_notifications
         && cfg.profile == Profile::Desktop
-        && mirror_to_notifications(queue.clone()).await
+        && mirror_to_notifications(queue.clone(), gate.clone()).await
     {
         approvals.push_str(", and as desktop notifications");
     }
@@ -235,10 +245,12 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
             base_env: std::env::vars().collect(),
             limits: sync_mcp::Limits::default(),
             indicator,
+            active_ms: crate::computer_use::active_ms(),
         },
     );
     mcp.reload(cfg.mcp.clone(), crate::computer_use::store(&dirs).current());
     device.set_computer_use(mcp.clone());
+    let _ = gate.set(mcp.clone());
     let keyring = sync_policy::keyring::system(&dirs);
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
@@ -482,6 +494,7 @@ impl Daemon {
             audit_file: self.dirs.audit_file().to_string_lossy().into_owned(),
             exe: self.exe.to_string_lossy().into_owned(),
             computer_use: self.computer_use_line(&cfg),
+            computer_use_active: self.mcp.active(),
         }
     }
 
@@ -519,21 +532,23 @@ impl Daemon {
     /// `panic` takes an allow of computer use back: `unlock` does not give it
     /// again.
     fn consent_off_after_panic(&self) {
-        let file = self.dirs.config_file();
-        let Ok(mut cfg) = DeviceConfig::load(&file) else {
-            return;
-        };
-        if cfg.policy.computer_use.consent != Consent::Allow {
-            return;
+        if self.store.config().policy.computer_use.consent == Consent::Allow {
+            self.consent_off("panic");
         }
-        cfg.policy.computer_use.consent = Consent::Off;
-        cfg.policy.computer_use.until_ms = None;
-        if let Err(e) = cfg.save(&file) {
-            return warn!("panic could not switch computer use off in the config: {e}");
+    }
+
+    /// Switches computer use off in the running client and the file, taking
+    /// nothing else from the file (it may hold what the agent typed into an
+    /// editor while computer use was active).
+    fn consent_off(&self, why: &str) {
+        let r = self.store.update(why, |cfg| {
+            cfg.policy.computer_use.consent = Consent::Off;
+            cfg.policy.computer_use.until_ms = None;
+        });
+        if let Err(e) = r {
+            warn!("{why} could not switch computer use off in the config: {e}");
         }
-        if let Err(e) = self.reload() {
-            warn!("{e}");
-        }
+        self.mcp.announce();
     }
 
     async fn handle(&self, req: Request) -> Reply {
@@ -597,6 +612,10 @@ impl Daemon {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e.to_string()),
             },
+            Request::ComputerUseOff => {
+                self.consent_off("the device owner (computer-use off)");
+                Reply::ok()
+            }
             Request::McpStatus { probe } => Reply {
                 mcp: Some(crate::control::McpReport {
                     servers: self.mcp.status(probe).await,
@@ -1023,6 +1042,11 @@ async fn handle_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         Ok(req) if from_own_command && !req.allowed_from_own_commands() => Reply::err(
             "commands the client runs for the portal cannot change, unlock or reload it, answer its approvals or set its secrets",
         ),
+        // The agent may be typing into a terminal of the owner's: what
+        // comes in then could be its own answer.
+        Ok(req) if d.mcp.active() && !req.allowed_while_computer_use() => {
+            Reply::err(crate::owner::COMPUTER_USE_ACTIVE)
+        }
         Ok(req) => d.handle(req).await,
         Err(e) => Reply::err(e),
     };

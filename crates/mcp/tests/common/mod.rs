@@ -41,7 +41,7 @@ pub fn pin(files: &FileServer, version: &str, modes: &[&str], record: &Path) -> 
         "files": [{"kind": "executable", "path": "fake-mcp", "url": url, "sha256": sha256_hex(&data), "size": data.len()}],
         "run": {"program": "fake-mcp", "args": args, "env": {"FAKE_TELEMETRY": "off"}},
         "allow": ["screenshot", "list_windows", "get_cursor_position", "mouse_move", "mouse_click", "type_text", "press_key", "set_value", "PowerShell", "new_tool"],
-        "input": ["mouse_move", "mouse_click", "type_text", "press_key"],
+        "observe": ["screenshot", "list_windows", "get_cursor_position"],
         "focus": {"windows": {"tool": "list_windows"}},
         "selftest": {
             "screenshot": {"tool": "screenshot"},
@@ -55,7 +55,7 @@ pub fn env() -> Vec<(String, String)> {
     vec![("HOME".into(), "/nonexistent".into())]
 }
 
-pub async fn install(mcp: &Path, pin: &ServerPin) -> Result<String, String> {
+pub async fn install(mcp: &Path, pin: &ServerPin) -> Result<sync_mcp::install::Installed, String> {
     let mut said = Vec::new();
     sync_mcp::install::install(
         mcp,

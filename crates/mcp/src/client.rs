@@ -43,7 +43,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_line: 8 << 20,
+            max_line: 4 << 20,
             max_output: 16 << 20,
             max_garbage: 32,
             startup: Duration::from_secs(30),
@@ -134,9 +134,8 @@ impl Client {
     pub async fn start_with(
         launch: &Launch,
         limits: Limits,
-        mut stop: tokio::sync::watch::Receiver<u64>,
+        stop: tokio::sync::watch::Receiver<u64>,
     ) -> Result<Client, ClientError> {
-        stop.mark_unchanged();
         let mut c = crate::proc::spawn(launch)
             .await
             .map_err(ClientError::Start)?;
@@ -153,7 +152,9 @@ impl Client {
         if let Some(stderr) = c.child.stderr.take() {
             tokio::spawn(crate::proc::log_stderr(stderr, launch.log.clone()));
         }
-        let (tx, lines) = mpsc::channel(64);
+        // Little read ahead: what the server writes waits in its pipe, not in
+        // the client's memory.
+        let (tx, lines) = mpsc::channel(2);
         tokio::spawn(read_lines(stdout, tx, limits.max_line));
         let mut client = Client {
             child: c.child,
@@ -179,6 +180,7 @@ impl Client {
                     limits.startup.as_secs()
                 )));
             }
+            Err(ClientError::Stopped) => return Err(ClientError::Stopped),
             Err(e) => {
                 client.kill().await;
                 return Err(ClientError::Start(e.to_string()));
@@ -287,6 +289,12 @@ impl Client {
             return Err(ClientError::Crashed(self.dead.clone().unwrap_or_default()));
         }
         self.drain().await?;
+        // A stop that came before this request: nothing more reaches the
+        // server.
+        if self.stop.has_changed().unwrap_or(false) {
+            self.kill().await;
+            return Err(ClientError::Stopped);
+        }
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))

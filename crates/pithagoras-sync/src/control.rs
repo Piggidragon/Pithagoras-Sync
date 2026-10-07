@@ -56,6 +56,9 @@ pub enum Request {
         #[serde(default)]
         verbose: bool,
     },
+    /// `computer-use off`: the running client switches it off itself, without
+    /// taking anything else from the file.
+    ComputerUseOff,
 }
 
 /// Computer use as the running client sees it (`computer-use status`, `test`).
@@ -106,7 +109,27 @@ pub fn keyring_work() -> Duration {
 impl Request {
     /// Whether a command the client itself runs (a descendant) may send this.
     pub fn allowed_from_own_commands(&self) -> bool {
-        matches!(self, Request::Status | Request::Panic)
+        matches!(
+            self,
+            Request::Status | Request::Panic | Request::ComputerUseOff
+        )
+    }
+
+    /// Whether the client takes this while computer use is active: what only
+    /// looks or takes away.
+    pub fn allowed_while_computer_use(&self) -> bool {
+        matches!(
+            self,
+            Request::Status
+                | Request::Panic
+                | Request::ComputerUseOff
+                | Request::McpStatus { probe: false }
+                | Request::Approvals
+                | Request::Answer {
+                    answer: Choice::Deny,
+                    ..
+                }
+        )
     }
 
     /// How long the answer may take.
@@ -169,6 +192,10 @@ pub struct Status {
     /// Computer use in one line: the consent, the servers, who uses the screen.
     #[serde(default)]
     pub computer_use: String,
+    /// A computer-use call is in flight or ran within the last minute: the
+    /// client takes no change, answer or secret from the owner's side then.
+    #[serde(default)]
+    pub computer_use_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

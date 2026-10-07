@@ -48,7 +48,7 @@ export PITHAGORAS_SYNC_TEST_MCP_PINS=$PWD/mcp.json PITHAGORAS_SYNC_TEST_MCP_KEY=
 pithagoras-sync computer-use install && pithagoras-sync computer-use allow --minutes 10
 ```
 
-Then `sync-mock-portal`'s `mcp-list` and `mcp-call <server> <tool> [json]` list and call it (approvals are answered per `approve`). `PITHAGORAS_SYNC_TEST_MCP_CHECK_MS=<ms>` makes the daily look for new pins come that many milliseconds after the start.
+Then `sync-mock-portal`'s `mcp-list` and `mcp-call <server> <tool> [json]` list and call it (approvals are answered per `approve`). `PITHAGORAS_SYNC_TEST_MCP_CHECK_MS=<ms>` makes the daily look for new pins come that many milliseconds after the start, and `PITHAGORAS_SYNC_TEST_MCP_ACTIVE_MS=<ms>` shortens the minute after a call in which the client takes no change from its command line.
 
 ### The real server, by hand
 

@@ -13,7 +13,7 @@ fn server(allow: &[&str]) -> Value {
                    "url": "https://github.com/agent-sh/computer-use-linux/releases/download/v9.9.9/computer-use-linux-x86_64",
                    "sha256": "b".repeat(64), "size": 123}],
         "run": {"program": "computer-use-linux"},
-        "allow": allow, "input": [],
+        "allow": allow, "observe": [],
         "focus": {"windows": {"tool": "list_windows"}},
         "selftest": {"screenshot": {"tool": "screenshot"}}
     })
@@ -64,6 +64,10 @@ fn a_newer_document_is_taken_and_an_older_one_refused() {
             .mode();
         assert_eq!(m & 0o777, 0o600);
     }
+    // The record lost: the kept document still sets the floor.
+    std::fs::remove_file(t.path().join("mcp-pins-serial")).unwrap();
+    assert_eq!(s.seen_serial(), 5);
+    assert!(s.take(&d4, &key.sign(&d4, "t")).is_err());
 }
 
 #[test]

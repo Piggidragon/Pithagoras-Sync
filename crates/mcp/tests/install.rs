@@ -31,16 +31,18 @@ async fn the_right_hash_installs_into_a_private_folder() {
     let mcp = t.path().join("mcp");
     let files = FileServer::start().await;
     let pin = common::pin(&files, "1.0.0", &[], &t.path().join("record"));
-    let hash = common::install(&mcp, &pin).await.unwrap();
-    let dir = install::version_dir(&mcp, "fake", "1.0.0");
+    let done = common::install(&mcp, &pin).await.unwrap();
+    let (folder, hash) = (done.folder, done.sha256);
+    assert!(folder.starts_with("1.0.0-"), "{folder}");
+    let dir = install::version_dir(&mcp, "fake", &folder);
     assert_eq!(mode(&mcp), 0o700);
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join("fake-mcp")), 0o755);
-    assert_eq!(install::verify(&mcp, "fake", "1.0.0", &hash).unwrap(), dir);
+    assert_eq!(install::verify(&mcp, "fake", &folder, &hash).unwrap(), dir);
     let tools = install::kept_tools(&dir).unwrap();
     assert!(tools.iter().any(|t| t.name == "screenshot"));
     assert_eq!(install::kept_pin(&dir).unwrap(), pin);
-    assert_eq!(left(&mcp), ["1.0.0"]);
+    assert_eq!(left(&mcp), std::slice::from_ref(&folder));
     // It was run once, as installed: the handshake and the tool list.
     let rec = std::fs::read_to_string(t.path().join("record")).unwrap();
     assert!(
@@ -50,14 +52,14 @@ async fn the_right_hash_installs_into_a_private_folder() {
 
     // A file changed afterwards is not run.
     std::fs::write(dir.join("fake-mcp"), b"#!/bin/sh\necho evil\n").unwrap();
-    let e = install::verify(&mcp, "fake", "1.0.0", &hash).unwrap_err();
+    let e = install::verify(&mcp, "fake", &folder, &hash).unwrap_err();
     assert!(e.contains("changed"), "{e}");
     // Neither is one in a folder others may write.
-    let hash = common::install(&mcp, &pin).await.unwrap();
+    let hash = common::install(&mcp, &pin).await.unwrap().sha256;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-    assert!(install::verify(&mcp, "fake", "1.0.0", &hash).is_err());
+    assert!(install::verify(&mcp, "fake", &folder, &hash).is_err());
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(install::verify(&mcp, "fake", "1.0.0", &hash).is_ok());
+    assert!(install::verify(&mcp, "fake", &folder, &hash).is_ok());
 
     install::uninstall(&mcp, "fake").unwrap();
     assert!(!mcp.join("fake").exists());
@@ -118,7 +120,7 @@ async fn redirects_go_to_pinned_hosts_only() {
         pin.files[0].url = files.put("/away", Reply::Redirect(to.clone()));
         let e = common::install(&mcp, &pin).await.unwrap_err();
         assert!(e.contains("downloads"), "{to}: {e}");
-        assert!(!install::version_dir(&mcp, "fake", "2.0.0").exists());
+        assert!(!install::version_dir(&mcp, "fake", &install::folder_name(&pin)).exists());
     }
 }
 
@@ -164,8 +166,9 @@ async fn zips_and_wheels_unpack_and_count_in_the_hash() {
         path: "python/python313._pth".into(),
         text: "Lib\\site-packages\r\nimport site\r\n".into(),
     });
-    let hash = common::install(&mcp, &pin).await.unwrap();
-    let dir = install::version_dir(&mcp, "fake", "1.0.0");
+    let done = common::install(&mcp, &pin).await.unwrap();
+    let (folder, hash) = (done.folder, done.sha256);
+    let dir = install::version_dir(&mcp, "fake", &folder);
     let sp = dir.join("python/Lib/site-packages");
     assert_eq!(std::fs::read(sp.join("pkg/__init__.py")).unwrap(), b"x = 1");
     assert_eq!(std::fs::read(sp.join("native.pyd")).unwrap(), b"bin");
@@ -176,7 +179,7 @@ async fn zips_and_wheels_unpack_and_count_in_the_hash() {
             .contains("import site")
     );
     std::fs::write(sp.join("pkg/__init__.py"), b"x = 2").unwrap();
-    assert!(install::verify(&mcp, "fake", "1.0.0", &hash).is_err());
+    assert!(install::verify(&mcp, "fake", &folder, &hash).is_err());
 }
 
 #[tokio::test]
@@ -184,13 +187,24 @@ async fn prune_keeps_the_current_and_the_previous_version() {
     let t = tempfile::tempdir().unwrap();
     let mcp = t.path().join("mcp");
     let files = FileServer::start().await;
+    let mut folders = Vec::new();
     for v in ["1.0.0", "1.1.0", "1.2.0"] {
-        common::install(&mcp, &common::pin(&files, v, &[], &t.path().join("record")))
+        let done = common::install(&mcp, &common::pin(&files, v, &[], &t.path().join("record")))
             .await
             .unwrap();
+        folders.push(done.folder);
     }
-    install::prune(&mcp, "fake", &["1.2.0", "1.1.0"]).unwrap();
+    install::prune(&mcp, "fake", &[&folders[2], &folders[1]]).unwrap();
     let mut l = left(&mcp);
     l.sort();
-    assert_eq!(l, ["1.1.0", "1.2.0"]);
+    let mut want = vec![folders[1].clone(), folders[2].clone()];
+    want.sort();
+    assert_eq!(l, want);
+    // The same version from another pin (a new Python, say) goes into a
+    // folder of its own; the one running is not touched.
+    let mut other = common::pin(&files, "1.2.0", &[], &t.path().join("record"));
+    other.run.env.insert("NEW_TELEMETRY".into(), "off".into());
+    let done = common::install(&mcp, &other).await.unwrap();
+    assert_ne!(done.folder, folders[2]);
+    assert!(install::version_dir(&mcp, "fake", &folders[2]).exists());
 }

@@ -1854,7 +1854,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             println!("Allowed #{id}.");
         }
         Cmd::Deny { id } => {
-            owner::not_from_own_command(&dirs).await?;
+            // A denial only takes away: also while computer use is active.
+            owner::not_from_own_command_ancestry(&dirs).await?;
             to_running(
                 &dirs,
                 Request::Answer {
@@ -1881,9 +1882,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             {
                 reload_running(&dirs).await;
             }
+            // A build without the release key cannot update itself; the
+            // server's part may still have run. Any other failure is one.
             match (client, mcp) {
-                (Err(e), Ok(u)) if !u.changed.is_empty() || dirs_have_mcp(&dirs) => {
-                    eprintln!("pithagoras-sync: {e}");
+                (Err(e), Ok(_)) if e.contains("has no update key") && dirs_have_mcp(&dirs) => {
+                    eprintln!("note: {e}");
                 }
                 (Err(e), _) => return Err(e),
                 (Ok(_), Err(e)) => return Err(e),
@@ -1947,7 +1950,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             if !print {
                 apply_plan(&plan)?;
                 if dirs_have_mcp(&dirs) {
-                    crate::computer_use::uninstall_all(&dirs)?;
+                    let names = crate::computer_use::forget_all(&dirs)?;
+                    crate::computer_use::remove_files(&dirs, &names).await?;
                 }
                 println!("Uninstalled.");
             }
@@ -2045,8 +2049,10 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
         }
         ComputerUseCmd::Uninstall => {
             owner::not_from_own_command(dirs).await?;
-            let removed = cu::uninstall_all(dirs)?;
+            // The record first: the running client lets go of the server.
+            let removed = cu::forget_all(dirs)?;
             reload_running(dirs).await;
+            cu::remove_files(dirs, &removed).await?;
             if removed.is_empty() {
                 println!("No computer-use server was installed.");
             } else {
@@ -2091,11 +2097,18 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
             reload_running(dirs).await;
         }
         ComputerUseCmd::Off => {
-            let mut cfg = load_config(dirs)?;
-            cfg.policy.computer_use.set(Consent::Off, None, now_ms())?;
-            cfg.save(&dirs.config_file())?;
+            // The running client switches it off itself, also while computer
+            // use is active (when it takes no reload).
+            match control::send(&dirs.socket(), Request::ComputerUseOff).await? {
+                Some(r) if r.ok => {}
+                Some(r) => return Err(r.error.unwrap_or_default()),
+                None => {
+                    let mut cfg = load_config(dirs)?;
+                    cfg.policy.computer_use.set(Consent::Off, None, now_ms())?;
+                    cfg.save(&dirs.config_file())?;
+                }
+            }
             println!("Computer use is off: every call is refused.");
-            reload_running(dirs).await;
         }
         ComputerUseCmd::Status { json } => return computer_use_status(dirs, json).await,
         ComputerUseCmd::Setup { yes } => computer_use_setup(dirs, yes)?,
@@ -2136,7 +2149,7 @@ async fn computer_use_status(dirs: &Dirs, json: bool) -> Result<ExitCode, String
     let pinned = cu::pinned(&doc);
     let installed = cfg.mcp.iter().next();
     let files = installed.map(|(n, r)| {
-        sync_mcp::install::verify(&dirs.mcp_dir(), n, &r.version, &r.sha256).map(|_| ())
+        sync_mcp::install::verify(&dirs.mcp_dir(), n, &r.folder, &r.sha256).map(|_| ())
     });
     let setup = cu::installed(dirs, &cfg)
         .map(|(_, dir, pin)| cu::setup_state(&dir, &pin))
@@ -3291,6 +3304,7 @@ mod tests {
             audit_file: "/a".into(),
             exe: "/usr/local/bin/pithagoras-sync".into(),
             computer_use: String::new(),
+            computer_use_active: false,
         }
     }
 

@@ -145,6 +145,8 @@ pub struct ScreenRequest<'a> {
     /// The arguments as the owner reads them in the question and the audit
     /// log: visible escapes, cut. Typed text appears only this far.
     pub shown: &'a str,
+    /// `shown` is cut: a question about it takes no yes.
+    pub cut: bool,
 }
 
 /// Why a computer-use call is refused, with the reason the portal gets in the
@@ -373,6 +375,13 @@ impl Engine {
         let snap = Snapshot::new(policy, profile, &self.home, &self.own_dirs);
         let old = std::mem::replace(&mut *self.snap.write().unwrap(), Arc::new(snap));
         let new = self.snapshot();
+        // A changed consent of computer use starts afresh: no chat keeps a
+        // "for this chat" answer given under the one before.
+        if old.policy.computer_use != new.policy.computer_use {
+            for c in self.chats.lock().unwrap().values_mut() {
+                c.approved.remove(&Scope::Screen);
+            }
+        }
         if old.policy != new.policy {
             let now = self.now();
             self.record(
@@ -754,6 +763,12 @@ impl Engine {
                 "computer use asks, and nobody can answer prompts on this device".into(),
             ));
         }
+        if req.cut {
+            return Err(deny(
+                Some(why::CONSENT_DENIED),
+                "the arguments are too long to show in the question, so it cannot be allowed; send shorter ones".into(),
+            ));
+        }
         let opts = snap.policy.approvals.clone();
         let timeout = Duration::from_secs(opts.timeout_secs);
         let request = ApprovalRequest {
@@ -807,6 +822,46 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// Whether a computer-use call allowed earlier may still run now, after it
+    /// waited for its turn: not paused, within the hours, the consent not
+    /// switched off or run out meanwhile.
+    pub fn screen_still_allowed(&self, call: &Call<'_>, target: &str) -> Result<(), ScreenRefusal> {
+        use sync_proto::mcp_reason as why;
+        let refuse = |reason: &'static str, message: &str| {
+            self.record_in(
+                Some(call.chat),
+                "computer_use",
+                target,
+                None,
+                "denied",
+                Some(message.into()),
+                None,
+            );
+            Err(ScreenRefusal {
+                reason: Some(reason),
+                message: message.into(),
+            })
+        };
+        if self.is_paused() {
+            return refuse(why::PAUSED, "the device is paused");
+        }
+        let snap = self.snapshot();
+        let now = self.now();
+        if !snap.rules.as_ref().is_ok_and(|r| r.within_hours(now)) {
+            return refuse(
+                why::HOURS,
+                "outside the hours this device works for the portal",
+            );
+        }
+        if snap.policy.computer_use.effective(now) == crate::config::Consent::Off {
+            return refuse(
+                why::CONSENT_OFF,
+                "computer use was switched off while the call waited",
+            );
+        }
+        Ok(())
     }
 
     /// For grep and find, after the search root passed `authorize`: whether a path

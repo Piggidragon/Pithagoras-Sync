@@ -94,6 +94,29 @@ impl ConfigStore {
         }
     }
 
+    /// Changes the settings the client runs by, as `f` says, and saves them,
+    /// without taking anything else from the file: the device's own change
+    /// (`panic`, `computer-use off`), made also when the file holds edits it
+    /// would not take now. Audited as the owner's.
+    pub fn update(&self, why: &str, f: impl FnOnce(&mut DeviceConfig)) -> Result<(), String> {
+        let mut next = self.config();
+        f(&mut next);
+        let mut changes = Vec::new();
+        settings::diff("", &owned(&self.config()), &owned(&next), &mut changes);
+        next.save(&self.file)?;
+        for c in &changes {
+            self.engine.record(
+                None,
+                "policy",
+                &c.key,
+                "changed",
+                Some(format!("by {why}: {} -> {}", c.old, c.new)),
+            );
+        }
+        self.apply(next, why);
+        Ok(())
+    }
+
     pub fn portal_policy(&self) -> PortalPolicy {
         self.cfg.lock().unwrap().portal_policy
     }
@@ -140,11 +163,13 @@ impl ConfigStore {
 }
 
 /// The settings the owner keeps in the file, the pairing aside (`pair` and `unpair`
-/// change that, and it is not a permission).
+/// change that, and it is not a permission) and the record of the installed
+/// computer-use servers (the device's own, which the portal never sees).
 fn owned(cfg: &DeviceConfig) -> serde_json::Value {
     let mut v = serde_json::to_value(cfg).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
         o.remove("portal");
+        o.remove("mcp");
     }
     v
 }

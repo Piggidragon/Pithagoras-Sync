@@ -82,6 +82,8 @@ pub struct Options {
     pub base_env: Vec<(String, String)>,
     pub limits: Limits,
     pub indicator: Arc<dyn Indicator>,
+    /// How long after a call computer use counts as active (`active`).
+    pub active_ms: i64,
 }
 
 /// The process of one server and how its last starts went.
@@ -96,39 +98,49 @@ struct Slot {
 struct Server {
     name: String,
     version: String,
+    folder: String,
     sha256: String,
     pin: ServerPin,
     dir: PathBuf,
     /// The allowed tools the server listed at install.
     tools: Vec<KeptTool>,
-    /// Why it cannot run (its files changed or are gone).
-    error: Option<String>,
+    /// Why it cannot run (its files changed or are gone, it is no longer
+    /// pinned); found at load or before a start.
+    error: Mutex<Option<String>>,
     slot: tokio::sync::Mutex<Slot>,
     waiting: AtomicUsize,
 }
 
 impl Server {
+    fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+
     fn info(&self) -> McpServerInfo {
+        let error = self.error();
         McpServerInfo {
             name: self.name.clone(),
             version: self.version.clone(),
-            state: if self.error.is_some() {
+            state: if error.is_some() {
                 "unavailable"
             } else {
                 "ready"
             }
             .into(),
-            error: self.error.clone(),
-            tools: self
-                .tools
-                .iter()
-                .map(|t| McpToolInfo {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema: t.input_schema.clone(),
-                    input: self.pin.is_input(&t.name),
-                })
-                .collect(),
+            tools: if error.is_some() {
+                Vec::new()
+            } else {
+                self.tools
+                    .iter()
+                    .map(|t| McpToolInfo {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        input_schema: t.input_schema.clone(),
+                        input: self.pin.is_input(&t.name),
+                    })
+                    .collect()
+            },
+            error,
         }
     }
 }
@@ -187,12 +199,25 @@ fn server_err(reason: &str, message: impl Into<String>) -> RpcError {
 
 /// The arguments as the owner reads them: control characters escaped, cut.
 pub fn shown(args: &Map<String, Value>) -> String {
+    shown_cut(args).0
+}
+
+/// `shown`, and whether it had to be cut (then a question cannot be
+/// answered with yes: nobody could read what they allowed).
+pub fn shown_cut(args: &Map<String, Value>) -> (String, bool) {
     let text = sync_policy::approve::visible(&Value::Object(args.clone()).to_string());
     if text.chars().count() <= MAX_SHOWN {
-        return text;
+        return (text, false);
     }
     let cut: String = text.chars().take(MAX_SHOWN).collect();
-    format!("{cut}… ({} characters in all)", text.chars().count())
+    (
+        format!("{cut}… ({} characters in all)", text.chars().count()),
+        true,
+    )
+}
+
+fn paused() -> RpcError {
+    RpcError::denied("the device is paused").with_reason(why::PAUSED)
 }
 
 impl Service {
@@ -236,17 +261,19 @@ impl Service {
         let mut next = BTreeMap::new();
         let old = self.servers.lock().unwrap().clone();
         for (name, rec) in installed {
+            let dir = install::version_dir(&self.opts.dir, &name, &rec.folder);
+            let pin = self.effective_pin(&name, &rec, &doc, &dir);
+            // The same files run by the same pin: the running process stays.
             if let Some(s) = old.get(&name)
-                && s.version == rec.version
+                && s.folder == rec.folder
                 && s.sha256 == rec.sha256
-                && doc
-                    .server(&name, &self.opts.os)
-                    .is_none_or(|p| p.version != rec.version || p.allowed() == s.pin.allowed())
+                && s.error().is_none()
+                && pin.as_ref().is_ok_and(|p| *p == s.pin)
             {
                 next.insert(name, s.clone());
                 continue;
             }
-            next.insert(name.clone(), Arc::new(self.load(&name, &rec, &doc)));
+            next.insert(name.clone(), Arc::new(self.load(&name, &rec, pin, dir)));
         }
         let stale: Vec<Arc<Server>> = old
             .iter()
@@ -265,15 +292,42 @@ impl Service {
         self.announce();
     }
 
-    fn load(&self, name: &str, rec: &InstalledServer, doc: &Document) -> Server {
-        let dir = install::version_dir(&self.opts.dir, name, &rec.version);
-        let checked = install::verify(&self.opts.dir, name, &rec.version, &rec.sha256);
-        // The document's pin when it is for this version (its allow-list may
-        // have narrowed), else the one it was installed from.
-        let pin = match doc.server(name, &self.opts.os) {
+    /// The pin a server runs by: the document's when it pins this version
+    /// (its allow-list may have narrowed); else the one it was installed
+    /// from, narrowed to what the document allows for its newer version
+    /// (a tool it dropped stays off, and the focus check runs wherever
+    /// either asks for it). A server the document no longer names is not run.
+    fn effective_pin(
+        &self,
+        name: &str,
+        rec: &InstalledServer,
+        doc: &Document,
+        dir: &std::path::Path,
+    ) -> Result<ServerPin, String> {
+        match doc.server(name, &self.opts.os) {
             Some(p) if p.version == rec.version => Ok(p.clone()),
-            _ => install::kept_pin(&dir),
-        };
+            Some(p) => {
+                let mut kept = install::kept_pin(dir)?;
+                let allowed = p.allowed();
+                kept.allow.retain(|t| allowed.contains(t));
+                kept.observe.retain(|t| p.observe.contains(t));
+                Ok(kept)
+            }
+            None if doc.serial == 0 => install::kept_pin(dir),
+            None => Err(format!(
+                "the signed pins no longer name {name}, so it is not run; `pithagoras-sync computer-use uninstall` removes it"
+            )),
+        }
+    }
+
+    fn load(
+        &self,
+        name: &str,
+        rec: &InstalledServer,
+        pin: Result<ServerPin, String>,
+        dir: PathBuf,
+    ) -> Server {
+        let checked = install::verify(&self.opts.dir, name, &rec.folder, &rec.sha256);
         let (pin, error) = match (pin, checked) {
             (Ok(p), Ok(_)) => (Some(p), None),
             (Ok(p), Err(e)) => (Some(p), Some(e)),
@@ -296,11 +350,12 @@ impl Service {
         Server {
             name: name.to_string(),
             version: rec.version.clone(),
+            folder: rec.folder.clone(),
             sha256: rec.sha256.clone(),
             pin,
             dir,
             tools,
-            error,
+            error: Mutex::new(error),
             slot: tokio::sync::Mutex::new(Slot::default()),
             waiting: AtomicUsize::new(0),
         }
@@ -361,8 +416,11 @@ impl Service {
         let mut out = Vec::new();
         for s in servers {
             let mut slot = s.slot.lock().await;
-            if probe && s.error.is_none() {
-                match self.ensure_started(&s, &mut slot).await {
+            if probe && s.error().is_none() {
+                match self
+                    .ensure_started(&s, &mut slot, self.stop.subscribe())
+                    .await
+                {
                     Ok(()) => {
                         if let Some(c) = slot.client.as_mut()
                             && let Err(e) = c
@@ -386,7 +444,7 @@ impl Service {
                 version: s.version.clone(),
                 running,
                 tools: s.tools.iter().map(|t| t.name.clone()).collect(),
-                error: s.error.clone(),
+                error: s.error(),
                 last_error: slot.last_error.clone(),
                 retry_in_secs: slot
                     .retry_at
@@ -398,8 +456,14 @@ impl Service {
     }
 
     /// Starts the server unless it runs, within its backoff, after checking
-    /// its files.
-    async fn ensure_started(&self, s: &Server, slot: &mut Slot) -> Result<(), RpcError> {
+    /// its files. `stop` was taken before the call checked the pause, so a
+    /// `panic` while the files are hashed still ends what comes next.
+    async fn ensure_started(
+        &self,
+        s: &Server,
+        slot: &mut Slot,
+        stop: watch::Receiver<u64>,
+    ) -> Result<(), RpcError> {
         if let Some(c) = slot.client.as_mut()
             && !c.is_dead()
         {
@@ -423,29 +487,33 @@ impl Service {
             ));
         }
         let dir = s.dir.clone();
-        let (mcp, name, version, sha) = (
+        let (mcp, name, folder, sha) = (
             self.opts.dir.clone(),
             s.name.clone(),
-            s.version.clone(),
+            s.folder.clone(),
             s.sha256.clone(),
         );
         // The hash at every start: a server changed after install is not run.
         let checked =
-            tokio::task::spawn_blocking(move || install::verify(&mcp, &name, &version, &sha))
+            tokio::task::spawn_blocking(move || install::verify(&mcp, &name, &folder, &sha))
                 .await
                 .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?;
         if let Err(e) = checked {
             warn!("computer use: {e}");
+            // Unavailable from now on, and the portal hears of it.
+            *s.error.lock().unwrap() = Some(e.clone());
+            self.announce();
             return Err(server_err(why::CHANGED, e));
         }
         let launch = install::launch(&s.pin, &dir, &self.opts.dir, &self.opts.base_env);
-        match Client::start_with(&launch, self.opts.limits.clone(), self.stop.subscribe()).await {
+        match Client::start_with(&launch, self.opts.limits.clone(), stop).await {
             Ok(c) => {
                 info!("computer use: {} {} started", s.name, s.version);
                 slot.client = Some(c);
                 slot.retry_at = None;
                 Ok(())
             }
+            Err(ClientError::Stopped) => Err(paused()),
             Err(e) => {
                 let msg = e.to_string();
                 failed(slot, &msg);
@@ -484,58 +552,106 @@ impl Service {
         Ok(())
     }
 
+    /// A refusal before the consent, in the audit log as every decision is.
+    fn refuse(&self, chat: &str, target: &str, e: RpcError) -> RpcError {
+        self.engine.record(
+            Some(chat),
+            "computer_use",
+            target,
+            "denied",
+            Some(e.message.clone()),
+        );
+        e
+    }
+
     async fn call_inner(&self, id: &Id, p: McpCallParams) -> Result<McpCallResult, RpcError> {
+        // Taken first: a `panic` from here on ends this call wherever it is.
+        let stop = self.stop.subscribe();
+        let name = |s: &str| {
+            sync_policy::approve::visible(&s.chars().take(MAX_MCP_NAME).collect::<String>())
+        };
+        let early = format!("{}.{}", name(&p.server), name(&p.tool));
+        let chat = p.ctx.chat.clone();
+        if self.engine.is_paused() {
+            return Err(self.refuse(&chat, &early, paused()));
+        }
         if p.server.len() > MAX_MCP_NAME || p.tool.len() > MAX_MCP_NAME {
-            return Err(RpcError::new(
-                code::INVALID_PARAMS,
-                "server and tool names have at most 64 bytes",
+            return Err(self.refuse(
+                &chat,
+                &early,
+                RpcError::new(
+                    code::INVALID_PARAMS,
+                    "server and tool names have at most 64 bytes",
+                ),
             ));
         }
         if p.ctx.tool.is_some() {
-            return Err(RpcError::denied("mcp.call takes no pi tool label in ctx"));
+            return Err(self.refuse(
+                &chat,
+                &early,
+                RpcError::denied("mcp.call takes no pi tool label in ctx"),
+            ));
         }
         let server = self.servers.lock().unwrap().get(&p.server).cloned();
         let Some(s) = server else {
-            return Err(server_err(
-                why::NOT_INSTALLED,
-                format!(
-                    "no MCP server {} is installed on this device",
-                    sync_policy::approve::visible(&p.server)
+            return Err(self.refuse(
+                &chat,
+                &early,
+                server_err(
+                    why::NOT_INSTALLED,
+                    format!(
+                        "no MCP server {} is installed on this device",
+                        name(&p.server)
+                    ),
                 ),
             ));
         };
-        if let Some(e) = &s.error {
-            return Err(server_err(why::CHANGED, e.clone()));
+        if let Some(e) = s.error() {
+            return Err(self.refuse(&chat, &early, server_err(why::CHANGED, e)));
         }
         let Some(tool) = s.tools.iter().find(|t| t.name == p.tool) else {
-            return Err(RpcError::denied(format!(
-                "{} is not a tool this device allows for {} {}",
-                sync_policy::approve::visible(&p.tool),
-                s.name,
-                s.version
-            ))
-            .with_reason(why::TOOL_NOT_ALLOWED));
+            return Err(self.refuse(
+                &chat,
+                &early,
+                RpcError::denied(format!(
+                    "{} is not a tool this device allows for {} {}",
+                    name(&p.tool),
+                    s.name,
+                    s.version
+                ))
+                .with_reason(why::TOOL_NOT_ALLOWED),
+            ));
         };
         let size = serde_json::to_string(&p.args)
             .map(|t| t.len())
             .unwrap_or(usize::MAX);
         if size > MAX_MCP_ARGS {
-            return Err(RpcError::new(
-                code::TOO_LARGE,
-                format!("args are limited to {MAX_MCP_ARGS} bytes"),
+            return Err(self.refuse(
+                &chat,
+                &early,
+                RpcError::new(
+                    code::TOO_LARGE,
+                    format!("args are limited to {MAX_MCP_ARGS} bytes"),
+                ),
             ));
         }
-        crate::schema::check(&tool.input_schema, &p.args)
-            .map_err(|e| RpcError::new(code::INVALID_PARAMS, e))?;
+        let (shown, cut) = shown_cut(&p.args);
+        let target = format!("{}.{} {shown}", s.name, p.tool);
+        if let Err(e) = crate::schema::check(&tool.input_schema, &p.args) {
+            return Err(self.refuse(&chat, &target, RpcError::new(code::INVALID_PARAMS, e)));
+        }
         if s.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING {
             s.waiting.fetch_sub(1, Ordering::SeqCst);
-            return Err(RpcError::new(
-                code::BUSY,
-                "too many computer-use calls wait for this server",
+            return Err(self.refuse(
+                &chat,
+                &target,
+                RpcError::new(
+                    code::BUSY,
+                    "too many computer-use calls wait for this server",
+                ),
             ));
         }
         let _waiting = Counter(&s.waiting);
-        let shown = shown(&p.args);
         let call = Call {
             id: Some(id),
             chat: &p.ctx.chat,
@@ -550,15 +666,15 @@ impl Service {
                     server: &s.name,
                     tool: &p.tool,
                     shown: &shown,
+                    cut,
                 },
             )
             .await?;
         let mut slot = s.slot.lock().await;
-        if self.engine.is_paused() {
-            return Err(RpcError::denied("the device is paused").with_reason(why::PAUSED));
-        }
-        self.ensure_started(&s, &mut slot).await?;
-        let target = format!("{}.{} {shown}", s.name, p.tool);
+        // Waiting in the queue does not outlast the consent: switched off,
+        // run out, paused or outside the hours meanwhile, the call is refused.
+        self.engine.screen_still_allowed(&call, &target)?;
+        self.ensure_started(&s, &mut slot, stop).await?;
         if s.pin.is_input(&p.tool)
             && let Err(e) = self.focus_check(&s, &mut slot).await
         {
@@ -573,6 +689,10 @@ impl Service {
                 Some(e.clone()),
             );
             return Err(RpcError::denied(e).with_reason(why::FOCUS));
+        }
+        // The last moment before the input: a `panic` meanwhile wins.
+        if self.engine.is_paused() {
+            return Err(paused());
         }
         self.indicate(&s.name, &p.ctx.chat);
         // From here the chat sees what is on the screen: untrusted content.
@@ -594,9 +714,7 @@ impl Service {
                         ),
                     )
                     .with_reason(why::TIMED_OUT),
-                    ClientError::Stopped => {
-                        RpcError::denied("the device is paused").with_reason(why::PAUSED)
-                    }
+                    ClientError::Stopped => paused(),
                     ClientError::Crashed(m) => server_err(why::CRASHED, format!("{}: {m}", s.name)),
                     other => server_err(why::BAD_ANSWER, format!("{}: {other}", s.name)),
                 };
@@ -656,11 +774,11 @@ impl Service {
             .get(server)
             .cloned()
             .ok_or_else(|| format!("{server} is not installed"))?;
-        if let Some(e) = &s.error {
-            return Err(e.clone());
+        if let Some(e) = s.error() {
+            return Err(e);
         }
         let mut slot = s.slot.lock().await;
-        self.ensure_started(&s, &mut slot)
+        self.ensure_started(&s, &mut slot, self.stop.subscribe())
             .await
             .map_err(|e| e.message)?;
         let c = slot.client.as_mut().ok_or("the server is not running")?;
@@ -670,6 +788,16 @@ impl Service {
     /// Whether a call is in flight (its question included).
     pub fn busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether computer use is active: a call in flight or one within
+    /// `BURST_GAP_MS`. Meanwhile the agent may be typing into a terminal or
+    /// clicking in a browser of the owner's, so the client takes no answer,
+    /// setting or secret from the owner's side (only `status`, `panic` and a
+    /// denial): it could be the agent answering itself.
+    pub fn active(&self) -> bool {
+        self.busy()
+            || self.engine.now() - self.last_call_ms.load(Ordering::SeqCst) < self.opts.active_ms
     }
 }
 
@@ -706,7 +834,7 @@ fn empty_pin(name: &str, version: &str, os: &str) -> ServerPin {
             env: BTreeMap::new(),
         },
         allow: Vec::new(),
-        input: Vec::new(),
+        observe: Vec::new(),
         focus: Focus {
             windows: none.clone(),
             focused: None,

@@ -1264,6 +1264,7 @@ fn screen_req(shown: &str) -> ScreenRequest<'_> {
         server: "cu",
         tool: "type_text",
         shown,
+        cut: false,
     }
 }
 
@@ -1440,4 +1441,65 @@ async fn hours_apply_to_computer_use() {
         .await
         .unwrap_err();
     assert_eq!(r.reason, Some(mcp_reason::HOURS));
+}
+
+#[tokio::test]
+async fn a_changed_consent_takes_back_for_this_chat() {
+    let f = Fixture::new();
+    let chat = scripted(Answer::ForChat);
+    let e = f.engine(
+        consent(Consent::Ask, None, 0),
+        Profile::Desktop,
+        chat.clone(),
+    );
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 1);
+    // Off, then ask again: the chat asks anew.
+    e.reload(consent(Consent::Off, None, 0), Profile::Desktop);
+    e.reload(consent(Consent::Ask, None, 0), Profile::Desktop);
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 2);
+    // A question about arguments too long to show takes no yes.
+    let mut long = screen_req("{...}");
+    long.cut = true;
+    let r = e
+        .authorize_screen(&screen_call("c2"), long)
+        .await
+        .unwrap_err();
+    assert_eq!(r.reason, Some(sync_proto::mcp_reason::CONSENT_DENIED));
+    assert_eq!(chat.asked.load(Ordering::SeqCst), 2, "not even asked");
+}
+
+#[tokio::test]
+async fn a_queued_call_does_not_outlast_the_consent() {
+    use sync_proto::mcp_reason;
+    let f = Fixture::new();
+    let now = f.clock.load(Ordering::SeqCst);
+    let e = f.engine(
+        consent(Consent::Allow, Some(10), now),
+        Profile::Desktop,
+        scripted(Answer::Once),
+    );
+    e.authorize_screen(&screen_call("c1"), screen_req("{}"))
+        .await
+        .unwrap();
+    e.screen_still_allowed(&screen_call("c1"), "cu.x").unwrap();
+    e.reload(consent(Consent::Off, None, now), Profile::Desktop);
+    let r = e
+        .screen_still_allowed(&screen_call("c1"), "cu.x")
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::CONSENT_OFF));
+    e.reload(consent(Consent::Allow, Some(10), now), Profile::Desktop);
+    e.pause();
+    let r = e
+        .screen_still_allowed(&screen_call("c1"), "cu.x")
+        .unwrap_err();
+    assert_eq!(r.reason, Some(mcp_reason::PAUSED));
 }

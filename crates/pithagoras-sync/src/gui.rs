@@ -165,7 +165,7 @@ pub trait Host {
     async fn install(&self) -> Result<Vec<String>, String>;
     /// Whether the window offers computer use: a server is pinned for this
     /// platform and it is not installed yet.
-    fn computer_use_offered(&self) -> bool;
+    async fn computer_use_offered(&self) -> bool;
     /// `computer-use install`; returns what it installed.
     async fn install_computer_use(&self) -> Result<String, String>;
     /// `pair <link>`; returns its notes.
@@ -475,7 +475,7 @@ async fn install_now(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Result<Vec<Stri
     };
     // Its own question, after the client is in place; a failure here leaves
     // the client installed and says why.
-    if h.computer_use_offered() && d.question(t.computer_use_question()) {
+    if h.computer_use_offered().await && d.question(t.computer_use_question()) {
         notes.push(match h.install_computer_use().await {
             Ok(what) => t.computer_use_installed(&shown(&what)),
             Err(e) => t.computer_use_failed(&shown(&e)),
@@ -1238,13 +1238,27 @@ impl Host for RealHost {
         crate::actions::apply(&plan, std::path::Path::new("/"), &crate::actions::System)
     }
 
-    fn computer_use_offered(&self) -> bool {
+    async fn computer_use_offered(&self) -> bool {
+        if crate::cli::load_config(&self.dirs).is_ok_and(|c| !c.mcp.is_empty()) {
+            return false;
+        }
         let store = crate::computer_use::store(&self.dirs);
-        let installable = crate::computer_use::pinned(&store.current())
-            .is_some_and(|p| p.unpinned(sync_mcp::arch()).is_none());
-        let installed = crate::cli::load_config(&self.dirs).is_ok_and(|c| !c.mcp.is_empty());
-        // With the release key a newer signed document may pin it.
-        !installed && (installable || store.key.is_some())
+        let installable = |d: &sync_mcp::Document| {
+            crate::computer_use::pinned(d).is_some_and(|p| p.unpinned(sync_mcp::arch()).is_none())
+        };
+        if installable(&store.current()) {
+            return true;
+        }
+        // A newer signed document may pin it; looked at only, for at most a
+        // few seconds (the install takes it then).
+        if store.key.is_none() {
+            return false;
+        }
+        let url = sync_mcp::pins::pins_url();
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(8), sync_mcp::pins::peek(&store, &url)).await,
+            Ok(Ok(d)) if installable(&d)
+        )
     }
 
     async fn install_computer_use(&self) -> Result<String, String> {
@@ -1713,7 +1727,7 @@ mod tests {
             *self.installed.lock().unwrap() = true;
             Ok(self.install_notes.clone())
         }
-        fn computer_use_offered(&self) -> bool {
+        async fn computer_use_offered(&self) -> bool {
             self.computer_use
         }
         async fn install_computer_use(&self) -> Result<String, String> {
@@ -2249,8 +2263,8 @@ mod tests {
         assert_eq!(h.did(), ["install"]);
     }
 
-    /// Windows without a link at hand: install, then the box that reads the
-    /// link from the clipboard; the install's notes in that box's text.
+    /// After the client: the question about computer use, its yes, its no,
+    /// and a failure that leaves the client installed.
     #[tokio::test]
     async fn the_install_offers_computer_use_after_the_client() {
         // Yes to the install, yes to computer use, then no link.
@@ -2316,6 +2330,8 @@ mod tests {
         );
     }
 
+    /// Windows without a link at hand: install, then the box that reads the
+    /// link from the clipboard; the install's notes in that box's text.
     #[tokio::test]
     async fn windows_without_a_link_keeps_the_two_steps() {
         let h = FakeHost {

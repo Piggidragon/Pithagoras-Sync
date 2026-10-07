@@ -1,7 +1,8 @@
 //! Putting a pinned server on the device, and taking it off again.
 //!
-//! Each version gets its own folder, `<mcp>/<server>/<version>/` (folders
-//! 0700, the user's own, never a link). It is built in a staging folder next
+//! Each version gets its own folder, `<mcp>/<server>/<version>-<pin hash>/`
+//! (folders 0700, the user's own, never a link): a pin that changes for the
+//! same version (a new Python patch) goes into a fresh folder too. It is built in a staging folder next
 //! to it: every file is downloaded from a pinned host, its size and sha256
 //! checked against the pin before anything is written, zips and wheels
 //! unpacked, the server started once (`initialize`, `tools/list`, and the
@@ -33,8 +34,23 @@ pub fn server_dir(mcp: &Path, server: &str) -> PathBuf {
     mcp.join(server)
 }
 
-pub fn version_dir(mcp: &Path, server: &str, version: &str) -> PathBuf {
-    mcp.join(server).join(version)
+/// The folder of an installed version (`folder_name`).
+pub fn version_dir(mcp: &Path, server: &str, folder: &str) -> PathBuf {
+    mcp.join(server).join(folder)
+}
+
+/// The folder a pin installs into: its version and the start of the sha256
+/// of the pin itself.
+pub fn folder_name(pin: &ServerPin) -> String {
+    let text = serde_json::to_vec(pin).unwrap_or_default();
+    format!("{}-{}", pin.version, &fsutil::sha256_hex(&text)[..12])
+}
+
+/// What an install recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub folder: String,
+    pub sha256: String,
 }
 
 /// The server's stderr, outside its hashed folder.
@@ -70,7 +86,9 @@ pub fn launch(pin: &ServerPin, dir: &Path, mcp: &Path, base_env: &[(String, Stri
             .map(|a| a.replace("{dir}", &dir.to_string_lossy()))
             .collect(),
         env: crate::session::environment(base_env, &extra, uid, &|p| Path::new(p).exists()),
-        cwd: dir.to_path_buf(),
+        // Outside the hashed folder: what a server writes to its working
+        // folder does not change it (and Windows can still move the folder).
+        cwd: dir.parent().unwrap_or(dir).to_path_buf(),
         log: Some(log_file(mcp, &pin.name)),
     }
 }
@@ -84,7 +102,10 @@ pub fn join(dir: &Path, rel: &str) -> PathBuf {
 /// and `.data/platlib` are unpacked into it, the other `.data` folders
 /// (scripts, headers, data) are left out.
 fn wheel_target(name: &str) -> Option<String> {
-    let (first, rest) = name.split_once('/')?;
+    // A module at the top of the wheel (`six.py`) goes in as it is.
+    let Some((first, rest)) = name.split_once('/') else {
+        return Some(name.to_string());
+    };
     if !first.ends_with(".data") {
         return Some(name.to_string());
     }
@@ -103,7 +124,7 @@ pub async fn install<F, Fut>(
     limits: &Limits,
     fetch: F,
     say: &mut (dyn FnMut(String) + Send),
-) -> Result<String, String>
+) -> Result<Installed, String>
 where
     F: Fn(String, usize) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
@@ -117,7 +138,8 @@ where
     let server = server_dir(mcp, &pin.name);
     fsutil::private_dirs(mcp, &server)?;
     fsutil::owned_and_private(mcp, &server)?;
-    let staging = server.join(format!(".staging-{}-{}", pin.version, std::process::id()));
+    let folder = folder_name(pin);
+    let staging = server.join(format!(".staging-{folder}-{}", std::process::id()));
     fsutil::remove_tree(&staging)?;
     let built = build(&staging, mcp, pin, arch, base_env, limits, fetch, say).await;
     let hash = match built {
@@ -127,9 +149,9 @@ where
             return Err(e);
         }
     };
-    let dir = version_dir(mcp, &pin.name, &pin.version);
-    // The same version again (a repair): the old folder steps aside first.
-    let aside = server.join(format!(".old-{}-{}", pin.version, std::process::id()));
+    let dir = version_dir(mcp, &pin.name, &folder);
+    // The same pin again (a repair): the old folder steps aside first.
+    let aside = server.join(format!(".old-{folder}-{}", std::process::id()));
     if std::fs::symlink_metadata(&dir).is_ok() {
         std::fs::rename(&dir, &aside).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -145,7 +167,10 @@ where
         pin.version,
         dir.display()
     ));
-    Ok(hash)
+    Ok(Installed {
+        folder,
+        sha256: hash,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -240,6 +265,14 @@ where
         .await
         .map_err(|e| format!("{} {}: {e}", pin.name, pin.version))?;
     let tools = client.list_tools().await;
+    // Windows: a first screenshot makes the UI Automation libraries write
+    // what they generate once, before the folder is hashed (later runs then
+    // find it there and change nothing).
+    if pin.platform == "windows" {
+        let _ = client
+            .call(&pin.selftest.screenshot.tool, &pin.selftest.screenshot.args)
+            .await;
+    }
     client.kill().await;
     let tools = tools.map_err(|e| format!("{} {}: {e}", pin.name, pin.version))?;
     say(format!(
@@ -352,8 +385,9 @@ pub fn kept_pin(dir: &Path) -> Result<ServerPin, String> {
 
 /// Whether the installed version may run: its folders the user's own and
 /// private, and its hash the one recorded at install.
-pub fn verify(mcp: &Path, server: &str, version: &str, sha256: &str) -> Result<PathBuf, String> {
-    let dir = version_dir(mcp, server, version);
+pub fn verify(mcp: &Path, server: &str, folder: &str, sha256: &str) -> Result<PathBuf, String> {
+    let dir = version_dir(mcp, server, folder);
+    let version = folder.rsplit_once('-').map_or(folder, |(v, _)| v);
     if std::fs::symlink_metadata(&dir).is_err() {
         return Err(format!("{server} {version} is not on the device any more"));
     }
@@ -367,8 +401,8 @@ pub fn verify(mcp: &Path, server: &str, version: &str, sha256: &str) -> Result<P
     Ok(dir)
 }
 
-/// Removes every version folder of `server` but `keep`, and what a stopped
-/// install left.
+/// Removes every version folder of `server` but `keep` (folder names), and
+/// what a stopped install left.
 pub fn prune(mcp: &Path, server: &str, keep: &[&str]) -> Result<(), String> {
     let dir = server_dir(mcp, server);
     let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -418,6 +452,7 @@ mod tests {
             Some("a/b.py")
         );
         assert_eq!(wheel_target("x-1.0.data/scripts/x.exe"), None);
+        assert_eq!(wheel_target("six.py").as_deref(), Some("six.py"));
         assert_eq!(wheel_target("x-1.0.data/data/share/x"), None);
     }
 

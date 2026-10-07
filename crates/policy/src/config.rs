@@ -260,8 +260,15 @@ impl ComputerUseOptions {
     /// an end (written by hand), is `off`.
     pub fn effective(&self, now_ms: i64) -> Consent {
         match self.consent {
+            // An end further away than an allow can last was not set by
+            // `computer-use allow`: it counts as off.
             Consent::Allow => match self.until_ms {
-                Some(until) if now_ms < until => Consent::Allow,
+                Some(until)
+                    if now_ms < until
+                        && until <= now_ms + i64::from(MAX_ALLOW_MINUTES) * 60_000 =>
+                {
+                    Consent::Allow
+                }
                 _ => Consent::Off,
             },
             c => c,
@@ -526,6 +533,9 @@ impl PortalPolicy {
 #[serde(deny_unknown_fields)]
 pub struct InstalledVersion {
     pub version: String,
+    /// Its folder under the server's: the version and a hash of its pin, so
+    /// a pin that changes for the same version gets a fresh folder.
+    pub folder: String,
     /// The hash over the version's whole folder (`sync_mcp::fsutil::tree_hash`),
     /// checked before every start.
     pub sha256: String,
@@ -538,12 +548,18 @@ pub struct InstalledVersion {
 #[serde(deny_unknown_fields)]
 pub struct InstalledServer {
     pub version: String,
+    /// As `InstalledVersion::folder`.
+    pub folder: String,
     pub sha256: String,
     /// The serial of the pins document it was installed from (0: built in).
     #[serde(default)]
     pub serial: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<InstalledVersion>,
+    /// Set by `computer-use rollback`: updates leave this version alone until
+    /// the owner installs again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -813,6 +829,10 @@ mod tests {
         // Allow written by hand without an end counts as off.
         let by_hand: ComputerUseOptions = toml::from_str("consent = \"allow\"").unwrap();
         assert_eq!(by_hand.effective(0), Consent::Off);
+        // Nor does one dated past the longest allow.
+        let far: ComputerUseOptions =
+            toml::from_str("consent = \"allow\"\nuntil_ms = 32503680000000").unwrap();
+        assert_eq!(far.effective(1_000), Consent::Off);
     }
 
     #[test]

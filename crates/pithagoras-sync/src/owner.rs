@@ -13,18 +13,37 @@ use sync_policy::{Dirs, Profile};
 use crate::control::{self, Request};
 
 /// Refuses when this process descends from the running client, i.e. the portal's
-/// agent runs it.
+/// agent runs it, and while computer use is active: the agent may then be
+/// typing into a terminal of the owner's, which no ancestry tells apart.
 pub async fn not_from_own_command(dirs: &Dirs) -> Result<(), String> {
+    if let Ok(Some(r)) = control::send(&dirs.socket(), Request::Status).await
+        && let Some(s) = r.status
+    {
+        if control::descends_from(std::process::id(), s.pid) {
+            return Err(OWN_COMMAND.into());
+        }
+        if s.computer_use_active {
+            return Err(COMPUTER_USE_ACTIVE.into());
+        }
+    }
+    Ok(())
+}
+
+/// The ancestry check alone, for what only takes away (`deny`).
+pub async fn not_from_own_command_ancestry(dirs: &Dirs) -> Result<(), String> {
     if let Ok(Some(r)) = control::send(&dirs.socket(), Request::Status).await
         && let Some(s) = r.status
         && control::descends_from(std::process::id(), s.pid)
     {
-        return Err(
-            "policy changes cannot come from commands the client runs for the portal".into(),
-        );
+        return Err(OWN_COMMAND.into());
     }
     Ok(())
 }
+
+const OWN_COMMAND: &str = "policy changes cannot come from commands the client runs for the portal";
+
+/// Why the client takes no change while computer use is active.
+pub const COMPUTER_USE_ACTIVE: &str = "computer use is active (a call within the last minute), and the agent could be typing this: changes, answers and secrets wait until it has been idle for a minute. `pithagoras-sync panic` stops it at once; `computer-use off` and `deny` work meanwhile";
 
 /// Confirms that the owner makes this change.
 pub fn confirm(profile: Profile) -> Result<(), String> {

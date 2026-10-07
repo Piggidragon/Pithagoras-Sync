@@ -263,9 +263,10 @@ pub struct ServerPin {
     pub run: Run,
     /// The tools the portal may call, exact names of this version.
     pub allow: Vec<String>,
-    /// Which of them are pointer or keyboard input (the focus check runs first).
+    /// Which of them only look (screenshots, the window list): every other
+    /// allowed tool counts as input, and the focus check runs before it.
     #[serde(default)]
-    pub input: Vec<String>,
+    pub observe: Vec<String>,
     pub focus: Focus,
     pub selftest: SelfTest,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -293,8 +294,10 @@ impl ServerPin {
         out
     }
 
+    /// Whether the focus check runs before `tool`: for every tool the pin
+    /// does not name as one that only looks.
     pub fn is_input(&self, tool: &str) -> bool {
-        self.input.iter().any(|t| t == tool)
+        !self.observe.iter().any(|t| t == tool)
     }
 
     /// What is not pinned yet for `arch` (`TODO-PIN`), if anything: such a
@@ -406,20 +409,25 @@ fn rel_path_ok(path: &str) -> Result<(), String> {
         .map_err(|_| format!("path {path:?} must stay inside the server's folder"))
 }
 
+/// Environment variables a pin may set besides a `..._TELEMETRY` switch: what
+/// keeps a server quiet and its text UTF-8, nothing that changes what it
+/// loads or runs.
+const PIN_ENV: &[&str] = &[
+    "DO_NOT_TRACK",
+    "NO_COLOR",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED",
+];
+
 fn env_name_ok(k: &str) -> Result<(), String> {
-    let plain = !k.is_empty()
+    let telemetry = k.ends_with("_TELEMETRY")
         && k.bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
-    // What changes how a program loads or what Python imports stays the device's.
-    let loader = k.starts_with("LD_")
-        || k.starts_with("DYLD_")
-        || matches!(
-            k,
-            "PATH" | "PYTHONPATH" | "PYTHONHOME" | "PYTHONSTARTUP" | "PYTHONUSERBASE"
-        );
-    if !plain || loader {
+    if !(PIN_ENV.contains(&k) || telemetry) {
         return Err(format!(
-            "environment variable {k:?} is not one a pin may set"
+            "environment variable {k:?} is not one a pin may set (a ..._TELEMETRY switch, or {})",
+            PIN_ENV.join(", ")
         ));
     }
     Ok(())
@@ -442,6 +450,9 @@ impl Document {
     pub fn validate(&self, baseline: bool) -> Result<(), String> {
         if !baseline && (self.serial == 0 || self.issued_ms <= 0) {
             return Err("a signed pins document needs a serial above 0 and issued_ms".into());
+        }
+        if !baseline && serde_json::to_string(self).is_ok_and(|t| t.contains(TODO_PIN)) {
+            return Err(format!("a signed pins document holds no {TODO_PIN}"));
         }
         let mut names = std::collections::HashSet::new();
         for s in &self.servers {
@@ -517,11 +528,11 @@ impl Document {
                     return Err(what(format!("environment variable {k}: value too long")));
                 }
             }
-            for t in s.allow.iter().chain(&s.input) {
+            for t in s.allow.iter().chain(&s.observe) {
                 tool_name_ok(t).map_err(what)?;
             }
-            if let Some(t) = s.input.iter().find(|t| !s.allow.contains(t)) {
-                return Err(what(format!("input tool {t} is not on the allow-list")));
+            if let Some(t) = s.observe.iter().find(|t| !s.allow.contains(t)) {
+                return Err(what(format!("observe tool {t} is not on the allow-list")));
             }
             let mut device_tools = vec![&s.focus.windows];
             device_tools.extend(&s.focus.focused);
@@ -639,10 +650,13 @@ impl PinStore {
     /// The highest serial taken; 0 when none (or unreadable, which only
     /// weakens the replay check, never a signature).
     pub fn seen_serial(&self) -> u64 {
-        std::fs::read_to_string(&self.serial_file)
+        let recorded = std::fs::read_to_string(&self.serial_file)
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // A record that went missing does not let an older document replace
+        // the one kept.
+        recorded.max(self.kept().map_or(0, |d| d.serial))
     }
 
     /// The kept signed document, checked again; `None` when there is none or it
@@ -766,7 +780,7 @@ mod tests {
             "name": name, "platform": "linux", "version": "1.0.0",
             "files": [{"kind": "executable", "path": "srv", "url": "https://github.com/o/r/releases/download/v1/srv", "sha256": "a".repeat(64), "size": 10}],
             "run": {"program": "srv", "args": ["--stdio"], "env": {"NO_TELEMETRY": "1"}},
-            "allow": allow, "input": [],
+            "allow": allow, "observe": [],
             "focus": {"windows": {"tool": "list_windows"}},
             "selftest": {"screenshot": {"tool": allow[0]}}
         })
@@ -891,8 +905,23 @@ mod tests {
         v["servers"][0]["version"] = json!("../1");
         assert!(parse(&v).is_err());
         let mut v = doc(vec![server("s", &["screenshot"])]);
-        v["servers"][0]["input"] = json!(["click"]);
-        assert!(parse(&v).is_err(), "input not on the allow-list");
+        v["servers"][0]["observe"] = json!(["click"]);
+        assert!(parse(&v).is_err(), "observe not on the allow-list");
+        for (k, ok) in [
+            ("FAKE_TELEMETRY", true),
+            ("PYTHONUTF8", true),
+            ("PYTHONWARNINGS", false),
+            ("GTK_MODULES", false),
+            ("BASH_ENV", false),
+            ("COMSPEC", false),
+        ] {
+            let mut v = doc(vec![server("s", &["screenshot"])]);
+            v["servers"][0]["run"]["env"] = json!({ k: "1" });
+            assert_eq!(parse(&v).is_ok(), ok, "{k}");
+        }
+        let mut v = doc(vec![server("s", &["screenshot"])]);
+        v["servers"][0]["write"] = json!([{"path": "python/pythonTODO-PIN._pth", "text": "x"}]);
+        assert!(parse(&v).is_err(), "TODO-PIN anywhere in a signed document");
         let mut v = doc(vec![server("s", &["screenshot"])]);
         v["servers"][0]["focus"]["windows"]["tool"] = json!("PowerShell");
         assert!(parse(&v).is_err());

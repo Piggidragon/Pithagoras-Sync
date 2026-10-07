@@ -115,7 +115,7 @@ mod tests {
             "name": "computer-use-linux", "platform": "linux", "version": "1.2.3",
             "files": [{"arch": "x86_64", "kind": "executable", "path": "computer-use-linux", "url": url}],
             "run": {"program": "computer-use-linux"},
-            "allow": allow, "input": [],
+            "allow": allow, "observe": [],
             "focus": {"windows": {"tool": "list_windows"}},
             "selftest": {"screenshot": {"tool": "screenshot"}}
         }]})

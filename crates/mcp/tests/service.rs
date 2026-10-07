@@ -68,17 +68,19 @@ impl Fx {
         let mut pin = common::pin(&self.files, version, modes, &self.root.join("record"));
         if let Some(a) = allow {
             pin.allow = a.iter().map(|s| s.to_string()).collect();
-            pin.input.retain(|i| pin.allow.contains(i));
+            pin.observe.retain(|i| pin.allow.contains(i));
         }
-        let hash = common::install(&self.mcp(), &pin).await.unwrap();
+        let done = common::install(&self.mcp(), &pin).await.unwrap();
         let mut installed = BTreeMap::new();
         installed.insert(
             "fake".to_string(),
             InstalledServer {
                 version: version.into(),
-                sha256: hash,
+                folder: done.folder,
+                sha256: done.sha256,
                 serial: 1,
                 previous: None,
+                held: false,
             },
         );
         self.svc.reload(installed, doc(&pin));
@@ -141,6 +143,7 @@ async fn fx(consent: Consent, answer: Answer, limits: sync_mcp::Limits) -> Fx {
             base_env: common::env(),
             limits,
             indicator: indicator.clone(),
+            active_ms: sync_mcp::service::BURST_GAP_MS,
         },
     );
     let files = FileServer::start().await;
@@ -205,6 +208,7 @@ async fn nothing_runs_without_consent_and_a_disallowed_tool_never_runs() {
 
     let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
     let mut pin = f.install("1.0.0", &["new-tool"], None).await;
+    let folder = sync_mcp::install::folder_name(&pin);
     for tool in ["set_value", "PowerShell", "perform_action", "nope"] {
         let e = f.call("c1", tool, json!({})).await.unwrap_err();
         assert_eq!(reason(&e), Some(why::TOOL_NOT_ALLOWED), "{tool}");
@@ -217,9 +221,11 @@ async fn nothing_runs_without_consent_and_a_disallowed_tool_never_runs() {
             "fake".to_string(),
             InstalledServer {
                 version: "1.0.0".into(),
-                sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake/1.0.0")).unwrap(),
+                sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake").join(&folder)).unwrap(),
+                folder,
                 serial: 2,
                 previous: None,
+                held: false,
             },
         )]),
         doc(&pin),
@@ -273,6 +279,8 @@ async fn an_allowed_call_runs_taints_and_shows_the_indicator_once_per_burst() {
         .unwrap();
     assert_eq!(f.indicator.0.lock().unwrap().as_slice(), ["c1"]);
     assert_eq!(f.svc.in_use().unwrap().chat, "c1");
+    // Within a minute of a call it counts as active.
+    assert!(f.svc.active());
     let rec = f.record();
     assert!(
         rec.contains("tools/call list_windows"),
@@ -363,14 +371,22 @@ async fn panic_ends_the_call_in_flight_and_stops_the_server() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_server_is_not_started() {
     let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
-    f.install("1.0.0", &[], None).await;
-    let program = f.mcp().join("fake/1.0.0/fake-mcp");
+    let pin = f.install("1.0.0", &[], None).await;
+    let program = f
+        .mcp()
+        .join("fake")
+        .join(sync_mcp::install::folder_name(&pin))
+        .join("fake-mcp");
     let mut data = std::fs::read(&program).unwrap();
     data.push(0);
     std::fs::write(&program, data).unwrap();
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!((e.code, reason(&e)), (code::SERVER, Some(why::CHANGED)));
     assert!(f.record().is_empty());
+    // From then on it is listed as unavailable, without tools.
+    let l = f.svc.list();
+    assert_eq!(l.servers[0].state, "unavailable");
+    assert!(l.servers[0].tools.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -382,7 +398,7 @@ async fn an_update_waits_for_the_calls_in_flight_and_is_announced() {
     let mut changes = ComputerUse::subscribe(&*f.svc);
     let before = f.svc.list().version;
     let next = common::pin(&f.files, "2.0.0", &[], &f.root.join("record"));
-    let hash = common::install(&f.mcp(), &next).await.unwrap();
+    let done = common::install(&f.mcp(), &next).await.unwrap();
     let call = f.call("c1", "screenshot", json!({}));
     let update = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -391,9 +407,11 @@ async fn an_update_waits_for_the_calls_in_flight_and_is_announced() {
                 "fake".to_string(),
                 InstalledServer {
                     version: "2.0.0".into(),
-                    sha256: hash.clone(),
+                    folder: done.folder.clone(),
+                    sha256: done.sha256.clone(),
                     serial: 2,
                     previous: None,
+                    held: false,
                 },
             )]),
             doc(&next),
@@ -408,4 +426,62 @@ async fn an_update_waits_for_the_calls_in_flight_and_is_announced() {
     let c = changes.recv().await.unwrap();
     assert_eq!(c.version, f.svc.list().version);
     f.call("c1", "screenshot", json!({})).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_document_narrows_or_stops_an_installed_version() {
+    let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
+    let pin = f.install("1.0.0", &[], None).await;
+    let folder = sync_mcp::install::folder_name(&pin);
+    let installed = || {
+        BTreeMap::from([(
+            "fake".to_string(),
+            InstalledServer {
+                version: "1.0.0".into(),
+                sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake").join(&folder)).unwrap(),
+                folder: folder.clone(),
+                serial: 1,
+                previous: None,
+                held: false,
+            },
+        )])
+    };
+    // Pins for 2.0.0 that drop type_text and call screenshot input: the
+    // installed 1.0.0 follows them.
+    let mut newer = pin.clone();
+    newer.version = "2.0.0".into();
+    newer.allow.retain(|t| t != "type_text");
+    newer.observe.retain(|t| t != "screenshot");
+    f.svc.reload(
+        installed(),
+        Document {
+            serial: 3,
+            issued_ms: 1,
+            servers: vec![newer],
+        },
+    );
+    let e = f
+        .call("c1", "type_text", json!({"text": "x"}))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), Some(why::TOOL_NOT_ALLOWED));
+    let l = f.svc.list();
+    let shot = l.servers[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "screenshot")
+        .unwrap();
+    assert!(shot.input, "the focus check runs where either asks");
+    // Pins that no longer name the server stop it.
+    f.svc.reload(
+        installed(),
+        Document {
+            serial: 4,
+            issued_ms: 1,
+            servers: vec![],
+        },
+    );
+    assert_eq!(f.svc.list().servers[0].state, "unavailable");
+    let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
+    assert_eq!(e.code, code::SERVER);
 }
