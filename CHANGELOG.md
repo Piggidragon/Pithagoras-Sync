@@ -25,7 +25,7 @@ The graphical install: a person who never opens a terminal can install, pair, se
 ### Known limits
 
 - A console window can flash when the logon task starts the client on Windows (Windows Terminal about 0.2 s, the classic console about 25 ms); a launcher without a console comes later (issue #6).
-- The window texts for the CLI's errors, and the notes a window passes on from a step, are English; SmartScreen warns about the unsigned Windows file (issue #7).
+- The window texts for the CLI's errors, and the notes of installing, pairing and uninstalling, are English; SmartScreen warns about the unsigned Windows file (issue #7).
 - Tried with Edge on Windows 11, Ubuntu's GNOME tools and kdialog under a virtual screen; links from Chrome and Firefox, Windows 10 and a real Plasma session are not tried yet.
 
 ## 0.0.1 - 2026-10-06

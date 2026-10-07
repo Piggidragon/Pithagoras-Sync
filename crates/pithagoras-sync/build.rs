@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 /// The `.ico` the resource is made of.
 const ICO: &str = "../../assets/pithagoras-sync.ico";
-/// The resource id of the icon group (`dialogs.rs` names it for the boxes).
-const ICON_ID: u16 = 1;
+// `ICON_ID`, the resource id of the icon group, shared with the boxes.
+include!("src/icon_id.rs");
 
 const RT_ICON: u16 = 3;
 const RT_GROUP_ICON: u16 = 14;
@@ -21,6 +21,7 @@ const GROUP_FLAGS: u16 = 0x1030;
 fn main() {
     println!("cargo:rerun-if-changed={ICO}");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/icon_id.rs");
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if os != "windows" || env != "msvc" {

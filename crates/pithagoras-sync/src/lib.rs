@@ -8,6 +8,8 @@ pub mod daemon;
 pub mod dialogs;
 pub mod gui;
 pub mod i18n;
+#[cfg(windows)]
+mod icon_id;
 pub mod install;
 pub mod logfile;
 pub mod owner;

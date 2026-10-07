@@ -25,7 +25,7 @@ use sync_policy::secret::Secret;
 use sync_policy::{Dirs, Mode};
 use sync_proto::methods::FolderInfo;
 
-use crate::cli::{Asked, Changed, Kept, Update};
+use crate::cli::{Asked, Changed, Kept, Update, UpdateNote};
 use crate::dialogs::{
     Buttons, Dialogs, Filled, Form, MAX_ANSWER, MAX_TEXT, Style, shown, shown_lines,
 };
@@ -34,6 +34,10 @@ use crate::secrets::SudoCheck;
 
 /// How long the flow waits for a new pairing to connect.
 pub const LINK_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the menu waits for the client's status before it shows the
+/// settings instead: a client that hangs does not hold the menu up.
+const STATUS_WAIT: Duration = Duration::from_secs(2);
 
 /// Whether the link came up after pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +84,8 @@ fn journal_args(place: &LogPlace) -> Option<Vec<&'static str>> {
 pub struct StatusView {
     /// The running client's link state and detail; `None` when it does not run.
     pub link: Option<(LinkState, Option<String>)>,
+    /// A client runs but did not answer in time: the rest is the settings'.
+    pub silent: bool,
     /// The portal's URL and this device's name there.
     pub portal: Option<(String, String)>,
     pub paused: bool,
@@ -118,6 +124,9 @@ pub enum Outcome {
     /// The owner said no or closed a window: nothing changed.
     Cancelled,
     Failed,
+    /// Too many refused login passwords: the program closes, even from the
+    /// menu, so the count starts anew only with a new start.
+    Ended,
 }
 
 /// What the flow does to the system. `RealHost` runs the code of the commands.
@@ -188,6 +197,12 @@ fn parse(t: Lang, link: &str) -> Result<PairUri, String> {
         return Err(t.link_too_long().into());
     }
     let u = PairUri::parse(link).map_err(|e| t.link_unusable(&shown(&e)))?;
+    usable(t, u)
+}
+
+/// A parsed link that may be used: its portal over https, or on this
+/// computer.
+fn usable(t: Lang, u: PairUri) -> Result<PairUri, String> {
     let host = &u.portal.host;
     let local = host == "localhost"
         || host
@@ -201,16 +216,19 @@ fn parse(t: Lang, link: &str) -> Result<PairUri, String> {
 
 /// `parse` for a text that may be anything the owner copied (Windows'
 /// clipboard). One that is no pairing link at all gets no description
-/// (`None`), since that would quote it; the one made is zeroed.
+/// (`None`), since that would quote it, and the parser's error is zeroed. (What the
+/// parser copies on its way is not.)
 fn parse_copied(t: Lang, text: &str) -> Option<Result<PairUri, String>> {
     if text.len() > MAX_ANSWER {
         return None;
     }
-    if let Err(e) = PairUri::parse(text) {
-        drop(Secret::new(e));
-        return None;
+    match PairUri::parse(text) {
+        Ok(u) => Some(usable(t, u)),
+        Err(e) => {
+            drop(Secret::new(e));
+            None
+        }
     }
-    Some(parse(t, text))
 }
 
 /// The owner check, with its refusal shown.
@@ -302,6 +320,12 @@ impl Dialogs for Later<'_> {
     }
 
     fn password(&self, text: &str) -> Option<Secret> {
+        // Windows has no password box: what is held gets a window of its
+        // own instead of going with one that never shows.
+        if self.d.style() == Style::Boxes {
+            self.flush();
+            return self.d.password(text);
+        }
         self.d.password(&self.with_held(text))
     }
 
@@ -470,6 +494,15 @@ async fn ask_link(d: &dyn Dialogs, h: &impl Host, t: Lang, install: bool) -> Out
         let link = link.expose().trim();
         if link.is_empty() {
             if install {
+                // kdialog's OK keeps its own label, not "Install and pair":
+                // its empty box is asked about, not taken as the Yes.
+                if d.style() == Style::Entries {
+                    let (user, path) = h.install_target();
+                    let q = t.install_question(&shown(&user), path.map(|p| shown(&p)).as_deref());
+                    if !d.question(&q) {
+                        return Outcome::Cancelled;
+                    }
+                }
                 return install_only(d, h, t).await;
             }
             d.error(t.no_link());
@@ -586,7 +619,15 @@ async fn pair_after_yes(
             after(d, h, t, &notes).await
         }
         Err(e) => {
-            d.error(&t.pair_failed(&shown(&e)));
+            let mut text = t.pair_failed(&shown(&e));
+            // Installed by now: said, with the install's notes.
+            if install {
+                text = format!("{text}\n\n{}", t.installed_not_paired());
+                if !notes.is_empty() {
+                    text = format!("{text}\n\n{}", t.notes(&notes));
+                }
+            }
+            d.error(&text);
             Outcome::Failed
         }
     }
@@ -600,8 +641,9 @@ const OWNER_PASSWORD_TRIES: u32 = 3;
 /// through the windows does not know it. `typed`: the one from the form, if
 /// it had a field for it. A password `su` refused is asked for again, with
 /// why at the top: zenity's form again, the link kept (shown as parsed), or
-/// the password window; after `OWNER_PASSWORD_TRIES` refusals the flow ends,
-/// so a program that drives the window cannot guess on in it.
+/// the password window. After `OWNER_PASSWORD_TRIES` refusals (an empty
+/// password counts) the program ends (`Outcome::Ended`, the menu too), so a
+/// program that drives the window cannot guess on in it.
 async fn owner_password(
     d: &dyn Dialogs,
     h: &impl Host,
@@ -637,25 +679,24 @@ async fn owner_password(
                 None => return Outcome::Cancelled,
             },
         };
-        if pw.expose().is_empty() {
-            d.error(t.password_empty());
-            continue;
-        }
-        match h.owner_password(&pw).await {
-            Ok(true) => return Outcome::Done,
-            Ok(false) => {
-                refused += 1;
-                if refused >= OWNER_PASSWORD_TRIES {
-                    d.error(&t.owner_password_tries(OWNER_PASSWORD_TRIES));
+        let why = if pw.expose().is_empty() {
+            t.password_empty()
+        } else {
+            match h.owner_password(&pw).await {
+                Ok(true) => return Outcome::Done,
+                Ok(false) => t.owner_password_wrong(),
+                Err(e) => {
+                    d.error(&t.owner_password_failed(&shown(&e)));
                     return Outcome::Failed;
                 }
-                d.error(t.owner_password_wrong());
             }
-            Err(e) => {
-                d.error(&t.owner_password_failed(&shown(&e)));
-                return Outcome::Failed;
-            }
+        };
+        refused += 1;
+        if refused >= OWNER_PASSWORD_TRIES {
+            d.error(&t.owner_password_tries(OWNER_PASSWORD_TRIES));
+            return Outcome::Ended;
         }
+        d.error(why);
     }
 }
 
@@ -726,7 +767,9 @@ async fn menu(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
         match d.menu(&text, &items, buttons) {
             None => return Outcome::Done,
             Some("pair") => {
-                ask_link(d, h, t, false).await;
+                if ask_link(d, h, t, false).await == Outcome::Ended {
+                    return Outcome::Ended;
+                }
             }
             Some("sudo") => {
                 sudo_menu(d, h, t).await;
@@ -770,7 +813,7 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     let version = found.available.as_deref().map(shown);
     let asked = match (&version, &found.stale_client) {
         (Some(v), _) => {
-            if !d.question(&t.update_question(v, &released, &current)) {
+            if !d.question(&t.update_question(v, &released, &current, found.client)) {
                 return Outcome::Cancelled;
             }
             Asked::Release(found.available.as_deref().unwrap_or_default())
@@ -815,7 +858,7 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     };
     let mut text = text;
     if !done.notes.is_empty() {
-        let notes: Vec<String> = done.notes.iter().map(|n| shown(n)).collect();
+        let notes: Vec<String> = done.notes.iter().map(|n| update_note(t, n)).collect();
         text = format!("{text}\n\n{}", t.notes(&notes));
     }
     if error {
@@ -824,6 +867,18 @@ async fn update(d: &dyn Dialogs, h: &impl Host, t: Lang) -> Outcome {
     } else {
         d.info(&text);
         Outcome::Done
+    }
+}
+
+/// A note of `update` in the window's language, escaped. What systemd said
+/// of the system unit (root only) stays as it said it.
+fn update_note(t: Lang, n: &UpdateNote) -> String {
+    match n {
+        UpdateNote::Unchanged(p) => t.ran_unchanged(&shown(p)),
+        UpdateNote::NoClient => t.no_client_runs().to_string(),
+        UpdateNote::CopyNotUpdated(p) => t.copy_not_updated(&shown(p)),
+        UpdateNote::NotRecorded(e) => t.release_not_recorded(&shown(e)),
+        UpdateNote::Unit(l) => shown(l),
     }
 }
 
@@ -1180,11 +1235,19 @@ impl Host for RealHost {
             path: shown(&f.path),
             ..f.clone()
         };
-        if let Ok(Some(r)) = control::send(&self.dirs.socket(), Request::Status).await
+        let reply = tokio::time::timeout(
+            STATUS_WAIT,
+            control::send(&self.dirs.socket(), Request::Status),
+        )
+        .await;
+        // No answer in time, or none at all from a client that is there.
+        let silent = matches!(reply, Err(_) | Ok(Err(_)));
+        if let Ok(Ok(Some(r))) = reply
             && let Some(s) = r.status
         {
             return StatusView {
                 link: Some((s.link.state, s.link.detail.as_deref().map(shown))),
+                silent: false,
                 portal: s.portal.zip(s.name).map(|(p, n)| (shown(&p), shown(&n))),
                 paused: s.paused,
                 mode: s.mode,
@@ -1198,6 +1261,7 @@ impl Host for RealHost {
         match cfg {
             Ok(c) => StatusView {
                 link: None,
+                silent,
                 portal: c.portal.as_ref().map(|p| (shown(&p.url), shown(&p.name))),
                 paused: false,
                 mode: c.policy.effective_mode(c.profile, now),
@@ -1218,6 +1282,7 @@ impl Host for RealHost {
             },
             Err(e) => StatusView {
                 link: None,
+                silent,
                 portal: None,
                 paused: false,
                 mode: Mode::Ask,
@@ -1279,11 +1344,11 @@ impl Host for RealHost {
     }
 
     async fn update_check(&self) -> Result<Update, String> {
-        crate::cli::update(&self.dirs, true, None, Asked::Anything, &mut |_| {}).await
+        crate::cli::update(&self.dirs, None, Asked::Check, &mut |_| {}).await
     }
 
     async fn update(&self, asked: Asked<'_>) -> Result<Update, String> {
-        crate::cli::update(&self.dirs, false, None, asked, &mut |_| {}).await
+        crate::cli::update(&self.dirs, None, asked, &mut |_| {}).await
     }
 
     fn sudo_available(&self) -> bool {
@@ -1424,6 +1489,8 @@ mod tests {
         stale_client: Option<&'static str>,
         /// The client does not take the request to restart.
         no_restart: bool,
+        /// No client of this user runs the program.
+        no_client: bool,
         /// What changed on offer between the question and the Yes.
         changed: Option<Changed>,
         did: Mutex<Vec<String>>,
@@ -1460,6 +1527,7 @@ mod tests {
                 release: None,
                 stale_client: None,
                 no_restart: false,
+                no_client: false,
                 changed: None,
                 did: Mutex::new(Vec::new()),
             }
@@ -1477,6 +1545,7 @@ mod tests {
                 installed: None,
                 restarted: false,
                 changed: None,
+                client: !self.no_client,
                 notes: Vec::new(),
             }
         }
@@ -1558,6 +1627,7 @@ mod tests {
         async fn status(&self) -> StatusView {
             StatusView {
                 link: Some((LinkState::Connected, None)),
+                silent: false,
                 portal: Some(("https://portal.example".into(), "laptop".into())),
                 paused: false,
                 mode: Mode::Ask,
@@ -1610,7 +1680,7 @@ mod tests {
                     Ok(Update {
                         installed: Some(v.into()),
                         restarted: !self.no_restart,
-                        notes: vec!["The one you ran, /tmp/x\x1b[2K, is unchanged.".into()],
+                        notes: vec![UpdateNote::Unchanged("/tmp/x\x1b[2K".into())],
                         ..found
                     })
                 }
@@ -1621,7 +1691,7 @@ mod tests {
                         ..found
                     })
                 }
-                Asked::Anything => panic!("the window asks about one release"),
+                Asked::Anything | Asked::Check => panic!("the window asks about one release"),
             }
         }
         fn sudo_available(&self) -> bool {
@@ -1936,11 +2006,38 @@ mod tests {
             "{seen:#?}"
         );
         assert_eq!(h.did(), ["owner password"]);
-        // Empty: installs only.
+        // Empty: installs only, after a Yes, since kdialog's OK does not
+        // say "Install".
         let h = FakeHost::default();
-        let (_, seen) = run(&h, &["text:"], None).await;
-        assert_eq!(seen.len(), 2, "{seen:#?}");
+        let (_, seen) = run(&h, &["text:", "yes"], None).await;
+        assert_eq!(seen.len(), 3, "{seen:#?}");
+        assert!(
+            seen[1].starts_with("question: Install Pithagoras Sync for alice?"),
+            "{seen:#?}"
+        );
         assert_eq!(h.did(), ["install"]);
+        let h = FakeHost::default();
+        let (o, _) = run(&h, &["text:", "no"], None).await;
+        assert_eq!(o, Outcome::Cancelled);
+        assert!(h.did().is_empty());
+    }
+
+    /// The pairing fails after the install worked: the window says it is
+    /// installed, with the install's notes, not only that pairing failed.
+    #[tokio::test]
+    async fn a_failed_pairing_after_the_install_says_it_is_installed() {
+        let h = FakeHost {
+            fail: Some("pair"),
+            install_notes: vec!["pairing links may not open it".into()],
+            ..FakeHost::default()
+        };
+        let (o, seen) = run_as(Style::Boxes, Lang::En, &h, &["yes"], None, Some(LINK)).await;
+        assert_eq!(o, Outcome::Failed);
+        assert_eq!(h.did(), ["install", &pair_did()]);
+        let e = seen.last().unwrap();
+        assert!(e.starts_with("error: Pairing failed"), "{seen:#?}");
+        assert!(e.contains("It is not paired yet"), "{e}");
+        assert!(e.contains("pairing links may not open it"), "{e}");
     }
 
     /// Windows with a valid pairing link in the clipboard: one box asks to
@@ -2392,11 +2489,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(o, Outcome::Failed);
+        assert_eq!(o, Outcome::Ended);
         assert_eq!(h.did(), ["owner password"; 3]);
         assert_eq!(
             seen.last().unwrap(),
-            "error: su did not accept the password 3 times. Nothing changed; open Pithagoras Sync again to try again."
+            "error: The login password was not accepted 3 times. Nothing changed; open Pithagoras Sync again to try again."
         );
         assert_eq!(seen.len(), 5, "{seen:#?}");
         assert_eq!(h.paired(), None);
@@ -2413,23 +2510,64 @@ mod tests {
             Some(LINK),
         )
         .await;
-        assert_eq!(o, Outcome::Failed);
+        assert_eq!(o, Outcome::Ended);
         assert_eq!(h.did(), ["owner password"; 3]);
         assert!(
             seen.last()
                 .unwrap()
-                .starts_with("error: su did not accept the password 3 times")
+                .starts_with("error: The login password was not accepted 3 times")
         );
         assert_eq!(h.paired(), None);
-        // An empty password is no try: su never saw it.
+        // An empty password counts too: the flow ends after three of any.
         let h = desktop(installed());
-        let (o, _) = run(
+        let (o, _) = run(&h, &["yes", "pw:", "pw:", "pw:", "pw:my login"], Some(LINK)).await;
+        assert_eq!(o, Outcome::Ended);
+        assert!(h.did().is_empty());
+        assert_eq!(h.paired(), None);
+    }
+
+    /// The three tries hold for the whole program: Pair again from the menu
+    /// does not start a new count, the program ends.
+    #[tokio::test]
+    async fn the_menu_ends_after_three_refused_passwords() {
+        let h = desktop(paired());
+        let link = format!("text:{LINK}");
+        let (o, seen) = run(
             &h,
-            &["yes", "pw:", "pw:guess 1", "pw:guess 2", "pw:my login"],
-            Some(LINK),
+            &[
+                "pick:pair",
+                &link,
+                "yes",
+                "pw:guess 1",
+                "pw:guess 2",
+                "pw:guess 3",
+                "pick:pair",
+            ],
+            None,
         )
         .await;
-        assert_eq!(o, Outcome::Done);
+        assert_eq!(o, Outcome::Ended);
+        assert_eq!(h.did(), ["owner password"; 3]);
+        assert!(
+            seen.last()
+                .unwrap()
+                .starts_with("error: The login password was not accepted 3 times"),
+            "{seen:#?}"
+        );
+        let menus = seen.iter().filter(|s| s.starts_with("menu")).count();
+        assert_eq!(menus, 1, "{seen:#?}");
+    }
+
+    /// Windows asks no password: what is held is shown on its own, not lost
+    /// with a box that never shows.
+    #[tokio::test]
+    async fn held_messages_are_not_lost_to_a_password_windows_does_not_ask() {
+        let d = Fake::styled(Style::Boxes, &[]);
+        let l = Later::new(&d);
+        l.info("installed");
+        assert!(l.password("Password?").is_none());
+        l.flush();
+        assert_eq!(d.seen()[0], "info: installed");
     }
 
     #[tokio::test]
@@ -2734,13 +2872,13 @@ mod tests {
             ),
             "{seen:#?}"
         );
-        // The notes as the command line says them, escaped.
+        // The notes in the window's words, escaped.
         assert!(
-            seen[2].contains("]: Pithagoras Sync is updated to 0.0.3. The client restarts with it.\n\nNote: The one you ran, /tmp/x\\u{1b}[2K, is unchanged."),
+            seen[2].contains("]: Pithagoras Sync is updated to 0.0.3. The client restarts with it.\n\nNote: The program you opened, /tmp/x\\u{1b}[2K, is unchanged."),
             "{seen:#?}"
         );
         assert_eq!(h.did(), ["update check", "update 0.0.3"]);
-        // In German, all of it but the notes.
+        // In German, the notes too.
         let h = FakeHost {
             release: Some("0.0.3"),
             ..paired()
@@ -2751,7 +2889,21 @@ mod tests {
             "{seen:#?}"
         );
         assert!(
-            seen[2].contains("]: Pithagoras Sync ist auf 0.0.3 aktualisiert. Der Client startet mit dieser Version neu.\n\nHinweis: The one you ran"),
+            seen[2].contains("]: Pithagoras Sync ist auf 0.0.3 aktualisiert. Der Client startet mit dieser Version neu.\n\nHinweis: Das Programm, das du geöffnet hast, /tmp/x\\u{1b}[2K, ist unverändert."),
+            "{seen:#?}"
+        );
+        // No client of the user runs it: the question does not promise a
+        // restart.
+        let h = FakeHost {
+            release: Some("0.0.3"),
+            no_client: true,
+            ..paired()
+        };
+        let (_, seen) = run(&h, &["pick:update", "no", "cancel"], None).await;
+        assert!(
+            seen[1].ends_with(
+                "The release is signed; no client of yours runs it now, so it takes effect when the client starts next."
+            ),
             "{seen:#?}"
         );
         // Up to date: said at the top of the menu, no question.
@@ -3231,6 +3383,7 @@ mod tests {
         use sync_policy::Access;
         let s = StatusView {
             link: Some((LinkState::Waiting, Some("refused (401)".into()))),
+            silent: false,
             portal: None,
             paused: true,
             mode: Mode::Full,
@@ -3265,6 +3418,19 @@ mod tests {
             "{de}"
         );
         assert!(de.contains("Wartet auf dich: 2"), "{de}");
+        // A client that did not answer in time is not called stopped.
+        let s = StatusView {
+            link: None,
+            silent: true,
+            ..s
+        };
+        assert!(
+            Lang::En
+                .status(&s)
+                .contains("Client: running, but it did not answer"),
+            "{}",
+            Lang::En.status(&s)
+        );
     }
 
     #[test]

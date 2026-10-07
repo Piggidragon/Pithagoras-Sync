@@ -346,9 +346,12 @@ pub fn this_program() -> Result<PathBuf, String> {
         .clone()
 }
 
-/// What a window's Yes to `update` was given to.
+/// What `update` is to do: look (`--check`), or what a window's Yes was
+/// given to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asked<'a> {
+    /// `update --check`: only look, change nothing.
+    Check,
     /// No window: the command line, which takes whatever is on offer.
     Anything,
     /// This release and no other.
@@ -370,21 +373,36 @@ pub enum Changed {
     Offered(String),
 }
 
-impl std::fmt::Display for Changed {
+/// A note of `update` that its other fields do not tell: the command line
+/// prints it (`Display`), a window says it in its language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateNote {
+    /// The program that ran the update is another, unchanged file.
+    Unchanged(String),
+    /// No client of this user runs the updated program.
+    NoClient,
+    /// The copy `install` set up (this path) was not updated.
+    CopyNotUpdated(String),
+    /// Which release was installed could not be recorded (this error).
+    NotRecorded(String),
+    /// What the system unit's restart did (root only): systemd's words.
+    Unit(String),
+}
+
+impl std::fmt::Display for UpdateNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Changed::Other { asked, offered } => write!(
+            UpdateNote::Unchanged(p) => write!(f, "The one you ran, {p}, is unchanged."),
+            UpdateNote::NoClient => write!(
                 f,
-                "the release on offer is now {offered} instead of {asked}: nothing was installed"
+                "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
             ),
-            Changed::Gone(v) => write!(
+            UpdateNote::CopyNotUpdated(p) => write!(
                 f,
-                "release {v} is no longer on offer: nothing was installed"
+                "The copy `install` set up, {p}, which the unit or logon task starts, was not updated: run `{p} update` for it."
             ),
-            Changed::Offered(v) => write!(
-                f,
-                "release {v} is on offer now: nothing was installed or restarted"
-            ),
+            UpdateNote::NotRecorded(e) => write!(f, "pithagoras-sync: {e}"),
+            UpdateNote::Unit(l) => f.write_str(l),
         }
     }
 }
@@ -420,21 +438,24 @@ pub struct Update {
     pub restarted: bool,
     /// What changed on offer since the window asked: nothing was done.
     pub changed: Option<Changed>,
-    /// What the fields above do not tell: what a window adds as notes.
-    pub notes: Vec<String>,
+    /// Whether a client of this user runs the program `update` replaces,
+    /// and so is asked to restart with the new one.
+    pub client: bool,
+    /// What the fields above do not tell.
+    pub notes: Vec<UpdateNote>,
 }
 
-/// `update` (`check`: `update --check`) with the release manifest at
-/// `manifest` (else the release channel's). `asked`: what a window showed the
-/// owner; anything else on offer is refused (`Update::changed`). `say` gets
-/// what the command line prints, line by line, as it happens.
+/// `update` with the release manifest at `manifest` (else the release
+/// channel's). `asked`: `Check` only looks; else what a window showed the
+/// owner, and anything else on offer is refused (`Update::changed`). `say`
+/// gets what the command line prints, line by line, as it happens.
 pub async fn update(
     dirs: &Dirs,
-    check: bool,
     manifest: Option<&str>,
     asked: Asked<'_>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Update, String> {
+    let check = asked == Asked::Check;
     owner::not_from_own_command(dirs).await?;
     let key = crate::update::PUBLIC_KEY
         .ok_or("this build has no update key; updates come with release builds")?;
@@ -505,6 +526,7 @@ pub async fn update(
         installed: None,
         restarted: false,
         changed: None,
+        client: client.is_some(),
         notes: Vec::new(),
     };
     // `say!`: a line the fields of `Update` tell as well; `note!`: one they
@@ -515,10 +537,10 @@ pub async fn update(
         };
     }
     macro_rules! note {
-        ($($arg:tt)*) => {{
-            let l = format!($($arg)*);
-            say(&l);
-            update.notes.push(l);
+        ($note:expr) => {{
+            let n = $note;
+            say(&n.to_string());
+            update.notes.push(n);
         }};
     }
     if let Err(c) = the_version_asked_about(offer.plan.as_ref().map(|p| p.version.as_str()), asked)
@@ -560,7 +582,7 @@ pub async fn update(
             && !check
             && let Some(l) = restart_unit(&exe, false, restarting)
         {
-            note!("{l}");
+            note!(UpdateNote::Unit(l));
         }
         return Ok(update);
     };
@@ -577,11 +599,12 @@ pub async fn update(
     say!("Updated {} to {}.", exe.display(), plan.version);
     // No program of this user is taken below this release from now on.
     if let Err(e) = crate::update::record(&records[1], offer.released) {
-        eprintln!("pithagoras-sync: {e}");
-        update.notes.push(e);
+        let n = UpdateNote::NotRecorded(e);
+        eprintln!("{n}");
+        update.notes.push(n);
     }
     if !crate::update::same_program(&exe, &me) {
-        note!("The one you ran, {}, is unchanged.", me.display());
+        note!(UpdateNote::Unchanged(me.display().to_string()));
     }
     let restarted = client.is_some()
         && matches!(
@@ -597,18 +620,12 @@ pub async fn update(
     // file: both restart.
     if unit_runs_exe {
         if let Some(l) = restart_unit(&exe, true, restarting) {
-            note!("{l}");
+            note!(UpdateNote::Unit(l));
         }
     } else if !restarted {
-        note!(
-            "No client of this user runs it. A client run by a system unit restarts with: sudo systemctl restart pithagoras-sync"
-        );
+        note!(UpdateNote::NoClient);
         if let Some(other) = crate::update::installed_copy(&me) {
-            note!(
-                "The copy `install` set up, {}, which the unit or logon task starts, was not updated: run `{} update` for it.",
-                other.display(),
-                other.display()
-            );
+            note!(UpdateNote::CopyNotUpdated(other.display().to_string()));
         }
     }
     Ok(update)
@@ -1769,11 +1786,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Sudo { cmd } => sudo_cmd(&dirs, cmd).await?,
         Cmd::Update { check, manifest } => {
-            let mut say = |l: &str| println!("{l}");
-            let u = update(&dirs, check, manifest.as_deref(), Asked::Anything, &mut say).await?;
-            if let Some(c) = u.changed {
-                return Err(c.to_string());
-            }
+            let asked = if check { Asked::Check } else { Asked::Anything };
+            update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await?;
         }
         Cmd::Install {
             system,
@@ -2925,20 +2939,30 @@ mod tests {
     /// the update runs is not installed.
     #[test]
     fn an_update_installs_only_the_version_asked_about() {
-        use super::Asked;
+        use super::{Asked, Changed};
         let ok = |o, a| the_version_asked_about(o, a).is_ok();
         assert!(ok(Some("0.0.3"), Asked::Release("0.0.3")));
         assert!(ok(Some("0.0.4"), Asked::Anything));
         assert!(ok(None, Asked::Anything));
         assert!(ok(None, Asked::Restart));
-        let e = the_version_asked_about(Some("0.0.4"), Asked::Release("0.0.3")).unwrap_err();
-        assert!(e.to_string().contains("0.0.4 instead of 0.0.3"), "{e}");
+        assert!(ok(Some("0.0.4"), Asked::Check));
+        assert_eq!(
+            the_version_asked_about(Some("0.0.4"), Asked::Release("0.0.3")),
+            Err(Changed::Other {
+                asked: "0.0.3".into(),
+                offered: "0.0.4".into()
+            })
+        );
         // The release went (pulled, or installed meanwhile): nothing to say
         // "updated" about.
-        let e = the_version_asked_about(None, Asked::Release("0.0.3")).unwrap_err();
-        assert!(e.to_string().contains("0.0.3 is no longer on offer"), "{e}");
+        assert_eq!(
+            the_version_asked_about(None, Asked::Release("0.0.3")),
+            Err(Changed::Gone("0.0.3".into()))
+        );
         // A Yes to a restart installs no release that came meanwhile.
-        let e = the_version_asked_about(Some("0.0.4"), Asked::Restart).unwrap_err();
-        assert!(e.to_string().contains("0.0.4 is on offer now"), "{e}");
+        assert_eq!(
+            the_version_asked_about(Some("0.0.4"), Asked::Restart),
+            Err(Changed::Offered("0.0.4".into()))
+        );
     }
 }

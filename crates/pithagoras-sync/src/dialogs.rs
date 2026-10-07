@@ -55,6 +55,15 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
+/// `text`, then `ask` below it, in one box of at most `MAX_TEXT` characters:
+/// `text` is cut to make room, so the question the box's buttons answer is
+/// never what is cut (Windows, whose boxes add it to the text).
+#[cfg(any(windows, test))]
+pub(crate) fn with_question(text: &str, ask: &str) -> String {
+    let room = MAX_TEXT.saturating_sub(ask.chars().count() + 3);
+    format!("{}\n\n{ask}", clip(text, room))
+}
+
 /// How much one window of the dialog program can ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Style {
@@ -161,8 +170,8 @@ pub const FORM_SEPARATOR: char = '\u{1f}';
 /// would grow as wide as the longest line.
 const FORM_LINE: usize = 72;
 
-/// `text` broken into lines of at most `width` characters, at spaces where it
-/// can be, else inside a word.
+/// `text` broken into lines of at most `width` characters at spaces; a longer
+/// word gets a line of its own, cut only past twice `width`.
 fn wrapped(text: &str, width: usize) -> String {
     let mut out = Vec::new();
     for para in text.split('\n') {
@@ -183,8 +192,14 @@ fn wrapped(text: &str, width: usize) -> String {
                     out.push(std::mem::take(&mut line));
                     continue;
                 }
-                // A word longer than a line: cut it.
-                let rest = word.split_off(width);
+                // A word longer than a line (a URL, a path) gets a line of
+                // its own, whole, so a host is never read in two pieces; only
+                // one too long for that is cut.
+                if word.len() <= 2 * width {
+                    out.push(word.iter().collect());
+                    break;
+                }
+                let rest = word.split_off(2 * width);
                 out.push(word.iter().collect());
                 word = rest;
             }
@@ -218,6 +233,16 @@ impl Helper {
     /// The program's arguments for `ask`, with the program's icon (`icon`)
     /// where the dialog shows one. Every value is one argument; zenity's take
     /// the `--name=value` form, so none can be read as an option.
+    /// Whether a window of `ask` shows the icon option: every kdialog one;
+    /// zenity 4 shows it in questions, information and errors, and takes it
+    /// but shows nothing in its forms, lists and entries.
+    fn shows_icon(&self, ask: &Ask) -> bool {
+        match self {
+            Helper::Kdialog(_) => true,
+            Helper::Zenity(_) => matches!(ask, Ask::Info(_) | Ask::Error(_) | Ask::Question(_)),
+        }
+    }
+
     pub fn args(&self, ask: &Ask, icon: bool) -> Vec<String> {
         let clipped = |t: &str| clip(t, MAX_TEXT);
         match self {
@@ -593,16 +618,51 @@ pub struct Native {
     helper: Helper,
     /// Locale variables set over the session's (`locale_fix`).
     locale: Vec<(&'static str, String)>,
-    /// Whether it is given the program's icon (`takes_icon`, `icon_there`).
-    icon: bool,
+    /// Whether `install` put the icon in place (`icon_there`).
+    icon_there: bool,
+    /// Whether the program takes the icon option (`takes_icon`): zenity is
+    /// asked its version once, the first time a window would show the icon.
+    takes_icon: std::cell::OnceCell<bool>,
 }
 
 impl Native {
-    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>, icon: bool) -> Native {
+    pub fn new(helper: Helper, locale: Vec<(&'static str, String)>, icon_there: bool) -> Native {
         Native {
             helper,
             locale,
-            icon,
+            icon_there,
+            takes_icon: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether `ask` gets the program's icon.
+    fn icon(&self, ask: &Ask) -> bool {
+        self.icon_there
+            && self.helper.shows_icon(ask)
+            && *self.takes_icon.get_or_init(|| {
+                let version = match &self.helper {
+                    Helper::Zenity(p) => zenity_version(p),
+                    Helper::Kdialog(_) => None,
+                };
+                takes_icon(&self.helper, version.as_deref())
+            })
+    }
+
+    /// The answer of an entry or password window: the line end cut off in
+    /// place, the rest never copied; a cancelled one's output zeroed.
+    fn secret_answer(&self, ask: &Ask) -> Option<Secret> {
+        match self.run(ask) {
+            (Some(0), Some(mut t)) => {
+                while t.ends_with(['\n', '\r']) {
+                    t.pop();
+                }
+                Some(Secret::new(t))
+            }
+            (_, Some(t)) => {
+                drop(Secret::new(t));
+                None
+            }
+            _ => None,
         }
     }
 
@@ -615,21 +675,23 @@ impl Native {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
         let helper = find_helper(&path, &desktop, &system_program)?;
         let locale = locale_fix(|v| std::env::var(v).ok(), &installed_locales(&path), lang);
-        let version = match &helper {
-            Helper::Zenity(p) => zenity_version(p),
-            Helper::Kdialog(_) => None,
-        };
         let data = sync_ops::info::home().map(|h| crate::cli::data_home(&h));
-        let icon = takes_icon(&helper, version.as_deref()) && data.is_some_and(|d| icon_there(&d));
+        let icon = data.is_some_and(|d| icon_there(&d));
         Some(Native::new(helper, locale, icon))
     }
 
     /// Runs the program; its exit code and up to `MAX_ANSWER` bytes of its
-    /// output (`None` when there was more, or it could not run).
+    /// output; for a form twice that, its separator and the line end, since
+    /// its link and its password each may take that much (`None` when there
+    /// was more, or it could not run).
     fn run(&self, ask: &Ask) -> (Option<i32>, Option<String>) {
         use std::io::Read;
+        let max = match ask {
+            Ask::Form(..) => 2 * MAX_ANSWER + FORM_SEPARATOR.len_utf8() + 1,
+            _ => MAX_ANSWER,
+        };
         let mut cmd = dialog_command(self.helper.program());
-        cmd.args(self.helper.args(ask, self.icon))
+        cmd.args(self.helper.args(ask, self.icon(ask)))
             .stdout(std::process::Stdio::piped());
         for (k, v) in &self.locale {
             cmd.env(k, v);
@@ -639,18 +701,15 @@ impl Native {
         };
         // Room for all of it from the start: a buffer grown on the way would
         // leave copies of a password behind.
-        let mut out = Vec::with_capacity(MAX_ANSWER + 1);
+        let mut out = Vec::with_capacity(max + 1);
         let read = child.stdout.take().map(|mut s| {
-            let ok = (&mut s)
-                .take(MAX_ANSWER as u64 + 1)
-                .read_to_end(&mut out)
-                .is_ok();
+            let ok = (&mut s).take(max as u64 + 1).read_to_end(&mut out).is_ok();
             // The rest unread, the program would wait on a full pipe forever.
             let _ = std::io::copy(&mut s, &mut std::io::sink());
             ok
         });
         let status = child.wait().ok().and_then(|s| s.code());
-        let text = if read == Some(true) && out.len() <= MAX_ANSWER {
+        let text = if read == Some(true) && out.len() <= max {
             match String::from_utf8(std::mem::take(&mut out)) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -721,36 +780,11 @@ impl Dialogs for Native {
     }
 
     fn entry(&self, text: &str, buttons: Buttons) -> Option<Secret> {
-        match self.run(&Ask::Entry(text, buttons)) {
-            (Some(0), Some(mut t)) => {
-                while t.ends_with(['\n', '\r']) {
-                    t.pop();
-                }
-                Some(Secret::new(t))
-            }
-            (_, Some(t)) => {
-                drop(Secret::new(t));
-                None
-            }
-            _ => None,
-        }
+        self.secret_answer(&Ask::Entry(text, buttons))
     }
 
     fn password(&self, text: &str) -> Option<Secret> {
-        match self.run(&Ask::Password(text)) {
-            (Some(0), Some(mut t)) => {
-                // Only the line end goes; the rest is never copied.
-                while t.ends_with(['\n', '\r']) {
-                    t.pop();
-                }
-                Some(Secret::new(t))
-            }
-            (_, Some(t)) => {
-                drop(Secret::new(t));
-                None
-            }
-            _ => None,
-        }
+        self.secret_answer(&Ask::Password(text))
     }
 
     fn menu(
@@ -807,14 +841,13 @@ mod win {
 
     use sync_policy::win::wide;
 
-    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip};
+    use super::{Dialogs, MAX_ANSWER, MAX_TEXT, Secret, TITLE, WinDialogs, clip, with_question};
 
     /// The clipboard's text format.
     const CF_UNICODETEXT: u32 = 13;
     const IDNO: i32 = 7;
 
-    /// The resource id of the program's icon (`build.rs`).
-    const ICON_ID: usize = 1;
+    use crate::icon_id::ICON_ID;
 
     /// A box with the program's icon (`MB_USERICON`) unless `style` names a
     /// stock one (an error's). Without the icon resource (a build that has
@@ -834,7 +867,7 @@ mod win {
                 lpszText: t.as_ptr(),
                 lpszCaption: title.as_ptr(),
                 dwStyle: style | MB_SETFOREGROUND | if own { MB_USERICON } else { 0 },
-                lpszIcon: ICON_ID as *const u16,
+                lpszIcon: ICON_ID as usize as *const u16,
                 dwContextHelpId: 0,
                 lpfnMsgBoxCallback: None,
                 dwLanguageId: 0,
@@ -897,7 +930,7 @@ mod win {
         }
 
         fn entry(&self, text: &str, _buttons: super::Buttons) -> Option<Secret> {
-            let t = format!("{text}\n\n{}", self.0.clipboard_hint());
+            let t = with_question(text, self.0.clipboard_hint());
             if message(&t, MB_OKCANCEL) != IDOK {
                 return None;
             }
@@ -920,9 +953,13 @@ mod win {
             _buttons: super::Buttons,
         ) -> Option<&'static str> {
             for (i, (key, label)) in items.iter().enumerate() {
-                let t = self
-                    .0
-                    .menu_step((i == 0).then_some(text), label, i + 1 == items.len());
+                // The status in the first box only; the next ones just ask.
+                let ask = self.0.menu_step(label, i + 1 == items.len());
+                let t = if i == 0 {
+                    with_question(text, &ask)
+                } else {
+                    ask
+                };
                 match message(&t, MB_YESNOCANCEL) {
                     IDYES => return Some(key),
                     IDNO => continue,
@@ -1237,6 +1274,78 @@ mod tests {
         assert!(icon_there(t.path()));
     }
 
+    /// zenity's form gives back a link and a password of the most each may
+    /// hold, rather than a cancel nobody chose.
+    #[cfg(unix)]
+    #[test]
+    fn a_form_holds_a_link_and_a_password_of_full_length() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let z = dir.path().join("zenity");
+        let link = "l".repeat(MAX_ANSWER);
+        let pw = "p".repeat(MAX_ANSWER);
+        std::fs::write(
+            &z,
+            format!("#!/bin/sh\nprintf '%s\\037%s\\n' '{link}' '{pw}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let n = Native::new(Helper::Zenity(z), Vec::new(), false);
+        let form = Form {
+            entry: Some("Link"),
+            password: Some("Password"),
+        };
+        let f = n.form("t", form, B).expect("an answer, not a cancel");
+        assert_eq!(f.entry.as_ref().map(Secret::expose), Some(link.as_str()));
+        assert_eq!(f.password.as_ref().map(Secret::expose), Some(pw.as_str()));
+    }
+
+    /// zenity is asked its version only when a window would show the icon,
+    /// and only once: not before the icon is installed, not for a form.
+    #[cfg(unix)]
+    #[test]
+    fn zenity_is_asked_its_version_only_for_an_icon() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("asked");
+        let z = dir.path().join("zenity");
+        std::fs::write(
+            &z,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo v >> '{}'; echo 4.0.1; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&z, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let asked = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let n = Native::new(Helper::Zenity(z.clone()), Vec::new(), false);
+        assert!(n.question("q"));
+        assert_eq!(asked(), 0);
+        let n = Native::new(Helper::Zenity(z), Vec::new(), true);
+        n.form("f", Form::default(), B);
+        assert_eq!(asked(), 0);
+        assert!(n.question("q"));
+        n.info("i");
+        assert_eq!(asked(), 1);
+    }
+
+    /// A box's question (Windows adds it below the text) is never what is
+    /// cut when the text is too long: the text is.
+    #[test]
+    fn the_question_of_a_box_is_never_cut() {
+        let ask = "Pair again?\n\nYes: Pair again.";
+        let t = with_question(&"s".repeat(MAX_TEXT), ask);
+        assert!(t.ends_with(ask), "{t}");
+        assert!(t.chars().count() <= MAX_TEXT + 1, "{}", t.chars().count());
+        assert_eq!(with_question("Status", ask), format!("Status\n\n{ask}"));
+    }
+
     #[test]
     fn a_long_text_is_cut_before_it_reaches_the_dialog() {
         let z = Helper::Zenity("/usr/bin/zenity".into());
@@ -1400,12 +1509,21 @@ mod tests {
     }
 
     #[test]
-    fn long_lines_are_broken_at_spaces_and_inside_long_words() {
+    fn long_lines_are_broken_at_spaces_and_long_words_kept_whole() {
         assert_eq!(wrapped("aa bb cc", 5), "aa bb\ncc");
         assert_eq!(wrapped("a\n\nb", 5), "a\n\nb");
-        assert_eq!(wrapped("abcdefghij k", 4), "abcd\nefgh\nij k");
+        assert_eq!(wrapped("abcdefg h", 4), "abcdefg\nh");
+        // A portal URL longer than a line stays in one piece.
+        let portal = "https://portal.example.com.some-long-tenant-name.example.net/pithagoras";
+        let text = format!("The login password for pairing with {portal} as laptop");
+        assert!(
+            wrapped(&text, 72).lines().any(|l| l == portal),
+            "{}",
+            wrapped(&text, 72)
+        );
+        // Only one longer than two lines is cut, at that length.
         let url = format!("https://{}", "x".repeat(200));
-        assert!(wrapped(&url, 72).lines().all(|l| l.chars().count() <= 72));
+        assert!(wrapped(&url, 72).lines().all(|l| l.chars().count() <= 144));
         assert_eq!(wrapped(&url, 72).replace('\n', ""), url);
     }
 

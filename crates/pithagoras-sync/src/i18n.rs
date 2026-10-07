@@ -432,10 +432,10 @@ impl Lang {
     pub fn owner_password_tries(self, n: u32) -> String {
         match self {
             Lang::En => format!(
-                "su did not accept the password {n} times. Nothing changed; open Pithagoras Sync again to try again."
+                "The login password was not accepted {n} times. Nothing changed; open Pithagoras Sync again to try again."
             ),
             Lang::De => format!(
-                "su hat das Passwort {n}-mal nicht angenommen. Es wurde nichts geändert; öffne Pithagoras Sync erneut, um es noch einmal zu versuchen."
+                "Das Anmeldepasswort wurde {n}-mal nicht angenommen. Es wurde nichts geändert; öffne Pithagoras Sync erneut, um es noch einmal zu versuchen."
             ),
         }
     }
@@ -563,13 +563,70 @@ impl Lang {
 
     /// A newer release (`version`), made `released`; this computer has
     /// `current`.
-    pub fn update_question(self, version: &str, released: &str, current: &str) -> String {
+    /// `client`: a client of this user runs the program, and restarts with
+    /// the new one.
+    pub fn update_question(
+        self,
+        version: &str,
+        released: &str,
+        current: &str,
+        client: bool,
+    ) -> String {
+        let restart = match (self, client) {
+            (Lang::En, true) => "the client restarts with it.",
+            (Lang::En, false) => {
+                "no client of yours runs it now, so it takes effect when the client starts next."
+            }
+            (Lang::De, true) => "der Client startet mit ihr neu.",
+            (Lang::De, false) => {
+                "gerade läuft kein Client von dir damit, sie wirkt also beim nächsten Start des Clients."
+            }
+        };
         match self {
             Lang::En => format!(
-                "Version {version} of Pithagoras Sync is available, released {released}; this computer has {current}.\n\nUpdate Pithagoras Sync to {version} now? The release is signed; the client restarts with it."
+                "Version {version} of Pithagoras Sync is available, released {released}; this computer has {current}.\n\nUpdate Pithagoras Sync to {version} now? The release is signed; {restart}"
             ),
             Lang::De => format!(
-                "Version {version} von Pithagoras Sync ist verfügbar, veröffentlicht am {released}; dieser Computer hat {current}.\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; der Client startet mit ihr neu."
+                "Version {version} von Pithagoras Sync ist verfügbar, veröffentlicht am {released}; dieser Computer hat {current}.\n\nPithagoras Sync jetzt auf {version} aktualisieren? Die Version ist signiert; {restart}"
+            ),
+        }
+    }
+
+    /// `update` ran from another file than the one it updated: `path`.
+    pub fn ran_unchanged(self, path: &str) -> String {
+        match self {
+            Lang::En => format!("The program you opened, {path}, is unchanged."),
+            Lang::De => format!("Das Programm, das du geöffnet hast, {path}, ist unverändert."),
+        }
+    }
+
+    pub fn no_client_runs(self) -> &'static str {
+        self.pick(
+            "No client of yours runs the updated program now; it runs the new version from its next start. A client the system runs restarts with: sudo systemctl restart pithagoras-sync",
+            "Gerade führt kein Client von dir das aktualisierte Programm aus; er führt die neue Version ab seinem nächsten Start aus. Ein Client, den das System ausführt, startet neu mit: sudo systemctl restart pithagoras-sync",
+        )
+    }
+
+    /// The copy `install` set up, at `path`, was not updated.
+    pub fn copy_not_updated(self, path: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "The installed copy, {path}, which starts at login, was not updated. Open that one and choose Update there."
+            ),
+            Lang::De => format!(
+                "Die installierte Kopie, {path}, die beim Anmelden startet, wurde nicht aktualisiert. Öffne sie und wähle dort Aktualisieren."
+            ),
+        }
+    }
+
+    /// Which release was installed could not be recorded: `e`.
+    pub fn release_not_recorded(self, e: &str) -> String {
+        match self {
+            Lang::En => format!(
+                "Which release was installed could not be recorded, so an older one is not yet refused: {e}"
+            ),
+            Lang::De => format!(
+                "Welche Version installiert wurde, konnte nicht festgehalten werden, daher wird eine ältere noch nicht abgelehnt: {e}"
             ),
         }
     }
@@ -730,6 +787,12 @@ impl Lang {
         use std::fmt::Write;
         let mut out = String::new();
         let client = match &s.link {
+            None if s.silent => self
+                .pick(
+                    "running, but it did not answer",
+                    "läuft, hat aber nicht geantwortet",
+                )
+                .to_string(),
             None => self.pick("not running", "läuft nicht").to_string(),
             Some((LinkState::Connected, _)) => self
                 .pick("running, connected", "läuft, verbunden")
@@ -1047,8 +1110,8 @@ impl Lang {
     /// Windows: one item of a menu, as a Yes/No/Cancel question; `text` (the
     /// menu's, with the status) in the first box only. After the `last` one
     /// there is no next choice: No closes as well.
-    pub fn menu_step(self, text: Option<&str>, label: &str, last: bool) -> String {
-        let ask = match (self, last) {
+    pub fn menu_step(self, label: &str, last: bool) -> String {
+        match (self, last) {
             (Lang::En, false) => {
                 format!("{label}?\n\nYes: {label}. No: the next choice. Cancel: close.")
             }
@@ -1059,10 +1122,6 @@ impl Lang {
             (Lang::De, true) => {
                 format!("{label}?\n\nJa: {label}. Nein oder Abbrechen: schließen.")
             }
-        };
-        match text {
-            Some(t) => format!("{t}\n\n{ask}"),
-            None => ask,
         }
     }
 }
@@ -1108,9 +1167,8 @@ mod tests {
     #[test]
     fn the_last_menu_step_offers_no_next_choice() {
         for t in [Lang::En, Lang::De] {
-            let next = t.menu_step(Some("Menu"), "Pair again", false);
-            let last = t.menu_step(None, "Uninstall", true);
-            assert!(next.starts_with("Menu\n\n"), "{next}");
+            let next = t.menu_step("Pair again", false);
+            let last = t.menu_step("Uninstall", true);
             assert!(
                 last.starts_with(t.pick("Uninstall?", "Uninstall?")),
                 "{last}"

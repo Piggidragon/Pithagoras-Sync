@@ -1336,7 +1336,7 @@ async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
         }
         assert!(
             shown[4].contains("--error")
-                && flat(&shown[4]).contains("su did not accept the password 3 times"),
+                && flat(&shown[4]).contains("The login password was not accepted 3 times"),
             "{shown:#?}"
         );
     }
