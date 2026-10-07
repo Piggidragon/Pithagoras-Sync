@@ -7,6 +7,7 @@ pub mod approve;
 pub mod audit;
 pub mod config;
 pub mod engine;
+pub mod keyring;
 #[cfg(unix)]
 pub mod notify;
 pub mod paths;
@@ -17,6 +18,8 @@ pub mod queue;
 pub mod rules;
 pub mod secret;
 pub mod settings;
+#[cfg(windows)]
+pub mod win;
 
 pub use approve::{Answer, ApprovalRequest, Approver, BoxFuture, NoApprover};
 pub use audit::{AuditLog, AuditRecord};

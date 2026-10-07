@@ -167,6 +167,7 @@ fn run(mock: &MockPortal, dev: Arc<Device>, token: &str) -> Running {
             spki_sha256: mock.spki.clone(),
             device_id: "dev-x".into(),
             name: "laptop".into(),
+            paired_ms: None,
         },
         token: token.into(),
     };

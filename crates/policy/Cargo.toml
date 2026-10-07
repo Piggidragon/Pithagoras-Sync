@@ -27,3 +27,4 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+sync-testkit.workspace = true

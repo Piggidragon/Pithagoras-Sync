@@ -14,35 +14,155 @@ pub trait Runner {
     fn try_run(&self, argv: &[String]) -> Result<String, String> {
         self.run(argv)
     }
+
+    /// Sets a string value under `HKEY_CURRENT_USER\<key>` (Windows); `name`
+    /// empty is the key's default value.
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String>;
+
+    /// Removes `HKEY_CURRENT_USER\<key>` and everything under it; a key that is
+    /// not there is no error.
+    fn reg_delete(&self, key: &str) -> Result<(), String>;
 }
 
 /// Runs real programs.
 pub struct System;
 
-impl System {
-    fn run_with(&self, argv: &[String], stderr: std::process::Stdio) -> Result<String, String> {
-        let (prog, args) = argv.split_first().ok_or("empty command")?;
-        let out = std::process::Command::new(prog)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(stderr)
-            .output()
-            .map_err(|e| format!("{prog}: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(format!("`{}` failed ({})", argv.join(" "), out.status))
+/// Without a console of its own (`gui` and a detached `run` let go of it), a
+/// console program the client starts (`schtasks`, the program's own
+/// `--version`) gets none either: Windows would open a window for each one
+/// over the dialogs. With a console it shares that one, its errors shown there.
+#[cfg(windows)]
+pub fn no_console_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // SAFETY: GetConsoleWindow has no preconditions.
+    if unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null() {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+#[cfg(not(windows))]
+pub fn no_console_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
+
+/// Lets go of the console (`gui` started by a double click, a detached `run`).
+/// `FreeConsole` leaves the standard handles that pointed into the console set:
+/// closed, or by then another object's. A program started with one of them
+/// inherited does not start (os error 6 or 50), and a print may land in that
+/// other object or fail. So they are cleared: the client's own output then
+/// goes nowhere, and the programs it starts get no handle for it.
+#[cfg(windows)]
+pub fn let_go_of_console() {
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let ids = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    // SAFETY: GetStdHandle, GetConsoleMode, FreeConsole and SetStdHandle have no
+    // preconditions; `mode` outlives the call that writes it. Only the handles
+    // of the console are cleared: a file or pipe given to the program stays.
+    unsafe {
+        let console = ids.map(|id| {
+            let mut mode = 0;
+            GetConsoleMode(GetStdHandle(id), &mut mode) != 0
+        });
+        FreeConsole();
+        for (id, console) in ids.into_iter().zip(console) {
+            if console {
+                SetStdHandle(id, std::ptr::null_mut());
+            }
         }
     }
 }
 
+/// How much of a program's error text goes into the error.
+const MAX_ERROR_TEXT: usize = 500;
+
+impl System {
+    /// Runs a program with none of the client's own handles: a window has no
+    /// console to share them with. Its error text goes into the error when
+    /// `why` (on one line, cut short), as it would have stood in the terminal.
+    fn run_with(&self, argv: &[String], why: bool) -> Result<String, String> {
+        let (prog, args) = argv.split_first().ok_or("empty command")?;
+        let out = no_console_window(&mut std::process::Command::new(prog))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let failed = format!("`{}` failed ({})", argv.join(" "), out.status);
+        let text = program_text(&out.stderr);
+        let text: String = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_ERROR_TEXT)
+            .collect();
+        if why && !text.is_empty() {
+            Err(format!("{failed}: {text}"))
+        } else {
+            Err(failed)
+        }
+    }
+}
+
+/// A console program's output. Windows' own programs write a pipe in the
+/// console's code page (OEM), not in UTF-8.
+fn program_text(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{CP_OEMCP, MultiByteToWideChar};
+        let len = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+        let mut wide = vec![0u16; len as usize];
+        // SAFETY: both buffers hold `len` elements and outlive the call; an
+        // OEM code page never makes more UTF-16 units than it had bytes.
+        let n = unsafe {
+            MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), len)
+        };
+        if n > 0 {
+            return String::from_utf16_lossy(&wide[..n as usize]);
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 impl Runner for System {
     fn run(&self, argv: &[String]) -> Result<String, String> {
-        self.run_with(argv, std::process::Stdio::inherit())
+        self.run_with(argv, true)
     }
 
     fn try_run(&self, argv: &[String]) -> Result<String, String> {
-        self.run_with(argv, std::process::Stdio::null())
+        self.run_with(argv, false)
+    }
+
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        return crate::registry::set_string(key, name, value);
+        #[cfg(not(windows))]
+        {
+            let _ = (key, name, value);
+            Err("the registry is Windows only".into())
+        }
+    }
+
+    fn reg_delete(&self, key: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        return crate::registry::delete_tree(key);
+        #[cfg(not(windows))]
+        {
+            let _ = key;
+            Err("the registry is Windows only".into())
+        }
     }
 }
 
@@ -65,10 +185,22 @@ pub enum Action {
     Run {
         argv: Vec<String>,
     },
-    /// May fail; `hint` tells the owner what to do then.
+    /// May fail; `hint` tells the owner what to do then. Empty: a failure is
+    /// no news (a task ended that did not run), and adds no note.
     Try {
         argv: Vec<String>,
         hint: String,
+    },
+    /// A string value under `HKEY_CURRENT_USER\<key>` (Windows; never another
+    /// hive). `name` empty is the key's default value.
+    RegSet {
+        key: String,
+        name: String,
+        value: String,
+    },
+    /// `HKEY_CURRENT_USER\<key>` and everything under it.
+    RegDelete {
+        key: String,
     },
 }
 
@@ -86,6 +218,11 @@ impl Action {
             Action::Remove { path } => format!("remove {}", path.display()),
             Action::Run { argv } => format!("run: {}", shell_words(argv)),
             Action::Try { argv, .. } => format!("run (may fail): {}", shell_words(argv)),
+            Action::RegSet { key, name, value } => format!(
+                "set HKCU\\{key} {} = {value}",
+                if name.is_empty() { "(default)" } else { name }
+            ),
+            Action::RegDelete { key } => format!("remove HKCU\\{key} and what is in it"),
         }
     }
 }
@@ -156,9 +293,21 @@ pub fn apply(actions: &[Action], root: &Path, runner: &dyn Runner) -> Result<Vec
                 runner.run(argv)?;
             }
             Action::Try { argv, hint } => {
-                if let Err(e) = runner.try_run(argv) {
+                if let Err(e) = runner.try_run(argv)
+                    && !hint.is_empty()
+                {
                     hints.push(format!("{e}: {hint}"));
                 }
+            }
+            Action::RegSet { key, name, value } => {
+                runner
+                    .reg_set(key, name, value)
+                    .map_err(|e| format!("HKCU\\{key}: {e}"))?;
+            }
+            Action::RegDelete { key } => {
+                runner
+                    .reg_delete(key)
+                    .map_err(|e| format!("HKCU\\{key}: {e}"))?;
             }
         }
     }
@@ -219,5 +368,142 @@ impl Runner for Fake {
             .find(|(k, _)| *k == key)
             .map(|(_, a)| a.clone())
             .unwrap_or(Ok(String::new()))
+    }
+
+    /// Recorded as `reg set <key> <name> <value>`.
+    fn reg_set(&self, key: &str, name: &str, value: &str) -> Result<(), String> {
+        self.run(&argv(&["reg", "set", key, name, value]))
+            .map(|_| ())
+    }
+
+    /// Recorded as `reg delete <key>`.
+    fn reg_delete(&self, key: &str) -> Result<(), String> {
+        self.run(&argv(&["reg", "delete", key])).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program that fails says why in the error, which a window shows: it
+    /// has no console its text could go to.
+    #[test]
+    fn a_failing_programs_own_words_are_in_the_error() {
+        #[cfg(unix)]
+        let fail = argv(&[
+            "sh",
+            "-c",
+            "echo 'no such task' >&2; echo second line >&2; exit 3",
+        ]);
+        #[cfg(windows)]
+        let fail = argv(&[
+            "cmd",
+            "/c",
+            "(echo no such task& echo second line) 1>&2 & exit 3",
+        ]);
+        let e = System.run(&fail).unwrap_err();
+        assert!(e.contains("failed"), "{e}");
+        assert!(e.ends_with(": no such task second line"), "{e}");
+        // A step that may fail is explained by its hint, not by the program.
+        let e = System.try_run(&fail).unwrap_err();
+        assert!(!e.ends_with("second line"), "{e}");
+    }
+
+    /// The console of a window started by a double click goes away (Windows
+    /// Terminal closes its handles): a program started after that with the
+    /// standard handles inherited still starts, and printing does not fail.
+    /// Run in a child process, which gives up its console.
+    #[cfg(windows)]
+    #[test]
+    fn programs_start_after_the_console_is_let_go() {
+        const CHILD: &str = "PITHAGORAS_SYNC_TEST_CONSOLE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            std::process::exit(without_console());
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "actions::tests::programs_start_after_the_console_is_let_go",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+    }
+
+    /// 0 when all went well, else which step failed.
+    #[cfg(windows)]
+    fn without_console() -> i32 {
+        use std::io::Write;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{
+            AllocConsole, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+        };
+        let open = |name: &str| -> HANDLE {
+            let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            // SAFETY: the name is NUL-terminated and outlives the call.
+            unsafe {
+                CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        // The standard handles point into a console, as for a double click.
+        let mut out = open("CONOUT$");
+        if out == INVALID_HANDLE_VALUE {
+            // SAFETY: AllocConsole has no preconditions.
+            unsafe { AllocConsole() };
+            out = open("CONOUT$");
+        }
+        let input = open("CONIN$");
+        if out == INVALID_HANDLE_VALUE || input == INVALID_HANDLE_VALUE {
+            return 2;
+        }
+        // SAFETY: the handles are ours; SetStdHandle has no preconditions.
+        unsafe {
+            SetStdHandle(STD_INPUT_HANDLE, input);
+            SetStdHandle(STD_OUTPUT_HANDLE, out);
+            SetStdHandle(STD_ERROR_HANDLE, out);
+        }
+        let_go_of_console();
+        // Gone, as Windows Terminal leaves them after FreeConsole.
+        // SAFETY: the handles are ours and not used again here.
+        unsafe {
+            CloseHandle(input);
+            CloseHandle(out);
+        }
+        let inherited = no_console_window(&mut std::process::Command::new("cmd"))
+            .args(["/c", "exit 0"])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+        if !inherited.is_ok_and(|s| s.success()) {
+            return 3;
+        }
+        if System.run(&argv(&["cmd", "/c", "exit 0"])).is_err() {
+            return 4;
+        }
+        let mut stdout = std::io::stdout();
+        if writeln!(stdout, "nobody reads this")
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            return 5;
+        }
+        0
     }
 }

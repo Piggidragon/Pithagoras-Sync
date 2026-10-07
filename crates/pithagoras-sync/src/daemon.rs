@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::control::{self, Reply, Request, Status};
-use sync_policy::config::{Elevation, SecretStorage};
+use sync_connector::token::TokenStore;
+use sync_policy::config::{Elevation, PortalConfig, SecretStorage};
+use sync_policy::keyring::SecretStore;
 use sync_policy::secret::Secret;
 
 pub struct Daemon {
@@ -32,7 +34,27 @@ pub struct Daemon {
     /// an update).
     restart: tokio::sync::Notify,
     restarting: std::sync::atomic::AtomicBool,
+    /// The OS keyring, for a token or password kept there.
+    keyring: Arc<dyn SecretStore>,
+    /// Why the stored password could not be loaded from the keyring, for
+    /// `status`; cleared once it is set or loaded.
+    secret_error: std::sync::Mutex<Option<String>>,
+    /// Counts what set or dropped the password (`panic`, `sudo set`, `sudo
+    /// clear`). A load from the keyring may wait minutes on its unlock prompt;
+    /// it keeps what it read only when nothing of these came in meanwhile.
+    secret_gen: std::sync::Mutex<u64>,
+    /// `sudo set` and `sudo clear` write the stored password one after the
+    /// other: a clear that comes in while a set waits on the keyring's prompt
+    /// runs after it, and so takes out what the set stored.
+    secret_writes: tokio::sync::Mutex<()>,
+    /// The pairing the running link was started for. A link that still runs
+    /// for the one before a new pairing is not reported connected: the window
+    /// that paired waits for the new one.
+    linked: std::sync::Mutex<Option<PortalConfig>>,
 }
+
+/// Why a request on the keyring was cut off at `control::keyring_work`.
+const KEYRING_SLOW: &str = "the keyring did not finish in time (a prompt left open, or a `sudo set` before it still waiting on one)";
 
 /// With `approvals.desktop_notifications` on a Linux desktop: each approval is also
 /// shown as a notification (Allow once / Deny) answering the same queue. Off by
@@ -188,13 +210,7 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
     );
     crate::secrets::scrub_log_with(device.secrets.clone());
     device.engine.seal(vec![crate::secrets::file(&dirs)]);
-    if cfg.policy.privilege.secret_storage == SecretStorage::File {
-        match crate::secrets::load(&crate::secrets::file(&dirs)) {
-            Ok(Some(s)) => device.secrets.set(s),
-            Ok(None) => {}
-            Err(e) => warn!("elevation password not loaded: {e}"),
-        }
-    }
+    let keyring = sync_policy::keyring::system(&dirs);
     info!(
         "started: profile {:?}, mode {:?}, landlock {landlock}, cgroups {}, approvals: {approvals}",
         cfg.profile,
@@ -227,7 +243,21 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         approvals,
         restart: tokio::sync::Notify::new(),
         restarting: std::sync::atomic::AtomicBool::new(false),
+        keyring,
+        secret_error: std::sync::Mutex::new(None),
+        secret_gen: std::sync::Mutex::new(0),
+        secret_writes: tokio::sync::Mutex::new(()),
+        linked: std::sync::Mutex::new(None),
     });
+
+    // The file (or nothing, for memory) before the link starts: reading it waits
+    // on nobody.
+    if daemon.store.config().policy.privilege.secret_storage != SecretStorage::Keyring
+        && let Err(e) = daemon.load_stored_secret().await
+    {
+        warn!("elevation password {e}");
+    }
+
     let (shutdown_tx, shutdown) = watch::channel(false);
     let control = tokio::spawn(serve_control(
         daemon.clone(),
@@ -241,6 +271,11 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
         status_tx,
         shutdown.clone(),
     ));
+    // The keyring after the control channel is up: it may ask the owner to
+    // unlock it, and `panic` must reach the client meanwhile.
+    if daemon.store.config().policy.privilege.secret_storage == SecretStorage::Keyring {
+        tokio::spawn(load_from_keyring(daemon.clone(), shutdown.clone()));
+    }
     wait_for_signals(&daemon).await;
     info!("shutting down");
     shutdown_tx.send_replace(true);
@@ -342,11 +377,20 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
 }
 
 impl Daemon {
-    fn link_config(&self) -> Result<Option<LinkConfig>, String> {
-        let Some(portal) = self.store.config().portal else {
+    fn tokens(&self, cfg: &DeviceConfig) -> TokenStore {
+        TokenStore::new(
+            self.dirs.token_file(),
+            cfg.token_storage,
+            self.keyring.clone(),
+        )
+    }
+
+    async fn link_config(&self) -> Result<Option<LinkConfig>, String> {
+        let cfg = self.store.config();
+        let Some(portal) = cfg.portal.clone() else {
             return Ok(None);
         };
-        let token = pair::load_token(&self.dirs.token_file())?;
+        let token = self.tokens(&cfg).load().await?;
         Ok(Some(LinkConfig { portal, token }))
     }
 
@@ -362,6 +406,12 @@ impl Daemon {
         Ok(())
     }
 
+    fn link_for(&self, paired: Option<&PortalConfig>) -> LinkStatus {
+        // Held while the state is read: supervise changes both under it.
+        let linked = self.linked.lock().unwrap();
+        link_for(self.link_status.borrow().clone(), linked.as_ref(), paired)
+    }
+
     pub fn status(&self) -> Status {
         let cfg = self.store.config();
         let info = self.device.info();
@@ -372,7 +422,7 @@ impl Daemon {
             portal: cfg.portal.as_ref().map(|p| p.url.clone()),
             device_id: cfg.portal.as_ref().map(|p| p.device_id.clone()),
             name: cfg.portal.as_ref().map(|p| p.name.clone()),
-            link: self.link_status.borrow().clone(),
+            link: self.link_for(cfg.portal.as_ref()),
             paused: self.device.is_paused(),
             mode: info.mode,
             mode_expires_ms: info.mode_expires_ms,
@@ -384,6 +434,7 @@ impl Daemon {
             portal_policy: cfg.portal_policy.as_str().into(),
             elevation: self.elevation_status(&cfg),
             elevation_password: self.device.secrets.is_set(),
+            token_storage: self.tokens(&cfg).describe().into(),
             running_commands: self.device.execs.running(),
             cgroups: self.device.execs.uses_cgroups(),
             landlock: self.device.engine.landlock_available(),
@@ -407,7 +458,7 @@ impl Daemon {
                 self.device.pause().await;
                 // Kept in memory only, the secret is gone until the owner types it
                 // again; a stored one comes back with unlock.
-                self.device.secrets.clear();
+                self.drop_secret();
                 Reply::ok()
             }
             Request::Unlock => {
@@ -417,8 +468,20 @@ impl Daemon {
                     return Reply::err(format!("cannot remove the pause marker: {e}"));
                 }
                 self.device.unlock();
-                self.load_stored_secret();
-                Reply::ok()
+                match tokio::time::timeout(
+                    crate::control::keyring_work(),
+                    self.load_stored_secret(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Reply::ok(),
+                    Ok(Err(e)) => {
+                        Reply::err(format!("unlocked, but the elevation password was {e}"))
+                    }
+                    Err(_) => Reply::err(format!(
+                        "unlocked, but the elevation password was not loaded: {KEYRING_SLOW}"
+                    )),
+                }
             }
             Request::Reload => match self.reload() {
                 Ok(()) => Reply::ok(),
@@ -447,25 +510,67 @@ impl Daemon {
                 self.restart.notify_one();
                 Reply::ok()
             }
-            Request::SecretSet { name, value } => match self.set_secret(&name, value) {
-                Ok(()) => Reply::ok(),
-                Err(e) => Reply::err(e),
-            },
+            // Within `keyring_work`, so the CLI hears how it ended before it
+            // stops waiting; cut off, the client has not taken the password.
+            Request::SecretSet { name, value } => {
+                match tokio::time::timeout(
+                    crate::control::keyring_work(),
+                    self.set_secret(&name, value),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Reply::ok(),
+                    Ok(Err(e)) => Reply::err(e),
+                    Err(_) => {
+                        info!("sudo set gave up: the keyring took too long");
+                        Reply::err(format!(
+                            "the password was not taken: {KEYRING_SLOW}; if it reached the keyring, `pithagoras-sync unlock` loads it and `sudo clear` removes it"
+                        ))
+                    }
+                }
+            }
             Request::SecretClear { name } => {
                 if name != crate::secrets::ELEVATION {
                     return Reply::err(format!("there is no secret {name}"));
                 }
-                self.device.secrets.clear();
-                if let Err(e) = crate::secrets::remove(&crate::secrets::file(&self.dirs)) {
-                    return Reply::err(e);
+                self.drop_secret();
+                let cleared =
+                    tokio::time::timeout(crate::control::keyring_work(), self.clear_stored()).await;
+                // Again: an `unlock` may have read the stored one before it was gone.
+                self.drop_secret();
+                match cleared {
+                    Ok(Ok(())) => {
+                        *self.secret_error.lock().unwrap() = None;
+                        info!("elevation password cleared");
+                        Reply::ok()
+                    }
+                    Ok(Err(e)) => Reply::err(e),
+                    Err(_) => {
+                        info!("sudo clear gave up: the keyring took too long");
+                        Reply::err(format!(
+                            "the client forgot the password, but a stored one may be left: {KEYRING_SLOW}; run `pithagoras-sync sudo clear` again"
+                        ))
+                    }
                 }
-                info!("elevation password cleared");
-                Reply::ok()
             }
         }
     }
 
-    fn set_secret(&self, name: &str, value: Secret) -> Result<(), String> {
+    /// Takes the stored password out, after a `sudo set` that is still storing
+    /// one.
+    async fn clear_stored(&self) -> Result<(), String> {
+        let _one = match self.secret_writes.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                info!("sudo clear waits for the sudo set before it");
+                self.secret_writes.lock().await
+            }
+        };
+        let storage = self.store.config().policy.privilege.secret_storage;
+        crate::secrets::forget(&self.dirs, storage, self.keyring.as_ref()).await
+    }
+
+    async fn set_secret(&self, name: &str, value: Secret) -> Result<(), String> {
         if name != crate::secrets::ELEVATION {
             return Err(format!("there is no secret {name}"));
         }
@@ -477,24 +582,74 @@ impl Daemon {
             return Err("the client is being traced; it does not take the password now".into());
         }
         crate::secrets::check(value.expose())?;
+        let _one = self.secret_writes.lock().await;
+        let started = *self.secret_gen.lock().unwrap();
         let storage = self.store.config().policy.privilege.secret_storage;
-        if storage == SecretStorage::File {
-            crate::secrets::save(&crate::secrets::file(&self.dirs), &value)?;
+        crate::secrets::store(&self.dirs, storage, self.keyring.as_ref(), &value).await?;
+        let mut generation = self.secret_gen.lock().unwrap();
+        // A `panic` or `sudo clear` while the keyring asked to be unlocked wins:
+        // the client does not hold the password it was given before them (a
+        // waiting clear takes the stored one out next).
+        if *generation != started {
+            info!("elevation password not taken: panic or sudo clear came in while it was stored");
+            return Err(format!(
+                "a panic or sudo clear came in while the password was stored ({}), so the client does not hold it; `pithagoras-sync unlock` loads a stored one again",
+                storage.as_str()
+            ));
         }
+        *generation += 1;
         self.device.secrets.set(value);
+        *self.secret_error.lock().unwrap() = None;
+        drop(generation);
         info!("elevation password set (kept in {})", storage.as_str());
         Ok(())
     }
 
-    fn load_stored_secret(&self) {
-        if self.store.config().policy.privilege.secret_storage != SecretStorage::File {
-            return;
+    /// Loads the password from the file or the keyring, where the owner keeps it
+    /// there. A keyring that fails is an error the owner hears of (`status`,
+    /// `unlock`), never a reason to look elsewhere.
+    async fn load_stored_secret(&self) -> Result<(), String> {
+        let storage = self.store.config().policy.privilege.secret_storage;
+        // Paused (`panic`), it stays forgotten until `unlock` loads it.
+        if (storage == SecretStorage::Keyring && !cfg!(target_os = "linux"))
+            || self.device.is_paused()
+        {
+            return Ok(());
         }
-        match crate::secrets::load(&crate::secrets::file(&self.dirs)) {
-            Ok(Some(s)) => self.device.secrets.set(s),
-            Ok(None) => {}
-            Err(e) => warn!("elevation password not loaded: {e}"),
+        let started = *self.secret_gen.lock().unwrap();
+        let loaded = crate::secrets::load_stored(&self.dirs, storage, self.keyring.as_ref()).await;
+        // Held to the end, so a `panic` cannot come in between the check and the set.
+        let generation = self.secret_gen.lock().unwrap();
+        if *generation != started || self.device.is_paused() {
+            info!(
+                "elevation password not loaded: panic, sudo set or sudo clear came in while it was read from {}",
+                storage.as_str()
+            );
+            return Ok(());
         }
+        let result = match loaded {
+            Ok(Some(s)) => {
+                self.device.secrets.set(s);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) if storage == SecretStorage::Keyring => Err(e),
+            Err(e) => {
+                warn!("elevation password not loaded: {e}");
+                Ok(())
+            }
+        };
+        *self.secret_error.lock().unwrap() = result.as_ref().err().cloned();
+        drop(generation);
+        result
+    }
+
+    /// Forgets the password in memory; a load still reading it does not put it
+    /// back.
+    fn drop_secret(&self) {
+        let mut generation = self.secret_gen.lock().unwrap();
+        *generation += 1;
+        self.device.secrets.clear();
     }
 
     fn elevation_status(&self, cfg: &DeviceConfig) -> String {
@@ -504,54 +659,138 @@ impl Daemon {
             Elevation::Sudo if self.device.secrets.is_set() => {
                 format!("sudo, password set (kept in {})", p.secret_storage.as_str())
             }
-            Elevation::Sudo => {
-                "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
-            }
+            Elevation::Sudo => match &*self.secret_error.lock().unwrap() {
+                Some(e) => format!("sudo, no password: it was {e}"),
+                None => {
+                    "sudo, no password set (sudo -n: only what sudoers allows without one)".into()
+                }
+            },
         }
     }
 }
 
+/// Loads the password from the keyring at start. A keyring service that is not
+/// there yet (the client started at login before it) is tried again, as for the
+/// token, until the password is loaded, the keyring says no, or the owner set,
+/// cleared or dropped it (`sudo set`, `sudo clear`, `panic`) meanwhile.
+async fn load_from_keyring(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
+    let first = *d.secret_gen.lock().unwrap();
+    let mut retry = KEYRING_RETRY;
+    loop {
+        let e = tokio::select! {
+            r = d.load_stored_secret() => match r {
+                Ok(()) => return,
+                Err(e) => e,
+            },
+            _ = until(&mut shutdown) => return,
+        };
+        if !sync_policy::keyring::may_come_later(&e) {
+            warn!(
+                "elevation password {e}; sudo commands run without it until `pithagoras-sync unlock` or `sudo set`"
+            );
+            return;
+        }
+        warn!(
+            "elevation password {e}; trying again in {}s",
+            retry.as_secs()
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(retry) => {}
+            _ = until(&mut shutdown) => return,
+        }
+        retry = (retry * 2).min(KEYRING_RETRY_MAX);
+        if *d.secret_gen.lock().unwrap() != first || d.device.is_paused() {
+            return;
+        }
+    }
+}
+
+/// The first wait before reading the token again from a keyring that was not
+/// there; it doubles up to `KEYRING_RETRY_MAX`.
+const KEYRING_RETRY: Duration = Duration::from_secs(3);
+const KEYRING_RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Keeps one link running for the current pairing; restarts it when a reload
 /// changed the pairing, and waits for one after the portal refused the device.
+/// A keyring service that is not there yet (the client started at login before
+/// it) is tried again; a keyring that said no waits for the owner.
 async fn supervise(
     d: Arc<Daemon>,
     mut relink: mpsc::Receiver<()>,
     status: watch::Sender<LinkStatus>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut retry = KEYRING_RETRY;
     loop {
-        let cfg = match d.link_config() {
+        let loaded = tokio::select! {
+            c = d.link_config() => c,
+            _ = until(&mut shutdown) => return,
+        };
+        let cfg = match loaded {
             Ok(Some(c)) => c,
             other => {
+                let again = match &other {
+                    Err(e) if sync_policy::keyring::may_come_later(e) => Some(retry),
+                    _ => None,
+                };
                 let why = match other {
+                    Err(e) if again.is_some() => {
+                        format!("{e}; trying again in {}s", retry.as_secs())
+                    }
                     Err(e) => e,
                     _ => "not paired: run `pithagoras-sync pair <uri>`".into(),
                 };
                 status.send_replace(LinkStatus::new(LinkState::Stopped, Some(why)));
+                let wait = async {
+                    match again {
+                        Some(t) => tokio::time::sleep(t).await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
-                    _ = relink.recv() => continue,
+                    _ = relink.recv() => retry = KEYRING_RETRY,
+                    _ = wait => retry = (retry * 2).min(KEYRING_RETRY_MAX),
                     _ = until(&mut shutdown) => return,
                 }
+                continue;
             }
         };
-        let current = (cfg.portal.clone(), cfg.token.clone());
+        retry = KEYRING_RETRY;
+        let pairing = cfg.portal.clone();
+        // Until the new link says otherwise, not the old link's state.
+        {
+            let mut linked = d.linked.lock().unwrap();
+            status.send_replace(LinkStatus::new(LinkState::Connecting, None));
+            *linked = Some(cfg.portal.clone());
+        }
         let (stop, stop_rx) = watch::channel(false);
         let mut task = tokio::spawn(link::run(d.device.clone(), cfg, status.clone(), stop_rx));
+        // A reload comes with every policy change; only a new pairing (or
+        // none) brings a new token, and every pairing changes the portal block
+        // (`paired_ms`), so the token is read again only then. A read of the
+        // keyring may ask to unlock it.
+        let repaired = || d.store.config().portal.as_ref() != Some(&pairing);
         loop {
             tokio::select! {
                 end = &mut task => {
                     if let Ok(link::LinkEnd::Rejected(why)) = end {
                         warn!("{why}");
                     }
-                    // Down until the owner pairs again (or the client stops).
-                    tokio::select! {
-                        _ = relink.recv() => break,
-                        _ = until(&mut shutdown) => return,
+                    // Down until the owner pairs again or unpairs (or the
+                    // client stops): the token the portal refused is not
+                    // tried again.
+                    loop {
+                        tokio::select! {
+                            _ = relink.recv() => if repaired() {
+                                break;
+                            },
+                            _ = until(&mut shutdown) => return,
+                        }
                     }
+                    break;
                 }
                 _ = relink.recv() => {
-                    let same = matches!(d.link_config(), Ok(Some(c)) if (c.portal.clone(), c.token.clone()) == current);
-                    if !same {
+                    if repaired() {
                         stop.send_replace(true);
                         let _ = (&mut task).await;
                         break;
@@ -564,6 +803,31 @@ async fn supervise(
                 }
             }
         }
+    }
+}
+
+/// The link's state, connected only for the pairing in the config: right after
+/// a new pairing the link to the old portal may still be up (`linked`).
+fn link_for(
+    link: LinkStatus,
+    linked: Option<&PortalConfig>,
+    paired: Option<&PortalConfig>,
+) -> LinkStatus {
+    if link.state != LinkState::Connected || linked == paired {
+        return link;
+    }
+    match paired {
+        Some(_) => LinkStatus {
+            state: LinkState::Connecting,
+            detail: Some("switching to the new pairing".into()),
+            since_ms: link.since_ms,
+        },
+        // `unpair`: nothing connects again.
+        None => LinkStatus {
+            state: LinkState::Stopped,
+            detail: Some("not paired: the link to the old portal is closing".into()),
+            since_ms: link.since_ms,
+        },
     }
 }
 
@@ -771,6 +1035,41 @@ async fn serve_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_old_link_is_not_connected_for_a_new_pairing() {
+        use super::{LinkState, LinkStatus, PortalConfig, link_for};
+        let portal = |url: &str, id: &str| PortalConfig {
+            url: url.into(),
+            spki_sha256: None,
+            device_id: id.into(),
+            name: "box".into(),
+            paired_ms: Some(1),
+        };
+        let a = portal("https://a.example", "d1");
+        let b = portal("https://b.example", "d2");
+        let up = LinkStatus::new(LinkState::Connected, Some(a.url.clone()));
+        assert_eq!(
+            link_for(up.clone(), Some(&a), Some(&a)).state,
+            LinkState::Connected
+        );
+        // Paired again, with the same device id too.
+        let again = PortalConfig {
+            paired_ms: Some(2),
+            ..a.clone()
+        };
+        for paired in [&b, &again] {
+            let s = link_for(up.clone(), Some(&a), Some(paired));
+            assert_eq!(s.state, LinkState::Connecting);
+            assert_eq!(s.detail.as_deref(), Some("switching to the new pairing"));
+        }
+        // Unpaired: nothing to switch to.
+        let s = link_for(up.clone(), Some(&a), None);
+        assert_eq!(s.state, LinkState::Stopped);
+        assert!(s.detail.unwrap().starts_with("not paired"));
+        let down = LinkStatus::new(LinkState::Waiting, Some("closed".into()));
+        assert_eq!(link_for(down, Some(&a), Some(&b)).state, LinkState::Waiting);
+    }
+
     #[test]
     fn the_root_refusal_names_what_works_on_each_platform() {
         let linux = super::root_refusal(false);

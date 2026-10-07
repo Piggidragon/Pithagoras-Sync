@@ -3,6 +3,10 @@
 //! Linux: a systemd user unit (desktop, or a server user with lingering), or with
 //! `--system` a system unit (`User=` a dedicated user, or root). Windows: a
 //! per-user logon task in Task Scheduler, not a service (session 0 has no desktop).
+//!
+//! On a desktop, `install` also registers the program for `pithagoras-sync://`
+//! links, so the pairing link in the portal opens it: a `.desktop` file and an
+//! icon on Linux, a key under `HKEY_CURRENT_USER\Software\Classes` on Windows.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +14,28 @@ use crate::actions::{Action, argv};
 
 pub const UNIT_NAME: &str = "pithagoras-sync.service";
 pub const TASK_NAME: &str = "Pithagoras Sync";
+
+/// Whether the logon task `install` makes is there (Windows): for the window's
+/// menu and `uninstall --purge` alike.
+pub fn task_installed(runner: &dyn crate::actions::Runner) -> bool {
+    runner
+        .try_run(&crate::actions::argv(&[
+            "schtasks", "/Query", "/TN", TASK_NAME,
+        ]))
+        .is_ok()
+}
 pub const SYSTEM_BIN: &str = "/usr/local/bin/pithagoras-sync";
+/// Where `install` puts the program for one user on Linux, below the home
+/// directory: the user unit, the desktop entry and the windows all name it.
+pub const USER_PROGRAM: &str = ".local/bin/pithagoras-sync";
+/// The URI scheme of the pairing link.
+pub const SCHEME: &str = "pithagoras-sync";
+/// The desktop entry, in `<data home>/applications`.
+pub const DESKTOP_FILE: &str = "pithagoras-sync.desktop";
+/// The icon, built into the program (the release is one file).
+pub const ICON: &[u8] = include_bytes!("../../../assets/pithagoras-sync.svg");
+/// The link handler's key under `HKEY_CURRENT_USER`.
+pub const WINDOWS_CLASS_KEY: &str = r"Software\Classes\pithagoras-sync";
 const DESCRIPTION: &str = "Pithagoras Sync: lets a Pithagoras portal's agent reach this computer";
 const DOCS: &str = "https://github.com/Piggidragon/Pithagoras-Sync";
 
@@ -24,7 +49,36 @@ KillMode=control-group
 UMask=0077
 ";
 
-/// The user unit. The program lives in `~/.local/bin`.
+/// Where `install` puts the program on Windows, below `%LOCALAPPDATA%`.
+pub const WINDOWS_PROGRAM: &str = r"Programs\pithagoras-sync\pithagoras-sync.exe";
+/// Where `install` puts the user unit on Linux, below the home directory.
+const USER_UNIT_FOLDER: &str = ".config/systemd/user";
+
+/// The program `install` puts in `home` (`USER_PROGRAM`).
+pub fn user_program(home: &Path) -> PathBuf {
+    home.join(USER_PROGRAM)
+}
+
+/// The folder of the user unit in `home`.
+pub fn user_unit_folder(home: &Path) -> PathBuf {
+    home.join(USER_UNIT_FOLDER)
+}
+
+/// The user unit `install` writes in `home`.
+pub fn user_unit_file(home: &Path) -> PathBuf {
+    user_unit_folder(home).join(UNIT_NAME)
+}
+
+/// The program `install` puts in `local_app_data` (`%LOCALAPPDATA%`), built with
+/// `\` whichever platform computes it (tests run on Linux).
+pub fn windows_program(local_app_data: &str) -> String {
+    format!(
+        r"{}\{WINDOWS_PROGRAM}",
+        local_app_data.trim_end_matches('\\')
+    )
+}
+
+/// The user unit. The program lives in `~/.local/bin` (`USER_PROGRAM`).
 pub fn user_unit() -> String {
     format!(
         "[Unit]
@@ -32,7 +86,7 @@ Description={DESCRIPTION}
 Documentation={DOCS}
 
 [Service]
-ExecStart=%h/.local/bin/pithagoras-sync run
+ExecStart=%h/{USER_PROGRAM} run
 {SERVICE_BODY}
 [Install]
 WantedBy=default.target
@@ -87,11 +141,11 @@ pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Actio
     let mut v = vec![
         Action::Copy {
             from: exe.to_path_buf(),
-            to: home.join(".local/bin/pithagoras-sync"),
+            to: user_program(home),
             mode: 0o755,
         },
         Action::Write {
-            path: home.join(".config/systemd/user").join(UNIT_NAME),
+            path: user_unit_file(home),
             content: user_unit().into_bytes(),
             mode: 0o644,
         },
@@ -113,6 +167,124 @@ pub fn user_plan(home: &Path, exe: &Path, user: &str, linger: bool) -> Vec<Actio
     v
 }
 
+/// The desktop entry's `Exec=` program, quoted as the Desktop Entry
+/// Specification asks: inside double quotes `"`, `` ` ``, `$` and `\` take a
+/// backslash, then every backslash is doubled for the file's string escapes, and
+/// `%` is doubled since it starts a field code.
+fn desktop_exec_arg(program: &str) -> String {
+    let mut q = String::from("\"");
+    for c in program.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    q.replace('\\', "\\\\").replace('%', "%%")
+}
+
+/// The `.desktop` file: in the menu as "Pithagoras Sync", the handler of
+/// `pithagoras-sync://` links. Both start `gui`, which takes the link when
+/// there is one (`%u`).
+pub fn desktop_entry(program: &Path) -> Result<String, String> {
+    let p = program
+        .to_str()
+        .filter(|p| !p.chars().any(char::is_control))
+        .ok_or_else(|| format!("{}: not a path a desktop entry can name", program.display()))?;
+    Ok(format!(
+        "[Desktop Entry]
+Type=Application
+Name=Pithagoras Sync
+Comment=Lets your Pithagoras portal's agent reach this computer
+Comment[de]=Lässt den Agenten deines Pithagoras-Portals diesen Computer erreichen
+Exec={} gui %u
+Icon=pithagoras-sync
+Terminal=false
+Categories=Network;
+MimeType=x-scheme-handler/{SCHEME};
+",
+        desktop_exec_arg(p)
+    ))
+}
+
+/// The icon's path below the data home.
+pub fn icon_path(data_home: &Path) -> PathBuf {
+    data_home.join("icons/hicolor/scalable/apps/pithagoras-sync.svg")
+}
+
+/// The desktop entry, the icon and the link handler for the program `install`
+/// put in place. The two tools are best effort: one that is missing is a note.
+pub fn desktop_plan(data_home: &Path, program: &Path) -> Result<Vec<Action>, String> {
+    let apps = data_home.join("applications");
+    Ok(vec![
+        Action::Write {
+            path: icon_path(data_home),
+            content: ICON.to_vec(),
+            mode: 0o644,
+        },
+        Action::Write {
+            path: apps.join(DESKTOP_FILE),
+            content: desktop_entry(program)?.into_bytes(),
+            mode: 0o644,
+        },
+        Action::Try {
+            argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
+            hint: "the menu may show Pithagoras Sync only after the next login".into(),
+        },
+        Action::Try {
+            argv: argv(&[
+                "xdg-mime",
+                "default",
+                DESKTOP_FILE,
+                &format!("x-scheme-handler/{SCHEME}"),
+            ]),
+            hint: "pairing links may not open Pithagoras Sync; paste the link into it instead (Pithagoras Sync in the menu)".into(),
+        },
+    ])
+}
+
+/// Undoes `desktop_plan`. The `x-scheme-handler` line `xdg-mime` wrote to
+/// `mimeapps.list` stays: the file is the desktop's, and the line leads nowhere
+/// once the entry is gone.
+pub fn desktop_uninstall_plan(data_home: &Path) -> Vec<Action> {
+    let apps = data_home.join("applications");
+    vec![
+        Action::Remove {
+            path: apps.join(DESKTOP_FILE),
+        },
+        Action::Remove {
+            path: icon_path(data_home),
+        },
+        Action::Try {
+            argv: argv(&["update-desktop-database", &apps.to_string_lossy()]),
+            hint: "the menu may show Pithagoras Sync until the next login".into(),
+        },
+    ]
+}
+
+/// The `pithagoras-sync://` handler on Windows, for the program at `exe`:
+/// `HKCU\Software\Classes\pithagoras-sync` with `URL Protocol` and the command
+/// `"<exe>" "%1"`.
+pub fn windows_link_plan(exe: &str) -> Vec<Action> {
+    let set = |key: &str, name: &str, value: &str| Action::RegSet {
+        key: key.to_string(),
+        name: name.to_string(),
+        value: value.to_string(),
+    };
+    let command = format!(r"{WINDOWS_CLASS_KEY}\shell\open\command");
+    vec![
+        set(WINDOWS_CLASS_KEY, "", "URL:Pithagoras Sync pairing link"),
+        set(WINDOWS_CLASS_KEY, "URL Protocol", ""),
+        set(&command, "", &format!("\"{exe}\" \"%1\"")),
+    ]
+}
+
+pub fn windows_link_uninstall_plan() -> Vec<Action> {
+    vec![Action::RegDelete {
+        key: WINDOWS_CLASS_KEY.into(),
+    }]
+}
+
 pub fn user_uninstall_plan(home: &Path) -> Vec<Action> {
     vec![
         Action::Try {
@@ -120,7 +292,7 @@ pub fn user_uninstall_plan(home: &Path) -> Vec<Action> {
             hint: "the unit was not enabled".into(),
         },
         Action::Remove {
-            path: home.join(".config/systemd/user").join(UNIT_NAME),
+            path: user_unit_file(home),
         },
         Action::Run {
             argv: argv(&["systemctl", "--user", "daemon-reload"]),
@@ -179,6 +351,117 @@ pub fn system_stop_plan() -> Vec<Action> {
         argv: argv(&["systemctl", "stop", UNIT_NAME]),
         hint: "it was not running".into(),
     }]
+}
+
+/// What the unit or task was before `uninstall --purge` stopped it, so a purge
+/// that fails puts back that and no more: a unit the owner had switched off
+/// stays off, and a client that was not running is not started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Before {
+    /// Switched on: starts with the login or the machine.
+    pub enabled: bool,
+    /// A client was running: the unit was up, or one answered on the control
+    /// channel (Windows has no state of the task to ask that is not in the
+    /// system's language).
+    pub running: bool,
+}
+
+/// Asks the service manager what the unit or task is now, before the purge
+/// stops it. `client_running`: a client answered on the control channel.
+/// What it cannot find out counts as off, so a failed purge never switches on
+/// what it does not know was on.
+pub fn state_before(
+    windows: bool,
+    system: bool,
+    runner: &dyn crate::actions::Runner,
+    client_running: bool,
+) -> Before {
+    if windows {
+        let enabled = runner
+            .try_run(&argv(&["schtasks", "/Query", "/TN", TASK_NAME, "/XML"]))
+            .is_ok_and(|xml| task_enabled(&xml));
+        return Before {
+            enabled,
+            running: client_running,
+        };
+    }
+    let systemctl = |args: &[&str]| {
+        let mut a = vec!["systemctl"];
+        if !system {
+            a.push("--user");
+        }
+        a.extend(args);
+        a.push(UNIT_NAME);
+        runner.try_run(&argv(&a))
+    };
+    // `is-enabled` exits non-zero for anything that is not switched on.
+    let enabled = systemctl(&["is-enabled"]).is_ok_and(|s| s.trim() == "enabled");
+    // A unit between two starts (`activating`) is up as well.
+    let active = systemctl(&["show", "-p", "ActiveState", "--value"])
+        .is_ok_and(|s| !matches!(s.trim(), "" | "inactive" | "failed"));
+    Before {
+        enabled,
+        running: client_running || active,
+    }
+}
+
+/// Whether the logon task's definition (`schtasks /Query /XML`) has it
+/// switched on: `<Enabled>false</Enabled>` in its settings is off, the same in
+/// every language. A definition without its settings counts as off.
+pub fn task_enabled(xml: &str) -> bool {
+    let Some(settings) = xml
+        .find("<Settings>")
+        .and_then(|i| xml[i..].find("</Settings>").map(|j| &xml[i..i + j]))
+    else {
+        return false;
+    };
+    // Task Scheduler leaves the element out where it is on (the default).
+    match settings.find("<Enabled>") {
+        None => true,
+        Some(i) => {
+            let rest = &settings[i + "<Enabled>".len()..];
+            rest.split('<').next().is_some_and(|v| v.trim() == "true")
+        }
+    }
+}
+
+/// Puts back what the stop of `uninstall --purge` (and the `disable` of the
+/// uninstall after it) changed, as `before` says it was, when the purge fails
+/// while the unit or task is still there. Empty where nothing was on.
+pub fn restart_plan(windows: bool, system: bool, before: Before) -> Vec<Action> {
+    if windows {
+        // A switched-off task cannot be run, so a client started by hand
+        // beside it is not started again.
+        if !before.enabled {
+            return Vec::new();
+        }
+        let mut plan = vec![Action::Run {
+            argv: argv(&["schtasks", "/Change", "/TN", TASK_NAME, "/ENABLE"]),
+        }];
+        if before.running {
+            plan.push(Action::Try {
+                argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
+                hint: "the task starts it within a minute".into(),
+            });
+        }
+        return plan;
+    }
+    let systemctl = |what: &str| {
+        let mut a = vec!["systemctl"];
+        if !system {
+            a.push("--user");
+        }
+        a.extend([what, UNIT_NAME]);
+        Action::Run { argv: argv(&a) }
+    };
+    let mut plan = Vec::new();
+    if before.enabled {
+        plan.push(systemctl("enable"));
+    }
+    if before.running {
+        plan.push(systemctl("start"));
+    }
+    plan
 }
 
 fn xml_escape(s: &str) -> String {
@@ -330,14 +613,15 @@ pub fn current_user_sid() -> Result<String, String> {
 /// same whichever platform computes it (tests run it on Linux).
 pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Action> {
     let base = local_app_data.trim_end_matches('\\');
-    let target = format!(r"{base}\Programs\pithagoras-sync\pithagoras-sync.exe");
+    let target = windows_program(base);
     let xml_path = format!(r"{base}\pithagoras-sync\logon-task.xml");
-    vec![
+    let mut plan = vec![
         // A running client holds its program open, and the copy over it would fail:
         // `install` again (to repair or update by hand) ends the task first.
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
+            // Not running (every first install): no news, no note.
+            hint: String::new(),
         },
         Action::Copy {
             from: exe.to_path_buf(),
@@ -358,7 +642,9 @@ pub fn windows_plan(local_app_data: &str, exe: &Path, user_id: &str) -> Vec<Acti
             argv: argv(&["schtasks", "/Run", "/TN", TASK_NAME]),
             hint: "it starts at the next logon".into(),
         },
-    ]
+    ];
+    plan.extend(windows_link_plan(&target));
+    plan
 }
 
 /// `user_stop_plan` for the logon task: switched off first, or its minute
@@ -371,31 +657,114 @@ pub fn windows_stop_plan() -> Vec<Action> {
         },
         Action::Try {
             argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
+            // Not running (every first install): no news, no note.
+            hint: String::new(),
         },
     ]
 }
 
-pub fn windows_uninstall_plan(local_app_data: &str) -> Vec<Action> {
+/// `task`: whether the logon task is there (`task_installed`). Without it
+/// there is nothing to end or delete, and `uninstall` again succeeds.
+pub fn windows_uninstall_plan(local_app_data: &str, task: bool) -> Vec<Action> {
     let base = local_app_data.trim_end_matches('\\');
-    vec![
-        Action::Try {
-            argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
-            hint: "it was not running".into(),
-        },
-        Action::Run {
-            argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
-        },
-        Action::Remove {
-            path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
-        },
-    ]
+    let mut plan = Vec::new();
+    if task {
+        plan.extend([
+            Action::Try {
+                argv: argv(&["schtasks", "/End", "/TN", TASK_NAME]),
+                // Not running (every first install): no news, no note.
+                hint: String::new(),
+            },
+            Action::Run {
+                argv: argv(&["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]),
+            },
+        ]);
+    }
+    plan.push(Action::Remove {
+        path: PathBuf::from(format!(r"{base}\pithagoras-sync\logon-task.xml")),
+    });
+    plan.extend(windows_link_uninstall_plan());
+    plan
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actions::{Fake, apply};
+
+    /// Only the task's own setting counts, not its triggers'; a definition
+    /// that cannot be read counts as off.
+    #[test]
+    fn a_switched_off_task_is_read_from_its_settings() {
+        let on = task_xml("S-1-5-21-1", r"C:\p.exe");
+        assert!(task_enabled(&on));
+        let settings_off = on.replace(
+            "<Enabled>true</Enabled>\n  </Settings>",
+            "<Enabled>false</Enabled>\n  </Settings>",
+        );
+        assert_ne!(settings_off, on);
+        assert!(!task_enabled(&settings_off));
+        let triggers_off = on.replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 2);
+        assert!(task_enabled(&triggers_off));
+        assert!(task_enabled(&on.replace(
+            "    <Enabled>true</Enabled>\n  </Settings>",
+            "  </Settings>"
+        )));
+        assert!(!task_enabled(""));
+        assert!(!task_enabled("ERROR: access denied"));
+    }
+
+    /// What the unit was before the purge, asked of systemd, with what it
+    /// cannot tell taken as off.
+    #[test]
+    fn the_state_before_the_purge_is_asked_of_the_service_manager() {
+        let fake = |enabled: Result<&str, &str>, active: &str| Fake {
+            answers: vec![
+                (
+                    "systemctl is-enabled".into(),
+                    enabled.map(String::from).map_err(String::from),
+                ),
+                ("systemctl show".into(), Ok(active.into())),
+            ],
+            ..Fake::default()
+        };
+        let b = |enabled, running| Before { enabled, running };
+        for (enabled, active, client, want) in [
+            (Ok("enabled\n"), "active\n", false, b(true, true)),
+            (Ok("enabled\n"), "activating\n", false, b(true, true)),
+            (Err("disabled"), "inactive\n", false, b(false, false)),
+            (Err("disabled"), "failed\n", true, b(false, true)),
+            (Ok("static\n"), "inactive\n", false, b(false, false)),
+            (Err("no bus"), "", false, b(false, false)),
+        ] {
+            let f = fake(enabled, active);
+            assert_eq!(
+                state_before(false, true, &f, client),
+                want,
+                "{enabled:?} {active}"
+            );
+        }
+        // The user unit is asked with --user.
+        let f = Fake::default();
+        state_before(false, false, &f, false);
+        let ran = f.ran.lock().unwrap();
+        assert_eq!(ran.len(), 2);
+        assert!(ran.iter().all(|a| a[1] == "--user"), "{ran:?}");
+        // Windows: the task's definition, and the control channel for the client.
+        let f = Fake {
+            answers: vec![(
+                "schtasks /Query".into(),
+                Ok(task_xml("S-1-5-21-1", r"C:\p.exe")),
+            )],
+            ..Fake::default()
+        };
+        assert_eq!(state_before(true, false, &f, true), b(true, true));
+        let f = Fake {
+            answers: vec![("schtasks /Query".into(), Err("no such task".into()))],
+            ..Fake::default()
+        };
+        assert_eq!(state_before(true, false, &f, false), b(false, false));
+    }
 
     #[test]
     fn the_logon_task_is_switched_off_before_it_is_ended() {
@@ -574,6 +943,192 @@ mod tests {
         let ran = fake.ran.lock().unwrap().clone();
         assert!(ran.contains(&argv(&["systemctl", "enable", "--now", UNIT_NAME])));
         assert!(ran.contains(&argv(&["systemctl", "disable", "--now", UNIT_NAME])));
+    }
+
+    #[test]
+    fn the_desktop_entry_opens_pairing_links_and_the_menu_with_gui() {
+        let e = desktop_entry(Path::new("/home/someone/.local/bin/pithagoras-sync")).unwrap();
+        assert!(e.contains("\nExec=\"/home/someone/.local/bin/pithagoras-sync\" gui %u\n"));
+        assert!(e.contains("\nMimeType=x-scheme-handler/pithagoras-sync;\n"));
+        assert!(e.contains("\nTerminal=false\n"));
+        assert!(e.contains("\nIcon=pithagoras-sync\n"));
+        assert!(e.contains("\nCategories=Network;\n"));
+        assert!(e.contains("\nName=Pithagoras Sync\n"));
+        // Quoted as the spec says: no space, quote, `$` or `%` in the path can
+        // add an argument, expand a variable or become a field code.
+        let e = desktop_entry(Path::new("/home/a b/$x \"q\" 100%/p\\s")).unwrap();
+        assert!(
+            e.contains(r#"Exec="/home/a b/\\$x \\"q\\" 100%%/p\\\\s" gui %u"#),
+            "{e}"
+        );
+        // A path with a line break could add lines to the file.
+        assert!(desktop_entry(Path::new("/home/a\nExec=evil/p")).is_err());
+        assert!(desktop_plan(Path::new("/d"), Path::new("/x\ry")).is_err());
+    }
+
+    /// The desktop entry is Linux's: its folders are Unix paths, which a
+    /// `join` on Windows would write with `\`.
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_register_and_remove_the_link_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let data = Path::new("/home/someone/.local/share");
+        let program = Path::new("/home/someone/.local/bin/pithagoras-sync");
+        let fake = Fake::default();
+        apply(&desktop_plan(data, program).unwrap(), root.path(), &fake).unwrap();
+        let r = root.path();
+        let entry = r.join("home/someone/.local/share/applications/pithagoras-sync.desktop");
+        let icon =
+            r.join("home/someone/.local/share/icons/hicolor/scalable/apps/pithagoras-sync.svg");
+        assert_eq!(
+            std::fs::read_to_string(&entry).unwrap(),
+            desktop_entry(program).unwrap()
+        );
+        assert_eq!(std::fs::read(&icon).unwrap(), ICON);
+        let ran = fake.ran.lock().unwrap().clone();
+        assert_eq!(
+            ran,
+            [
+                argv(&[
+                    "update-desktop-database",
+                    "/home/someone/.local/share/applications"
+                ]),
+                argv(&[
+                    "xdg-mime",
+                    "default",
+                    "pithagoras-sync.desktop",
+                    "x-scheme-handler/pithagoras-sync"
+                ]),
+            ]
+        );
+        // A missing tool is a note, not a failed install.
+        let missing = Fake {
+            answers: vec![("xdg-mime default".into(), Err("xdg-mime: not found".into()))],
+            ..Fake::default()
+        };
+        let hints = apply(&desktop_plan(data, program).unwrap(), r, &missing).unwrap();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("paste the link"), "{hints:?}");
+        apply(&desktop_uninstall_plan(data), r, &Fake::default()).unwrap();
+        assert!(!entry.exists() && !icon.exists());
+        // The plans as `--print` lists them.
+        let listed: Vec<String> = desktop_plan(data, program)
+            .unwrap()
+            .iter()
+            .map(Action::describe)
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.ends_with("applications/pithagoras-sync.desktop"))
+        );
+        assert!(listed.iter().any(|l| l.contains("xdg-mime default")));
+    }
+
+    /// Ending a logon task that does not run (on every first install) is no
+    /// news: it adds no note. A start that failed does.
+    #[test]
+    fn a_task_that_was_not_running_adds_no_note() {
+        let tries = |plan: Vec<Action>| -> Vec<Action> {
+            plan.into_iter()
+                .filter(|a| matches!(a, Action::Try { .. }))
+                .collect()
+        };
+        let fake = Fake {
+            answers: vec![
+                ("schtasks /End".into(), Err("`schtasks /End` failed".into())),
+                ("schtasks /Run".into(), Err("`schtasks /Run` failed".into())),
+            ],
+            ..Fake::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let install = tries(windows_plan(r"C:\x", Path::new("p.exe"), "S-1"));
+        assert_eq!(
+            apply(&install, root.path(), &fake).unwrap(),
+            ["`schtasks /Run` failed: it starts at the next logon"]
+        );
+        for plan in [windows_stop_plan(), windows_uninstall_plan(r"C:\x", true)] {
+            assert_eq!(
+                apply(&tries(plan), root.path(), &fake).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn the_windows_link_handler_is_the_current_users_alone() {
+        let plan = windows_plan(
+            r"C:\Users\ann\AppData\Local",
+            Path::new("pithagoras-sync.exe"),
+            "S-1-5-21-1",
+        );
+        let fake = Fake::default();
+        let root = tempfile::tempdir().unwrap();
+        let regs: Vec<Action> = plan
+            .into_iter()
+            .filter(|a| matches!(a, Action::RegSet { .. }))
+            .collect();
+        apply(&regs, root.path(), &fake).unwrap();
+        let ran = fake.ran.lock().unwrap().clone();
+        let exe = r"C:\Users\ann\AppData\Local\Programs\pithagoras-sync\pithagoras-sync.exe";
+        assert_eq!(
+            ran,
+            [
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync",
+                    "",
+                    "URL:Pithagoras Sync pairing link"
+                ]),
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync",
+                    "URL Protocol",
+                    ""
+                ]),
+                argv(&[
+                    "reg",
+                    "set",
+                    r"Software\Classes\pithagoras-sync\shell\open\command",
+                    "",
+                    &format!("\"{exe}\" \"%1\"")
+                ]),
+            ]
+        );
+        assert!(
+            regs[0]
+                .describe()
+                .starts_with(r"set HKCU\Software\Classes\pithagoras-sync")
+        );
+        let un = windows_uninstall_plan(r"C:\Users\ann\AppData\Local", true);
+        assert_eq!(
+            un.last(),
+            Some(&Action::RegDelete {
+                key: r"Software\Classes\pithagoras-sync".into()
+            })
+        );
+        let schtasks = |plan: &[Action]| -> Vec<String> {
+            plan.iter()
+                .filter_map(|a| match a {
+                    Action::Try { argv, .. } | Action::Run { argv } => Some(argv[1].clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(schtasks(&un), ["/End", "/Delete"]);
+        // Uninstalled already: nothing for schtasks to fail on, the rest again.
+        let again = windows_uninstall_plan(r"C:\Users\ann\AppData\Local", false);
+        assert!(schtasks(&again).is_empty(), "{again:?}");
+        assert_eq!(again[..], un[2..]);
+        // The real runner refuses the registry off Windows rather than doing
+        // something else.
+        #[cfg(not(windows))]
+        assert!(
+            crate::actions::Runner::reg_set(&crate::actions::System, "Software\\x", "", "")
+                .is_err()
+        );
     }
 
     #[test]

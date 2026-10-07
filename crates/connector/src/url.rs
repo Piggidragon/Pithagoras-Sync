@@ -78,8 +78,21 @@ impl PortalUrl {
             None => 80,
         };
         let base = path.trim_end_matches('/').to_string();
-        if base.split('/').any(|c| c == ".." || c == ".") {
-            return Err(bad("no . or .. in the path"));
+        // The URL is shown to the owner before pairing: a path with spaces,
+        // quotes or other scripts could read as more text of the question.
+        if !plain_path(&base) {
+            return Err(bad(
+                "the path may hold only letters, digits, - . _ ~ / and %XX escapes",
+            ));
+        }
+        // Checked decoded: a server or proxy that decodes `%2e` or `%2f`
+        // would otherwise resolve the endpoints outside the path shown.
+        let decoded = pct_bytes(&base, false).ok_or_else(|| bad("bad escape in the path"))?;
+        if decoded
+            .split(|c| matches!(c, b'/' | b'\\'))
+            .any(|c| c == b".." || c == b".")
+        {
+            return Err(bad("no . or .. in the path, escaped or not"));
         }
         Ok(PortalUrl {
             tls,
@@ -118,11 +131,34 @@ impl fmt::Display for PortalUrl {
     }
 }
 
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+/// ASCII letters, digits, `-._~/` and `%` with two hex digits.
+fn plain_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if b
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                i += 3
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'/') => {
+                i += 1
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `s` without `prefix`, matched ignoring ASCII case; `None` when it does not
+/// start with it.
+pub fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    // `get`: the prefix's length may end inside a character of `s`.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),
+        _ => None,
     }
 }
 
@@ -138,7 +174,12 @@ pub struct PairUri {
 
 impl PairUri {
     pub fn parse(s: &str) -> Result<PairUri, String> {
-        let query = strip_prefix_ci(s.trim(), "pithagoras-sync://pair?")
+        // Windows hands a link from the browser or the shell over with an empty
+        // path made `/` (`pithagoras-sync://pair/?...`): that one form is taken
+        // too, no other path.
+        let s = s.trim();
+        let query = strip_prefix_ci(s, "pithagoras-sync://pair?")
+            .or_else(|| strip_prefix_ci(s, "pithagoras-sync://pair/?"))
             .ok_or("a pairing URI starts with pithagoras-sync://pair?")?;
         let (mut portal, mut code, mut spki) = (None, None, None);
         for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -173,6 +214,11 @@ impl PairUri {
 }
 
 fn pct_decode(s: &str) -> Option<String> {
+    String::from_utf8(pct_bytes(s, true)?).ok()
+}
+
+/// `s` with its `%XX` escapes decoded, and `+` as a space when `plus`.
+fn pct_bytes(s: &str, plus: bool) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -183,7 +229,7 @@ fn pct_decode(s: &str) -> Option<String> {
                 out.push(u8::from_str_radix(h, 16).ok()?);
                 i += 3;
             }
-            b'+' => {
+            b'+' if plus => {
                 out.push(b' ');
                 i += 1;
             }
@@ -193,7 +239,7 @@ fn pct_decode(s: &str) -> Option<String> {
             }
         }
     }
-    String::from_utf8(out).ok()
+    Some(out)
 }
 
 #[cfg(test)]
@@ -214,6 +260,8 @@ mod tests {
         let u = PortalUrl::parse("http://127.0.0.1:3000/pitha/").unwrap();
         assert_eq!(u.base, "/pitha");
         assert_eq!(u.to_string(), "http://127.0.0.1:3000/pitha");
+        let u = PortalUrl::parse("https://x/p%20q/r-s_t.u~v").unwrap();
+        assert_eq!(u.base, "/p%20q/r-s_t.u~v");
         let u = PortalUrl::parse("https://[::1]:8443").unwrap();
         assert_eq!((u.host.as_str(), u.port), ("::1", 8443));
         assert_eq!(u.authority(), "[::1]:8443");
@@ -226,7 +274,18 @@ mod tests {
             "https://x:99999",
             "https://",
             "https://x/../y",
+            "https://x/a/%2e%2e/b",
+            "https://x/a/%2E./b",
+            "https://x/a/.%2e",
+            "https://x/a/%2e",
+            "https://x/a%2f..%2fb",
+            "https://x/a%5c..",
             "https://[nope]",
+            "https://x/a b",
+            "https://x/\u{2014}",
+            "https://x/a\"b",
+            "https://x/a%2",
+            "https://x/a%zz",
         ] {
             assert!(PortalUrl::parse(bad).is_err(), "{bad}");
         }
@@ -245,8 +304,37 @@ mod tests {
         let p =
             PairUri::parse("pithagoras-sync://pair?portal=http://127.0.0.1:3000&code=x1").unwrap();
         assert!(p.spki.is_none());
+        // A path that would make the question read differently.
+        let fake = "pithagoras-sync://pair?portal=https%3A%2F%2Fevil.example%2F%20%E2%80%94%20verified%3A%20https%3A%2F%2Fportal.company.example&code=AB";
+        assert!(
+            PairUri::parse(fake)
+                .unwrap_err()
+                .contains("the path may hold only")
+        );
+        // As Windows starts the handler for a link from Edge, Chrome, Firefox or
+        // `Start-Process` (ShellExecute): the empty path made `/`, the escapes
+        // kept, the scheme's case as written.
+        let link = "portal=http%3A%2F%2F127.0.0.1%3A18080&code=AB12CD34";
+        let plain = PairUri::parse(&format!("pithagoras-sync://pair?{link}")).unwrap();
+        for windows in [
+            format!("pithagoras-sync://pair/?{link}"),
+            format!("Pithagoras-Sync://pair/?{link}"),
+            format!(" pithagoras-sync://pair/?{link}\r\n"),
+        ] {
+            assert_eq!(PairUri::parse(&windows).unwrap(), plain, "{windows}");
+        }
+        // Cut inside a character where the prefix ends: refused, not a panic.
+        assert!(PairUri::parse(&format!("{}é", "a".repeat(22))).is_err());
+        assert_eq!(strip_prefix_ci("aé", "ab"), None);
+        assert_eq!(strip_prefix_ci("HTTPS://x", "https://"), Some("x"));
         for bad in [
             "https://portal.example",
+            "pithagoras-sync://pair//?portal=https://x&code=AB",
+            "pithagoras-sync://pair/x?portal=https://x&code=AB",
+            "pithagoras-sync://pair/portal=https://x&code=AB",
+            "pithagoras-sync://pair/",
+            "pithagoras-sync://pair.example/?portal=https://x&code=AB",
+            "pithagoras-sync:pair?portal=https://x&code=AB",
             "pithagoras-sync://pair?code=AB",
             "pithagoras-sync://pair?portal=https://x",
             "pithagoras-sync://pair?portal=https://x&code=A B",

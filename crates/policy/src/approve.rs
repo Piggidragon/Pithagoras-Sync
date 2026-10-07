@@ -31,6 +31,15 @@ pub fn visible(s: &str) -> String {
     out
 }
 
+/// The three characters markup gives a meaning (`&`, `<`, `>`), as entities:
+/// for a notification server or dialog program that reads Pango or HTML-like
+/// markup, so outside text cannot style or hide what the owner reads.
+pub fn markup_escaped(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{61c}')
 }

@@ -1,7 +1,8 @@
 //! The device's configuration file (`config.toml`): pairing data and policy.
 //!
 //! The owner edits it by hand or with `pithagoras-sync mode` / `folder`; the portal
-//! never writes it. The connector token lives in a separate 0600 file (`token`).
+//! never writes it. The connector token lives in a separate 0600 file (`token`) or
+//! in the OS keyring (`token_storage`).
 
 use std::fs;
 use std::io::{self, Write};
@@ -167,6 +168,10 @@ pub enum SecretStorage {
     /// A 0600 file in the client's config folder, which survives restarts. Any
     /// unconfined command of the same user could read it.
     File,
+    /// The OS keyring (the Secret Service; Linux only, as sudo is). Survives
+    /// restarts; any unconfined command of the same user could ask the unlocked
+    /// keyring for it, as it could read the file.
+    Keyring,
 }
 
 impl SecretStorage {
@@ -174,6 +179,29 @@ impl SecretStorage {
         match self {
             SecretStorage::Memory => "memory",
             SecretStorage::File => "file",
+            SecretStorage::Keyring => "keyring",
+        }
+    }
+}
+
+/// Where the connector token is kept. Unset, it is the platform's default: the
+/// file on Linux, the keyring on Windows (where a failing keyring falls back to
+/// the file). Set, it never falls back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenStorage {
+    /// `token`, a 0600 file in the config folder.
+    File,
+    /// The OS keyring: the Secret Service on Linux, the Credential Manager on
+    /// Windows.
+    Keyring,
+}
+
+impl TokenStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenStorage::File => "file",
+            TokenStorage::Keyring => "keyring",
         }
     }
 }
@@ -341,6 +369,12 @@ pub struct PortalConfig {
     pub spki_sha256: Option<String>,
     pub device_id: String,
     pub name: String,
+    /// When this pairing was made (ms since the epoch). A new pairing differs
+    /// from the old one by it even when the portal keeps the device id, so the
+    /// running client knows to read the new token. Absent in a config from
+    /// before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +453,8 @@ pub struct DeviceConfig {
     pub profile: Profile,
     pub portal_policy: PortalPolicy,
     pub portal: Option<PortalConfig>,
+    /// Where the connector token is kept; unset is the platform's default.
+    pub token_storage: Option<TokenStorage>,
     pub policy: Policy,
     pub exec: ExecOptions,
 }

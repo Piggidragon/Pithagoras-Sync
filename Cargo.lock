@@ -1344,6 +1344,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sync-proto",
+ "sync-testkit",
  "tempfile",
  "tokio",
  "toml",
@@ -1385,9 +1386,11 @@ dependencies = [
  "serde_json",
  "sync-proto",
  "sync-release",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "zbus",
 ]
 
 [[package]]

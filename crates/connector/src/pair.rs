@@ -92,6 +92,10 @@ pub async fn pair(uri: &str, name: &str) -> Result<Paired, String> {
             spki_sha256: uri.spki,
             device_id: r.device_id,
             name: name.to_string(),
+            paired_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64),
         },
         token: r.connector_token,
     })

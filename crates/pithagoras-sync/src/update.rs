@@ -307,10 +307,9 @@ pub fn same_program(a: &Path, b: &Path) -> bool {
 /// logon task starts), when it exists and is not `me`.
 pub fn installed_copy(me: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
-    let p = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
-        .join(r"Programs\pithagoras-sync\pithagoras-sync.exe");
+    let p = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(crate::install::WINDOWS_PROGRAM);
     #[cfg(not(windows))]
-    let p = PathBuf::from(std::env::var_os("HOME")?).join(".local/bin/pithagoras-sync");
+    let p = crate::install::user_program(Path::new(&std::env::var_os("HOME")?));
     (p.is_file() && !same_program(&p, me)).then_some(p)
 }
 
@@ -896,7 +895,7 @@ fn check_runs(path: &Path, version: &str) -> Result<(), String> {
 fn run_version(path: &Path) -> std::io::Result<(bool, String)> {
     let mut tries = 0;
     let out = loop {
-        match std::process::Command::new(path)
+        match crate::actions::no_console_window(&mut std::process::Command::new(path))
             .arg("--version")
             .stdin(std::process::Stdio::null())
             .output()

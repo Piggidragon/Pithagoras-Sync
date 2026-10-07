@@ -26,8 +26,10 @@ pub struct Cli {
     /// More log output.
     #[arg(short, long, global = true)]
     pub verbose: bool,
+    /// Without one: the help in a terminal, the graphical flow from a file
+    /// manager or the menu.
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -42,6 +44,19 @@ pub enum Cmd {
         /// window and write the log to `client.log` in the state folder.
         #[arg(long, hide = true)]
         detach: bool,
+    },
+    /// Install, pair and uninstall in windows instead of a terminal.
+    ///
+    /// The menu entry and a double click on the program start it, and so does a
+    /// pairing link (pithagoras-sync://pair?...) opened in the browser: it asks
+    /// before it installs, pairs (showing the portal it would pair with) or
+    /// uninstalls. Needs zenity or kdialog on Linux.
+    Gui {
+        /// A pairing link to pair with (after asking).
+        link: Option<String>,
+        /// The same, as an option.
+        #[arg(long = "link", value_name = "LINK", conflicts_with = "link")]
+        link_option: Option<String>,
     },
     /// Pair with a portal, using the URI it shows under Settings, Devices.
     Pair {
@@ -295,6 +310,12 @@ pub fn log_file(dirs: &Dirs) -> PathBuf {
     dirs.state.join("client.log")
 }
 
+/// Where `gui` notes what it could not show in a window. Not `client.log`: that
+/// one existing means the client logs to it rather than to the journal.
+pub fn gui_log_file(dirs: &Dirs) -> PathBuf {
+    dirs.state.join("gui.log")
+}
+
 /// The client's exit code when it stops to be restarted (EX_TEMPFAIL).
 pub const RESTART_EXIT: u8 = 75;
 
@@ -368,7 +389,7 @@ async fn reload_running(dirs: &Dirs) {
 /// The config file, or a new config for this machine when there is none yet. The
 /// profile is detected once, by whichever command writes the file first, so a
 /// `folder add` before `pair` on a desktop does not make it headless.
-fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
+pub(crate) fn load_config(dirs: &Dirs) -> Result<DeviceConfig, String> {
     // Only a config that is not there means defaults: one this user cannot read
     // (another user's folder) is an error, so nothing writes defaults over it.
     match std::fs::metadata(dirs.config_file()) {
@@ -458,6 +479,9 @@ fn status_text(s: &Status) -> String {
             let _ = writeln!(out, "Portal:    not paired");
         }
     }
+    if s.portal.is_some() && !s.token_storage.is_empty() {
+        let _ = writeln!(out, "Token:     kept in the {}", s.token_storage);
+    }
     let _ = writeln!(
         out,
         "Link:      {state}{}",
@@ -525,6 +549,121 @@ fn status_text(s: &Status) -> String {
     let _ = writeln!(out, "Config:    {}", visible(&s.config_file));
     let _ = writeln!(out, "Audit log: {}", visible(&s.audit_file));
     out
+}
+
+/// Where this config keeps the connector token.
+pub fn token_store(dirs: &Dirs, cfg: &DeviceConfig) -> sync_connector::token::TokenStore {
+    sync_connector::token::TokenStore::new(
+        dirs.token_file(),
+        cfg.token_storage,
+        sync_policy::keyring::system(dirs),
+    )
+}
+
+/// What a pairing did, for `pair` to print and the GUI to show.
+pub struct Paired {
+    pub portal: sync_policy::PortalConfig,
+    pub mode: Mode,
+    pub folders_empty: bool,
+    /// The running client took the new pairing.
+    pub running: bool,
+    /// Said once to the owner: where the token went when the keyring failed.
+    pub notes: Vec<String>,
+}
+
+/// Pairs with the portal of `uri` and keeps the pairing: the code behind `pair`
+/// and the link handler. The caller has checked that the owner makes the change
+/// and passes the config it read then.
+pub async fn pair_device(
+    dirs: &Dirs,
+    mut cfg: DeviceConfig,
+    uri: &str,
+    name: Option<String>,
+) -> Result<Paired, String> {
+    let name = name
+        .or_else(|| cfg.portal.as_ref().map(|p| p.name.clone()))
+        .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
+    let paired = pair::pair(uri, &name).await?;
+    let notes = token_store(dirs, &cfg)
+        .save(&paired.token)
+        .await
+        .map_err(|e| {
+            format!(
+                "{e}. The portal paired the device {} already, but this computer could not keep its token: remove that device in the portal (Settings, Devices) and pair again with a new code",
+                sync_policy::approve::visible(&paired.portal.device_id)
+            )
+        })?
+        .into_iter()
+        .collect();
+    cfg.portal = Some(paired.portal.clone());
+    cfg.save(&dirs.config_file())?;
+    let running = matches!(
+        control::send(&dirs.socket(), Request::Reload).await,
+        Ok(Some(_))
+    );
+    Ok(Paired {
+        portal: paired.portal,
+        mode: cfg.policy.mode,
+        folders_empty: cfg.policy.folders.is_empty(),
+        running,
+        notes,
+    })
+}
+
+/// The uninstall after a purge's stop, without the steps the stop took
+/// already (on Windows: ending the task).
+fn not_again(stop: &[Action], uninstall: Vec<Action>) -> Vec<Action> {
+    uninstall
+        .into_iter()
+        .filter(|a| !stop.contains(a))
+        .collect()
+}
+
+/// How long `mode full` lasts, for its message.
+fn full_for(expiry_hours: u32) -> String {
+    match expiry_hours {
+        0 => ", with no expiry".into(),
+        1 => ", for 1 hour".into(),
+        h => format!(", for {h} hours"),
+    }
+}
+
+/// What `pair` says about a plain-http portal.
+pub fn http_note(url: &str) -> Option<String> {
+    url.starts_with("http://").then(|| {
+        format!(
+            "Note: plain http trusts whoever answers on the portal's port on this machine.{}",
+            if cfg!(target_os = "linux") {
+                " The client talks only to a program of this user or root there; a portal that runs as another user needs https."
+            } else {
+                " Any local account that listens there while the portal is down gets the token: on a machine shared with other accounts, use https."
+            }
+        )
+    })
+}
+
+/// What to do next in this mode, after pairing.
+pub fn mode_hint(mode: Mode, folders_empty: bool) -> Option<&'static str> {
+    match mode {
+        Mode::Ask => Some(
+            "Every call waits for your approval (in the portal, or `pithagoras-sync approve`). To let it work in folders of your choice: pithagoras-sync folder add <path> --rw --exec, then pithagoras-sync mode folders.",
+        ),
+        Mode::Folders if folders_empty => Some(
+            "Grant a folder next: pithagoras-sync folder add <path> --rw --exec (nothing is reachable until then).",
+        ),
+        _ => None,
+    }
+}
+
+/// How to start a client that does not run yet: the unit `setup` or `install`
+/// made for this user, if any.
+fn start_hint() -> String {
+    let linux = cfg!(target_os = "linux");
+    let system = linux
+        .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
+        .flatten();
+    let user_unit = linux && info::home().is_some_and(|h| install::user_unit_file(&h).is_file());
+    install::start_hint(system.as_deref(), &info::user().0, user_unit)
 }
 
 /// Sends a request to the running client and wants an answer.
@@ -724,31 +863,48 @@ fn sudo_status_text(v: &SudoView) -> String {
 /// but the elevation: the callers wait for answers, and whatever the owner changed
 /// meanwhile (the mode, a folder) must not be written back.
 async fn set_elevation(dirs: &Dirs, to: Elevation) -> Result<(), String> {
-    let mut cfg = load_config(dirs)?;
     let word = if to == Elevation::Sudo {
         "active"
     } else {
         "not active"
     };
-    if cfg.policy.privilege.elevation == to {
+    if switch_elevation(dirs, to).await? {
+        println!("Sudo access is {word} now.");
+    } else {
         println!("Sudo access is {word} already.");
-        return Ok(());
     }
-    cfg.policy.privilege.elevation = to;
-    cfg.save(&dirs.config_file())?;
-    println!("Sudo access is {word} now.");
-    reload_running(dirs).await;
     Ok(())
 }
 
+/// `set_elevation` without the words: whether it changed anything. The owner
+/// checks are the caller's.
+pub(crate) async fn switch_elevation(dirs: &Dirs, to: Elevation) -> Result<bool, String> {
+    let mut cfg = load_config(dirs)?;
+    if cfg.policy.privilege.elevation == to {
+        return Ok(false);
+    }
+    cfg.policy.privilege.elevation = to;
+    cfg.save(&dirs.config_file())?;
+    reload_running(dirs).await;
+    Ok(true)
+}
+
 /// Whether a password is stored: the running client holds one, or (when the
-/// client is not running) the file is there and the client will load it, which it
-/// does only with file storage.
-async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
+/// client is not running) the file or the keyring has one the client will load,
+/// which it does only with file or keyring storage.
+pub(crate) async fn sudo_password_set(dirs: &Dirs, storage: SecretStorage) -> Result<bool, String> {
     Ok(
         match control::send(&dirs.socket(), Request::Status).await? {
             Some(r) => r.status.is_some_and(|s| s.elevation_password),
-            None => storage == SecretStorage::File && crate::secrets::file(dirs).exists(),
+            None => match storage {
+                SecretStorage::Memory => false,
+                SecretStorage::File => crate::secrets::file(dirs).exists(),
+                // Without unlocking it: a status is no reason for a prompt.
+                SecretStorage::Keyring => sync_policy::keyring::system(dirs)
+                    .has(crate::secrets::ELEVATION)
+                    .await
+                    .unwrap_or(false),
+            },
         },
     )
 }
@@ -766,6 +922,36 @@ async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
             info::user().0
         ))?
     };
+    match keep_password(dirs, value).await? {
+        Kept::InClient => println!("Password stored in the client."),
+        Kept::ForNextStart => println!("Password stored for the client's next start."),
+        Kept::Nowhere => {
+            return Err(
+                "the client is not running, and it keeps the password in memory only (policy.privilege.secret_storage = memory); start it first".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Where `keep_password` put the password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// The running client holds it (and stores it as its storage says).
+    InClient,
+    /// In the file or the keyring, for the client's next start.
+    ForNextStart,
+    /// Nowhere: the client is not running and keeps it in memory only.
+    Nowhere,
+}
+
+/// Gives the password to the running client, or to the file or keyring for
+/// the client's next start. The owner checks are the caller's.
+pub(crate) async fn keep_password(
+    dirs: &Dirs,
+    value: sync_policy::secret::Secret,
+) -> Result<Kept, String> {
+    use crate::secrets;
     match control::send(
         &dirs.socket(),
         Request::SecretSet {
@@ -775,23 +961,43 @@ async fn store_password(dirs: &Dirs, stdin: bool) -> Result<(), String> {
     )
     .await?
     {
-        Some(r) if r.ok => println!("Password stored in the client."),
-        Some(r) => return Err(r.error.unwrap_or_default()),
-        None if load_config(dirs)?.policy.privilege.secret_storage == SecretStorage::File => {
-            secrets::save(&secrets::file(dirs), &value)?;
-            println!("Password stored for the client's next start.");
-        }
+        Some(r) if r.ok => Ok(Kept::InClient),
+        Some(r) => Err(r.error.unwrap_or_default()),
         None => {
-            return Err(
-                "the client is not running, and it keeps the password in memory only (policy.privilege.secret_storage = memory); start it first".into(),
-            );
+            let storage = load_config(dirs)?.policy.privilege.secret_storage;
+            if storage == SecretStorage::Memory {
+                return Ok(Kept::Nowhere);
+            }
+            let keyring = sync_policy::keyring::system(dirs);
+            secrets::store(dirs, storage, keyring.as_ref(), &value).await?;
+            Ok(Kept::ForNextStart)
         }
     }
-    Ok(())
+}
+
+/// Forgets the password: in the running client, or where it is stored. The
+/// owner checks are the caller's.
+pub(crate) async fn forget_password(dirs: &Dirs) -> Result<(), String> {
+    use crate::secrets;
+    match control::send(
+        &dirs.socket(),
+        Request::SecretClear {
+            name: secrets::ELEVATION.into(),
+        },
+    )
+    .await?
+    {
+        Some(r) if !r.ok => Err(r.error.unwrap_or_default()),
+        Some(_) => Ok(()),
+        None => {
+            let storage = load_config(dirs)?.policy.privilege.secret_storage;
+            let keyring = sync_policy::keyring::system(dirs);
+            secrets::forget(dirs, storage, keyring.as_ref()).await
+        }
+    }
 }
 
 async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
-    use crate::secrets;
     sudo_supported(cfg!(target_os = "linux"))?;
     match cmd {
         SudoCmd::Status => {
@@ -856,18 +1062,7 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
         }
         SudoCmd::Clear { deactivate } => {
             owner::not_from_own_command(dirs).await?;
-            match control::send(
-                &dirs.socket(),
-                Request::SecretClear {
-                    name: secrets::ELEVATION.into(),
-                },
-            )
-            .await?
-            {
-                Some(r) if !r.ok => return Err(r.error.unwrap_or_default()),
-                Some(_) => {}
-                None => secrets::remove(&secrets::file(dirs))?,
-            }
+            forget_password(dirs).await?;
             println!("Password forgotten.");
             let cfg = load_config(dirs)?;
             if cfg.policy.privilege.elevation == Elevation::Sudo {
@@ -889,9 +1084,108 @@ async fn sudo_cmd(dirs: &Dirs, cmd: SudoCmd) -> Result<(), String> {
     Ok(())
 }
 
+/// The pairing link when the program was started with one alone, as the
+/// browser hands it over (`pithagoras-sync <link>`).
+pub fn link_argument(args: &[std::ffi::OsString]) -> Option<String> {
+    let [_, arg] = args else { return None };
+    let arg = arg.to_str()?;
+    let scheme = format!("{}:", install::SCHEME);
+    sync_connector::url::strip_prefix_ci(arg, &scheme).map(|_| arg.to_string())
+}
+
+/// Whether SIGPIPE may end this command quietly when its output is cut off
+/// (`| head`), as it does command line tools. Never the client itself, nor the
+/// graphical flow: a start without a command is how a double click begins it,
+/// and it writes the password to a `sudo` that may have exited.
+pub fn dies_on_sigpipe(cmd: Option<&Cmd>) -> bool {
+    !matches!(cmd, None | Some(Cmd::Run { .. } | Cmd::Gui { .. }))
+}
+
+/// Whether a start without a command is a double click or the menu's: no
+/// terminal and a display to show windows on (the units `install` and `setup`
+/// write always name `run`). On Windows: a console window that Windows opened
+/// for this program alone.
+fn gui_without_command() -> bool {
+    #[cfg(windows)]
+    return console_is_ours_alone();
+    #[cfg(not(windows))]
+    {
+        use std::io::IsTerminal;
+        let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        !terminal && crate::dialogs::has_display()
+    }
+}
+
+/// Whether the console belongs to this process only: Explorer made it for a
+/// double click, so nobody reads it.
+#[cfg(windows)]
+fn console_is_ours_alone() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut ids = [0u32; 4];
+    // SAFETY: the buffer holds `ids.len()` process ids.
+    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+}
+
+/// The graphical flow (`gui`, a pairing link, a double click).
+async fn gui(dirs: &Dirs, link: Option<String>) -> Result<ExitCode, String> {
+    // The owner's login and sudo passwords pass through this process: as the
+    // client does, it keeps other processes of the user (the commands an agent
+    // runs among them) out of its memory, and asks for none while traced.
+    #[cfg(target_os = "linux")]
+    sync_policy::secret::undumpable();
+    // What the commands it runs print (the purge's list) is for a terminal;
+    // here nobody reads it, and a pipe closed meanwhile must not end an
+    // uninstall halfway.
+    #[cfg(unix)]
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        // SAFETY: points fd 1 at /dev/null; `null` stays open until then.
+        unsafe { libc::dup2(null.as_raw_fd(), 1) };
+    }
+    #[cfg(windows)]
+    if console_is_ours_alone() {
+        crate::actions::let_go_of_console();
+    }
+    let lang = crate::i18n::Lang::detect();
+    #[cfg(windows)]
+    let d: Box<dyn crate::dialogs::Dialogs> = Box::new(crate::dialogs::WinDialogs(lang));
+    #[cfg(not(windows))]
+    let d: Box<dyn crate::dialogs::Dialogs> = match crate::dialogs::Native::find(lang) {
+        Some(n) => Box::new(n),
+        None => {
+            crate::gui::say_without_dialogs(dirs, lang.no_dialogs()).await;
+            return Ok(ExitCode::from(1));
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if sync_policy::secret::traced() {
+        d.error(lang.traced());
+        return Ok(ExitCode::from(1));
+    }
+    let host = crate::gui::RealHost { dirs: dirs.clone() };
+    // Awaited here, on the thread in `block_on`, never spawned: its dialogs and
+    // programs block for minutes, and this way hold none of the runtime's
+    // workers.
+    Ok(
+        match crate::gui::flow(d.as_ref(), &host, lang, link.as_deref()).await {
+            crate::gui::Outcome::Done => ExitCode::SUCCESS,
+            _ => ExitCode::from(1),
+        },
+    )
+}
+
 pub async fn run(cli: Cli) -> Result<ExitCode, String> {
     let dirs = Dirs::from_env()?;
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        if gui_without_command() {
+            return gui(&dirs, None).await;
+        }
+        // In a terminal, as before; and nothing else without a display.
+        eprint!("{}", <Cli as clap::CommandFactory>::command().render_help());
+        return Ok(ExitCode::from(2));
+    };
+    match cmd {
+        Cmd::Gui { link, link_option } => return gui(&dirs, link.or(link_option)).await,
         Cmd::Run { detach } => {
             if detach {
                 // Without a console the log would go nowhere; the file is capped.
@@ -899,10 +1193,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     eprintln!("pithagoras-sync: no log file: {e}");
                 }
                 #[cfg(windows)]
-                // SAFETY: FreeConsole has no preconditions.
-                unsafe {
-                    windows_sys::Win32::System::Console::FreeConsole()
-                };
+                crate::actions::let_go_of_console();
             }
             let ran = crate::daemon::run(dirs).await;
             if detach && let Err(e) = &ran {
@@ -916,10 +1207,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Cmd::Pair { uri, name } => {
-            let mut cfg = owner_edit(&dirs).await?;
-            let name = name
-                .or_else(|| cfg.portal.as_ref().map(|p| p.name.clone()))
-                .unwrap_or_else(|| pair::name_from_hostname(&info::hostname()));
+            let cfg = owner_edit(&dirs).await?;
             if let Some(old) = &cfg.portal {
                 println!("Replacing the pairing with {}.", old.url);
             }
@@ -929,67 +1217,40 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                     root_warning(cfg!(windows), cfg.policy.privilege.allow_root)
                 );
             }
-            let paired = pair::pair(&uri, &name).await?;
-            pair::save_token(&dirs.token_file(), &paired.token)?;
-            cfg.portal = Some(paired.portal.clone());
-            cfg.save(&dirs.config_file())?;
+            let done = pair_device(&dirs, cfg, &uri, name).await?;
+            for n in &done.notes {
+                eprintln!("note: {n}");
+            }
+            let p = &done.portal;
             println!(
                 "Paired with {} as {} (device {}).",
-                paired.portal.url, paired.portal.name, paired.portal.device_id
+                p.url, p.name, p.device_id
             );
-            if paired.portal.url.starts_with("http://") {
-                println!(
-                    "Note: plain http trusts whoever answers on the portal's port on this machine.{}",
-                    if cfg!(target_os = "linux") {
-                        " The client talks only to a program of this user or root there; a portal that runs as another user needs https."
-                    } else {
-                        " Any local account that listens there while the portal is down gets the token: on a machine shared with other accounts, use https."
-                    }
-                );
+            if let Some(n) = http_note(&p.url) {
+                println!("{n}");
             }
-            println!("Mode: {:?}.", cfg.policy.mode);
-            if cfg.policy.mode == Mode::Ask {
-                println!(
-                    "Every call waits for your approval (in the portal, or `pithagoras-sync approve`). To let it work in folders of your choice: pithagoras-sync folder add <path> --rw --exec, then pithagoras-sync mode folders."
-                );
-            } else if cfg.policy.mode == Mode::Folders && cfg.policy.folders.is_empty() {
-                println!(
-                    "Grant a folder next: pithagoras-sync folder add <path> --rw --exec (nothing is reachable until then)."
-                );
+            println!("Mode: {:?}.", done.mode);
+            if let Some(n) = mode_hint(done.mode, done.folders_empty) {
+                println!("{n}");
             }
-            match control::send(&dirs.socket(), Request::Reload).await {
-                Ok(Some(_)) => println!("The running client connects now."),
-                _ => {
-                    // The unit `setup` or `install` made for this user, if any.
-                    let linux = cfg!(target_os = "linux");
-                    let system = linux
-                        .then(|| std::fs::read_to_string(crate::update::system_unit_file()).ok())
-                        .flatten();
-                    let user_unit = linux
-                        && info::home().is_some_and(|h| {
-                            h.join(".config/systemd/user")
-                                .join(install::UNIT_NAME)
-                                .is_file()
-                        });
-                    println!(
-                        "{}",
-                        install::start_hint(system.as_deref(), &info::user().0, user_unit)
-                    );
-                }
+            if done.running {
+                println!("The running client connects now.");
+            } else {
+                println!("{}", start_hint());
             }
         }
         Cmd::Unpair => {
             owner::not_from_own_command(&dirs).await?;
             let mut cfg = DeviceConfig::load(&dirs.config_file())?;
+            let tokens = token_store(&dirs, &cfg);
             cfg.portal = None;
             cfg.save(&dirs.config_file())?;
-            match std::fs::remove_file(dirs.token_file()) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(format!("{}: {e}", dirs.token_file().display()));
-                }
-                _ => {}
-            }
+            // The running client lets go of the portal before the token goes:
+            // a keyring that fails here must not leave it connected.
             reload_running(&dirs).await;
+            tokens.delete().await.map_err(|e| {
+                format!("unpaired (the config names no portal now, and a running client was told), but {e}; run `unpair` again to remove the token")
+            })?;
             println!("Unpaired. Remove the device in the portal as well.");
         }
         Cmd::Status { json } => match control::send(&dirs.socket(), Request::Status).await? {
@@ -1007,7 +1268,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 } else {
                     println!("pithagoras-sync is not running.");
                     match &cfg.portal {
-                        Some(p) => println!("Paired with {} as {}.", p.url, p.name),
+                        Some(p) => println!(
+                            "Paired with {} as {} (token kept in the {}).",
+                            p.url,
+                            p.name,
+                            token_store(&dirs, &cfg).describe()
+                        ),
                         None => println!("Not paired."),
                     }
                     println!(
@@ -1079,11 +1345,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
                 println!(
                     "Full mode: the portal's agent can do whatever {} can do here{}.",
                     info::user().0,
-                    if cfg.policy.full.expiry_hours == 0 {
-                        ", with no expiry".to_string()
-                    } else {
-                        format!(", for {} hours", cfg.policy.full.expiry_hours)
-                    }
+                    full_for(cfg.policy.full.expiry_hours)
                 );
             }
             println!(
@@ -1156,7 +1418,21 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let cfg = owner_edit(&dirs).await?;
             let next = config_cmd::edit(&cfg, &key, op, now_ms())?;
-            next.save(&dirs.config_file())?;
+            if key == "token_storage" {
+                // The token moves with the setting: to its new place first, then
+                // the setting, then away from the old place.
+                let from = token_store(&dirs, &cfg);
+                let to = token_store(&dirs, &next);
+                let paired = cfg.portal.is_some();
+                for n in from
+                    .switch(&to, paired, || next.save(&dirs.config_file()))
+                    .await?
+                {
+                    eprintln!("note: {n}");
+                }
+            } else {
+                next.save(&dirs.config_file())?;
+            }
             let v = config_cmd::get(&next, Some(&key))?;
             println!("{key} = {v}");
             if key == "profile" {
@@ -1385,7 +1661,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
             purge: true,
             yes,
             print,
-        } => return purge(&dirs, system, print, yes).await,
+        } => {
+            let mut hints = Vec::new();
+            let r = purge(&dirs, system, print, yes, false, &mut hints).await;
+            for h in hints {
+                eprintln!("note: {h}");
+            }
+            return r;
+        }
         Cmd::Uninstall { system, print, .. } => {
             let plan = uninstall_plan(system)?;
             println!("Uninstall:");
@@ -1442,7 +1725,23 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn install_plan(
+/// `$XDG_DATA_HOME`, or `~/.local/share`: where desktop entries and icons go.
+pub fn data_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"))
+}
+
+/// Whether `install` left a desktop entry or icon here.
+fn desktop_installed(data: &Path) -> bool {
+    data.join("applications")
+        .join(install::DESKTOP_FILE)
+        .exists()
+        || install::icon_path(data).exists()
+}
+
+pub(crate) fn install_plan(
     system: bool,
     user: Option<&str>,
     linger: bool,
@@ -1483,14 +1782,22 @@ fn install_plan(
         );
     }
     let home = info::home().ok_or("cannot find the home directory")?;
-    let linger = linger && info::session() == "headless";
-    Ok(install::user_plan(&home, exe, &info::user().0, linger))
+    let headless = info::session() == "headless";
+    let linger = linger && headless;
+    let mut plan = install::user_plan(&home, exe, &info::user().0, linger);
+    // In a graphical session: the menu entry and the handler of pairing links.
+    if !headless {
+        let program = install::user_program(&home);
+        plan.extend(install::desktop_plan(&data_home(&home), &program)?);
+    }
+    Ok(plan)
 }
 
-fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
+pub(crate) fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
     if cfg!(windows) {
         let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is not set")?;
-        return Ok(install::windows_uninstall_plan(&local));
+        let task = install::task_installed(&actions::System);
+        return Ok(install::windows_uninstall_plan(&local, task));
     }
     if system {
         if !is_root() {
@@ -1499,7 +1806,12 @@ fn uninstall_plan(system: bool) -> Result<Vec<Action>, String> {
         return Ok(install::system_uninstall_plan());
     }
     let home = info::home().ok_or("cannot find the home directory")?;
-    Ok(install::user_uninstall_plan(&home))
+    let mut plan = install::user_uninstall_plan(&home);
+    let data = data_home(&home);
+    if desktop_installed(&data) {
+        plan.extend(install::desktop_uninstall_plan(&data));
+    }
+    Ok(plan)
 }
 
 /// Asks the running client to exit and waits until it has, so it does not write
@@ -1526,12 +1838,21 @@ async fn stop_client(dirs: &Dirs) -> Result<(), String> {
 }
 
 /// What an error of `uninstall --purge` after the stop says about the unit or
-/// task: stopped (or switched off) and how to start it again, or already deleted.
-fn stop_note(stopped: bool, deleted: bool, windows: bool, system: bool) -> String {
-    if !stopped {
-        String::new()
-    } else if deleted {
+/// task, which was as `before` says before the stop (`None`: there was none to
+/// stop): off as it was, how to put it back as it was, or deleted already.
+fn stop_note(
+    before: Option<install::Before>,
+    deleted: bool,
+    windows: bool,
+    system: bool,
+) -> String {
+    let Some(before) = before else {
+        return String::new();
+    };
+    if deleted {
         "\nThe unit or task is deleted already: `install` sets it up again.".into()
+    } else if windows && !before.enabled {
+        "\nThe logon task stays switched off, as it was before.".into()
     } else if windows {
         // The name has a space.
         format!(
@@ -1539,12 +1860,18 @@ fn stop_note(stopped: bool, deleted: bool, windows: bool, system: bool) -> Strin
             install::TASK_NAME
         )
     } else {
+        let what = match (before.enabled, before.running) {
+            (true, true) => "enable --now",
+            (true, false) => "enable",
+            (false, true) => "start",
+            (false, false) => return "\nThe unit stays off, as it was before.".into(),
+        };
         format!(
-            "\nThe unit was stopped: `{} {}` starts it again.",
+            "\nThe unit is off now: `{} {what} {}` puts it back as it was.",
             if system {
-                "sudo systemctl start"
+                "sudo systemctl"
             } else {
-                "systemctl --user start"
+                "systemctl --user"
             },
             install::UNIT_NAME
         )
@@ -1561,10 +1888,61 @@ fn delete_hint(path: &Path) -> String {
     }
 }
 
+/// What an error of `uninstall --purge` after the stop says, once it put back
+/// what the stop changed where the unit or task is still `installed`: switched
+/// on again if it was on, and started again if a client ran, so a purge that
+/// failed neither leaves the device offline nor brings back what the owner had
+/// switched off. Only when that fails too, how to do it by hand.
+fn after_stop_note(
+    before: Option<install::Before>,
+    installed: bool,
+    windows: bool,
+    system: bool,
+    runner: &dyn actions::Runner,
+) -> String {
+    let Some(b) = before.filter(|_| installed) else {
+        return stop_note(before, !installed, windows, system);
+    };
+    let plan = install::restart_plan(windows, system, b);
+    if plan.is_empty() {
+        return stop_note(before, false, windows, system);
+    }
+    match actions::apply(&plan, Path::new("/"), runner) {
+        Ok(_) if windows && b.running => {
+            "\nThe logon task was switched on again and starts the client.".into()
+        }
+        Ok(_) if windows => "\nThe logon task was switched on again.".into(),
+        Ok(_) => match (b.enabled, b.running) {
+            (true, true) => "\nThe unit was switched on and started again.".into(),
+            (true, false) => "\nThe unit was switched on again.".into(),
+            _ => "\nThe unit was started again.".into(),
+        },
+        Err(_) => stop_note(before, false, windows, system),
+    }
+}
+
 /// `uninstall --purge`: stops the client, undoes `install`, and removes what the
 /// client wrote for this user. The program stays: it may be the owner's only
-/// copy, and on Windows the running one cannot be deleted anyway.
-async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<ExitCode, String> {
+/// copy, and on Windows the running one cannot be deleted anyway. The hints of
+/// the steps it ran go to `hints`, also when it fails. In the `window` nothing
+/// is printed: what it would print for the owner goes to `hints`, but the plan,
+/// the pairing and the program, which the window says in its own words.
+pub(crate) async fn purge(
+    dirs: &Dirs,
+    system: bool,
+    print: bool,
+    yes: bool,
+    window: bool,
+    hints: &mut Vec<String>,
+) -> Result<ExitCode, String> {
+    // A window has no terminal to print to.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            if !window {
+                println!($($arg)*);
+            }
+        };
+    }
     let linux = cfg!(target_os = "linux");
     if cfg!(windows) && system {
         return Err(
@@ -1622,24 +2000,34 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     let unit_folder = if system {
         Some(Path::new("/etc/systemd/system").to_path_buf())
     } else {
-        home.as_ref().map(|h| h.join(".config/systemd/user"))
+        home.as_ref().map(|h| install::user_unit_folder(h))
     };
-    let installed = if cfg!(windows) {
-        runner
-            .try_run(&actions::argv(&[
-                "schtasks",
-                "/Query",
-                "/TN",
-                install::TASK_NAME,
-            ]))
-            .is_ok()
-    } else {
-        unit_folder
-            .as_ref()
-            .is_some_and(|d| d.join(install::UNIT_NAME).exists())
+    let is_installed = || {
+        if cfg!(windows) {
+            install::task_installed(&runner)
+        } else {
+            unit_folder
+                .as_ref()
+                .is_some_and(|d| d.join(install::UNIT_NAME).exists())
+        }
     };
+    let installed = is_installed();
     let (stop, uninstall) = if !installed {
-        (Vec::new(), Vec::new())
+        // A link handler left without the unit or task (removed by hand).
+        let mut links = Vec::new();
+        #[cfg(windows)]
+        if crate::registry::exists(install::WINDOWS_CLASS_KEY) {
+            links = install::windows_link_uninstall_plan();
+        }
+        if let Some(data) = home
+            .as_ref()
+            .filter(|_| linux && !system)
+            .map(|h| data_home(h))
+            && desktop_installed(&data)
+        {
+            links = install::desktop_uninstall_plan(&data);
+        }
+        (Vec::new(), links)
     } else if cfg!(windows) {
         (install::windows_stop_plan(), uninstall_plan(false)?)
     } else if system {
@@ -1647,6 +2035,7 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     } else {
         (install::user_stop_plan(), uninstall_plan(false)?)
     };
+    let uninstall = not_again(&stop, uninstall);
     let found = crate::purge::find(dirs)?;
     let me_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut programs = vec![me_exe.clone()];
@@ -1666,19 +2055,40 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
     let running = control::send(&dirs.socket(), Request::Status)
         .await?
         .and_then(|r| r.status);
-    let portal = DeviceConfig::load(&dirs.config_file())
-        .ok()
-        .and_then(|c| c.portal);
+    let config = DeviceConfig::load(&dirs.config_file()).ok();
+    let portal = config.as_ref().and_then(|c| c.portal.clone());
+    // What the keyring keeps for the client, asked without a prompt: an entry
+    // where the config puts it, or one an earlier setting left. The token store
+    // decides for the token, as `unpair` does. For the password, a keyring that
+    // cannot answer is taken to hold it where the config puts it there;
+    // removing it then fails with the reason.
+    let keyring = sync_policy::keyring::system(dirs);
+    let tokens = token_store(dirs, config.as_ref().unwrap_or(&DeviceConfig::default()));
+    let keyring_token = tokens.keyring_holds(portal.is_some()).await;
+    let password_setting = config.as_ref().is_some_and(|c| {
+        c.policy.privilege.secret_storage == sync_policy::config::SecretStorage::Keyring
+    });
+    let keyring_password = linux
+        && keyring
+            .has(crate::secrets::ELEVATION)
+            .await
+            .unwrap_or(password_setting);
 
     let mut notes = Vec::new();
+    // The window says these two in its own words: the pairing ends, the
+    // program stays.
+    let mut own_words = 0;
     if let Some(p) = &portal {
+        own_words += 1;
         notes.push(format!(
             "The pairing with {} (device {}) ends here: remove the device in the portal as well (Settings, Devices).",
             sync_policy::approve::visible(&p.url),
             sync_policy::approve::visible(&p.device_id)
         ));
     }
-    if let Some(d) = unit_folder.map(|d| d.join(format!("{}.d", install::UNIT_NAME)))
+    if let Some(d) = unit_folder
+        .as_ref()
+        .map(|d| d.join(format!("{}.d", install::UNIT_NAME)))
         && d.exists()
     {
         notes.push(format!(
@@ -1702,6 +2112,7 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
             "The user {u} and the files of its client stay: `sudo pithagoras-sync setup --remove --name {u}` removes them."
         ));
     }
+    let extra = own_words..notes.len();
     for p in &programs {
         notes.push(format!(
             "The program itself stays: {}. Delete it with `{}` when you no longer need it.",
@@ -1709,27 +2120,40 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
             delete_hint(p)
         ));
     }
+    if window {
+        hints.extend(notes[extra].iter().cloned());
+    }
 
     if running.is_none()
         && stop.is_empty()
         && uninstall.is_empty()
         && found.is_empty()
         && olds.is_empty()
+        && !keyring_token
+        && !keyring_password
     {
-        println!("Nothing to remove.");
+        say!("Nothing to remove.");
         for n in &notes {
-            println!("{n}");
+            say!("{n}");
         }
         return Ok(ExitCode::SUCCESS);
     }
-    println!("This removes:");
+    say!("This removes:");
     if let Some(s) = &running {
-        println!("  - stop the running client (pid {})", s.pid);
+        say!("  - stop the running client (pid {})", s.pid);
     }
-    show_plan(&stop);
-    show_plan(&uninstall);
-    for e in &found.entries {
-        println!(
+    if !window {
+        show_plan(&stop);
+        show_plan(&uninstall);
+    }
+    // The uninstall's own removals are listed with it already.
+    let removed_by_uninstall = |e: &Path| {
+        uninstall
+            .iter()
+            .any(|a| matches!(a, Action::Remove { path } if path == e))
+    };
+    for e in found.entries.iter().filter(|e| !removed_by_uninstall(e)) {
+        say!(
             "  - remove {}{}",
             e.display(),
             if std::fs::symlink_metadata(e).is_ok_and(|m| m.is_dir()) {
@@ -1740,39 +2164,72 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
         );
     }
     for p in &olds {
-        println!("  - remove {}", p.display());
+        say!("  - remove {}", p.display());
+    }
+    if keyring_token {
+        say!("  - remove the connector token from the keyring");
+    }
+    if keyring_password {
+        say!("  - remove the elevation password from the keyring");
     }
     for f in &found.folders {
-        println!(
+        say!(
             "  - remove the folder {} once nothing else is in it",
             f.display()
         );
     }
     for n in &notes {
-        println!("{n}");
+        say!("{n}");
     }
     if print {
         return Ok(ExitCode::SUCCESS);
     }
     if !yes && !ask("Go ahead?") {
-        println!("Nothing changed.");
+        say!("Nothing changed.");
         return Ok(ExitCode::from(1));
     }
-    apply_plan(&stop)?;
+    let mut apply = |plan: &[Action]| -> Result<(), String> {
+        hints.extend(actions::apply(plan, Path::new("/"), &actions::System)?);
+        Ok(())
+    };
+    // What the unit or task is before the stop, so a purge that fails puts
+    // back only that.
+    let before = (!stop.is_empty())
+        .then(|| install::state_before(cfg!(windows), system, &runner, running.is_some()));
+    apply(&stop)?;
     // From here on an error comes after the unit or task was stopped, and may
     // come after part of it was removed: it says so, and that running this again
     // goes on. Once the unit or task is deleted it says that instead.
     let deleted = std::cell::Cell::new(false);
     let after_stop = |e: String| {
-        let note = stop_note(!stop.is_empty(), deleted.get(), cfg!(windows), system);
+        let note = after_stop_note(
+            before,
+            !deleted.get() && is_installed(),
+            cfg!(windows),
+            system,
+            &runner,
+        );
         format!("{e}{note}\nRun this again to go on with what is left.")
     };
     stop_client(dirs).await.map_err(after_stop)?;
     // What was made while the question waited and the client shut down is the
     // client's too.
     let found = crate::purge::find(dirs).map_err(after_stop)?;
-    apply_plan(&uninstall).map_err(after_stop)?;
+    apply(&uninstall).map_err(after_stop)?;
     deleted.set(true);
+    // The keyring first: the config that says what is there goes with the files.
+    if keyring_token {
+        tokens.delete().await.map_err(after_stop)?;
+    }
+    if keyring_password {
+        crate::secrets::forget(
+            dirs,
+            sync_policy::config::SecretStorage::Keyring,
+            keyring.as_ref(),
+        )
+        .await
+        .map_err(after_stop)?;
+    }
     for p in &olds {
         match std::fs::remove_file(p) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1782,9 +2239,14 @@ async fn purge(dirs: &Dirs, system: bool, print: bool, yes: bool) -> Result<Exit
         }
     }
     for f in crate::purge::remove(&found).map_err(after_stop)? {
-        println!("Kept {}: something in it is not the client's.", f.display());
+        let kept = format!("Kept {}: something in it is not the client's.", f.display());
+        if window {
+            hints.push(kept);
+        } else {
+            println!("{kept}");
+        }
     }
-    println!("Removed.");
+    say!("Removed.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1799,6 +2261,34 @@ mod tests {
     use crate::control::Status;
     use clap::{CommandFactory, Parser};
     use sync_connector::{LinkState, LinkStatus};
+
+    #[test]
+    fn only_the_short_commands_die_on_sigpipe() {
+        let cmd = |args: &[&str]| {
+            let argv: Vec<&str> = std::iter::once("pithagoras-sync")
+                .chain(args.iter().copied())
+                .collect();
+            Cli::try_parse_from(argv).unwrap().cmd
+        };
+        for args in [&[][..], &["gui"], &["run"]] {
+            assert!(!super::dies_on_sigpipe(cmd(args).as_ref()), "{args:?}");
+        }
+        for args in [&["status"][..], &["folder", "list"]] {
+            assert!(super::dies_on_sigpipe(cmd(args).as_ref()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_lone_argument_is_a_link_only_with_the_scheme() {
+        let a = |s: &str| super::link_argument(&["pithagoras-sync".into(), s.into()]);
+        assert_eq!(
+            a("Pithagoras-Sync://pair?x").as_deref(),
+            Some("Pithagoras-Sync://pair?x")
+        );
+        assert_eq!(a("status"), None);
+        // The scheme's length ends inside a character: no link, and no panic.
+        assert_eq!(a(&format!("{}é", "a".repeat(15))), None);
+    }
     use sync_policy::config::SecretStorage;
     use sync_proto::methods::{Access, ApprovalInfo, Choice, FolderInfo};
 
@@ -1994,17 +2484,168 @@ mod tests {
         assert!(cmd.find_subcommand("secret").is_none());
     }
 
+    /// A purge that fails after the stop while the unit or task is still there
+    /// puts back what was on before, and nothing else: a task or unit the
+    /// owner had switched off stays off, and a client that was not running is
+    /// not started. Only when putting back fails it says how.
+    #[test]
+    fn a_failed_purge_puts_back_only_what_was_on() {
+        use super::after_stop_note;
+        use crate::actions::{Fake, argv};
+        use crate::install::Before;
+        let on = Before {
+            enabled: true,
+            running: true,
+        };
+        let off = Before {
+            enabled: false,
+            running: false,
+        };
+        let task = |a: &str| argv(&["schtasks", a, "/TN", "Pithagoras Sync"]);
+        let mut enable = task("/Change");
+        enable.push("/ENABLE".into());
+        let fake = Fake::default();
+        let n = after_stop_note(Some(on), true, true, false, &fake);
+        assert_eq!(
+            n,
+            "\nThe logon task was switched on again and starts the client."
+        );
+        assert_eq!(*fake.ran.lock().unwrap(), [enable.clone(), task("/Run")]);
+        // On, but no client ran: switched on, not run.
+        let fake = Fake::default();
+        let idle = Before {
+            enabled: true,
+            running: false,
+        };
+        let n = after_stop_note(Some(idle), true, true, false, &fake);
+        assert_eq!(n, "\nThe logon task was switched on again.");
+        assert_eq!(*fake.ran.lock().unwrap(), [enable.clone()]);
+        // Switched off before: it stays so, whether a client ran beside it or not.
+        for running in [false, true] {
+            let fake = Fake::default();
+            let b = Before {
+                enabled: false,
+                running,
+            };
+            let n = after_stop_note(Some(b), true, true, false, &fake);
+            assert_eq!(n, "\nThe logon task stays switched off, as it was before.");
+            assert!(fake.ran.lock().unwrap().is_empty());
+        }
+        let fake = Fake {
+            answers: vec![("schtasks /Change".into(), Err("refused".into()))],
+            ..Fake::default()
+        };
+        let n = after_stop_note(Some(on), true, true, false, &fake);
+        assert!(
+            n.contains("/TN \"Pithagoras Sync\" /ENABLE` turns it on"),
+            "{n}"
+        );
+        for system in [false, true] {
+            let systemctl = |what: &str| {
+                let mut a = vec!["systemctl"];
+                if !system {
+                    a.push("--user");
+                }
+                a.extend([what, "pithagoras-sync.service"]);
+                argv(&a)
+            };
+            for (b, ran, said) in [
+                (
+                    on,
+                    vec![systemctl("enable"), systemctl("start")],
+                    "\nThe unit was switched on and started again.",
+                ),
+                (
+                    Before {
+                        enabled: true,
+                        running: false,
+                    },
+                    vec![systemctl("enable")],
+                    "\nThe unit was switched on again.",
+                ),
+                (
+                    Before {
+                        enabled: false,
+                        running: true,
+                    },
+                    vec![systemctl("start")],
+                    "\nThe unit was started again.",
+                ),
+                (off, vec![], "\nThe unit stays off, as it was before."),
+            ] {
+                let fake = Fake::default();
+                let n = after_stop_note(Some(b), true, false, system, &fake);
+                assert_eq!(n, said, "{b:?}");
+                assert_eq!(*fake.ran.lock().unwrap(), ran, "{b:?}");
+            }
+        }
+        // Nothing stopped, or deleted already: nothing to put back.
+        for (before, installed) in [(None, true), (Some(on), false)] {
+            let fake = Fake::default();
+            let n = after_stop_note(before, installed, true, false, &fake);
+            assert_eq!(n, stop_note(before, !installed, true, false));
+            assert!(fake.ran.lock().unwrap().is_empty());
+        }
+    }
+
+    /// `uninstall --purge` on Windows ends the task once, in its stop.
+    #[test]
+    fn the_purge_ends_the_task_once() {
+        use crate::actions::Action;
+        use crate::install::{windows_stop_plan, windows_uninstall_plan};
+        let stop = windows_stop_plan();
+        let all: Vec<Action> = stop
+            .iter()
+            .cloned()
+            .chain(super::not_again(
+                &stop,
+                windows_uninstall_plan(r"C:\x", true),
+            ))
+            .collect();
+        let ends = all
+            .iter()
+            .filter(|a| a.describe().contains("schtasks /End"))
+            .count();
+        assert_eq!(ends, 1, "{all:?}");
+        assert!(all.iter().any(|a| a.describe().contains("/Delete")));
+    }
+
+    #[test]
+    fn full_mode_says_how_long_in_words() {
+        use super::full_for;
+        assert_eq!(full_for(0), ", with no expiry");
+        assert_eq!(full_for(1), ", for 1 hour");
+        assert_eq!(full_for(8), ", for 8 hours");
+    }
+
     #[test]
     fn a_purge_error_says_what_the_stop_left() {
-        assert_eq!(stop_note(false, false, true, false), "");
+        use crate::install::Before;
+        let b = |enabled, running| Some(Before { enabled, running });
+        assert_eq!(stop_note(None, false, true, false), "");
         // The task's name has a space and is quoted, so the command works as printed.
-        let w = stop_note(true, false, true, false);
+        let w = stop_note(b(true, true), false, true, false);
         assert!(w.contains("/TN \"Pithagoras Sync\" /ENABLE"), "{w}");
-        assert!(stop_note(true, false, false, false).contains("systemctl --user start"));
-        assert!(stop_note(true, false, false, true).contains("sudo systemctl start"));
+        assert!(stop_note(b(false, false), false, true, false).contains("stays switched off"));
+        // As it was: switched on and started, only one of them, or neither.
+        for (system, sc) in [(false, "systemctl --user"), (true, "sudo systemctl")] {
+            for (enabled, running, what) in [
+                (true, true, "enable --now"),
+                (true, false, "enable"),
+                (false, true, "start"),
+            ] {
+                let n = stop_note(b(enabled, running), false, false, system);
+                assert!(
+                    n.contains(&format!("`{sc} {what} pithagoras-sync.service`")),
+                    "{n}"
+                );
+            }
+            let n = stop_note(b(false, false), false, false, system);
+            assert_eq!(n, "\nThe unit stays off, as it was before.");
+        }
         // Once the task is deleted there is nothing to switch on.
         for windows in [true, false] {
-            let d = stop_note(true, true, windows, false);
+            let d = stop_note(b(true, true), true, windows, false);
             assert!(
                 d.contains("deleted already") && !d.contains("/ENABLE"),
                 "{d}"
@@ -2040,6 +2681,7 @@ mod tests {
             portal_policy: "write".into(),
             elevation: "off".into(),
             elevation_password: false,
+            token_storage: "file".into(),
             running_commands: 0,
             cgroups: false,
             landlock: true,

@@ -13,6 +13,7 @@ This file applies to every agent in this repo.
 - `crates/pithagoras-sync`: the binary: CLI, daemon, control socket, `install` and `setup`.
 - `docs/permissions.md`: every setting with its default, CLI command and whether the portal may set it. A new setting goes there, and into `settings::DEVICE_ONLY` when the portal must not change it.
 - `docs/testing.md`: the tools for trying a client by hand and the record of the test machine.
+- `docs/install.md`: the graphical install, pairing, sudo access and uninstall for people, window by window (`gui`, `crates/pithagoras-sync/src/gui.rs`, `dialogs.rs`). Every text a window shows lives in `i18n.rs`, in English and German; a new one gets both. `assets/` holds the icon `install` writes.
 - `docs/windows.md`: what differs on Windows and what is unverified there.
 - `crates/release`: `sync-release`, the release tooling: the release key (`keygen`, `sign`) and the signed update manifest. The minisign signer lives here. `docs/releasing.md` and `.github/workflows/release.yml` describe the release.
 - `crates/testkit`: the mock portal the tests talk to, plus two programs for manual runs: `sync-mock-portal` (the mock on loopback, driven over stdin) and `sync-test-sign` (throwaway minisign keys and signatures). The real portal side does not exist yet.

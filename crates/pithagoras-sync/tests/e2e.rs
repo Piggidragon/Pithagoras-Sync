@@ -19,6 +19,8 @@ struct Env {
     _t: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
+    /// More variables every command gets (a private session bus).
+    vars: Vec<(String, String)>,
 }
 
 impl Env {
@@ -30,7 +32,12 @@ impl Env {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         std::fs::write(home.join(".ssh/id_ed25519"), "secret").unwrap();
-        Env { _t: t, root, home }
+        Env {
+            _t: t,
+            root,
+            home,
+            vars: Vec::new(),
+        }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -46,8 +53,21 @@ impl Env {
             .env("USER", "tester")
             // A secret in the client's own environment must not reach commands.
             .env("PORTAL_SECRET", "must-not-leak")
+            // The stand-in dialog programs (`fake_dialogs`) count as the
+            // system's; the debug build alone reads this.
+            .env("PITHAGORAS_SYNC_TEST_DIALOG_DIR", self.root.join("fakebin"))
+            .envs(self.vars.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        // No keyring at all unless the test brings the fake one: without a bus
+        // address zbus would find the real session bus of whoever runs this.
+        if !self
+            .vars
+            .iter()
+            .any(|(k, _)| k == "DBUS_SESSION_BUS_ADDRESS")
+        {
+            c.env("PITHAGORAS_SYNC_NO_KEYRING", "1");
+        }
         c
     }
 
@@ -399,19 +419,27 @@ async fn a_step_that_may_fail_shows_only_the_clients_note() {
 
 /// A `systemctl` and `loginctl` on PATH that write their arguments to
 /// `systemctl.log` and succeed, but say no unit is active: nothing reaches the
-/// real systemd. Returns the PATH to run with.
+/// real systemd. With the file `unit-state` in the test's root (two lines:
+/// what `is-enabled` and `show -p ActiveState` say) they answer those as a
+/// unit in that state. Returns the PATH to run with.
 fn fake_systemd(env: &Env) -> String {
     use std::os::unix::fs::PermissionsExt;
     let bin = env.root.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
     let log = env.root.join("systemctl.log");
+    let state = env.root.join("unit-state");
     for prog in ["systemctl", "loginctl"] {
         let p = bin.join(prog);
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\necho \"{prog} $*\" >> '{}'\ncase \"$1\" in is-active) exit 3;; esac\nexit 0\n",
-                log.display()
+                "#!/bin/sh\necho \"{prog} $*\" >> '{log}'\ncase \"$1\" in is-active) exit 3;; esac\n\
+                 if [ -f '{state}' ]; then case \" $* \" in\n\
+                 *' is-enabled '*) e=$(sed -n 1p '{state}'); echo \"$e\"; [ \"$e\" = enabled ]; exit;;\n\
+                 *' ActiveState '*) sed -n 2p '{state}'; exit 0;;\n\
+                 esac; fi\nexit 0\n",
+                log = log.display(),
+                state = state.display()
             ),
         )
         .unwrap();
@@ -553,6 +581,146 @@ async fn purge_removes_what_the_client_left_but_the_program() {
     assert!(out.status.success(), "{text}");
     assert!(text.starts_with("Nothing to remove.\n"), "{text}");
     assert!(text.contains("The program itself stays"), "{text}");
+}
+
+/// `uninstall --purge` with the unit's folder read-only, so it fails after the
+/// stop while the unit is still there; `state` is what systemd says of the
+/// unit before (`is-enabled`, then `ActiveState`), `client` whether a client
+/// runs. Returns what it said on stderr and the systemctl calls after the
+/// uninstall's `disable --now`.
+async fn failed_purge(state: &str, client: bool) -> (String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    std::fs::write(env.root.join("unit-state"), state).unwrap();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    let daemon = if client {
+        env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "failpurge"])
+            .await;
+        let daemon = env.start();
+        mock.next_device(WAIT).await.expect("the client connects");
+        Some(daemon)
+    } else {
+        env.ok(&["mode", "ask"]).await;
+        None
+    };
+    let unit = env
+        .home
+        .join(".config/systemd/user/pithagoras-sync.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "installed").unwrap();
+    // The unit file cannot be removed: the uninstall fails after the stop.
+    let folder = unit.parent().unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = env
+        .cmd(&["uninstall", "--purge", "--yes"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("Run this again"), "{err}");
+    assert!(unit.exists());
+    if let Some(d) = daemon {
+        assert!(gone(d.id().unwrap()).await, "the client was stopped");
+    }
+    let calls = std::fs::read_to_string(env.root.join("systemctl.log")).unwrap();
+    let disable = "systemctl --user disable --now pithagoras-sync.service\n";
+    let after = calls
+        .find(disable)
+        .map(|i| calls[i + disable.len()..].to_string())
+        .unwrap_or_else(|| panic!("no disable: {calls}"));
+    (err, after)
+}
+
+/// A purge that fails while the unit is still there puts back what it
+/// stopped, so the device is not left offline, and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_that_fails_starts_the_unit_again() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root removes the unit file anyway.
+        return;
+    }
+    let (err, after) = failed_purge("enabled\nactive\n", false).await;
+    assert!(
+        err.contains("The unit was switched on and started again."),
+        "{err}"
+    );
+    assert_eq!(
+        after,
+        "systemctl --user enable pithagoras-sync.service\nsystemctl --user start pithagoras-sync.service\n"
+    );
+    // A client running beside a unit that was switched off and down: the
+    // client comes back through the unit, which stays switched off.
+    let (err, after) = failed_purge("disabled\ninactive\n", true).await;
+    assert!(err.contains("The unit was started again."), "{err}");
+    assert_eq!(after, "systemctl --user start pithagoras-sync.service\n");
+}
+
+/// A purge that fails switches on and starts nothing the owner had off: the
+/// unit was switched off and no client ran, so it stays that way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_that_fails_leaves_a_unit_that_was_off_off() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let (err, after) = failed_purge("disabled\ninactive\n", false).await;
+    assert!(
+        err.contains("The unit stays off, as it was before."),
+        "{err}"
+    );
+    assert_eq!(after, "");
+}
+
+/// Uninstalling in the window prints nothing (there is no terminal): what
+/// the purge would print for the owner comes as a note in the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_windows_purge_shows_its_notes_in_the_window() {
+    let env = Env::new();
+    fake_systemd(&env);
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "winpurge"])
+        .await;
+    looks_installed(&env);
+    // Not the client's: the folder stays, and the window says so.
+    let config = env.home.join(".config/pithagoras-sync");
+    std::fs::write(config.join("mine.txt"), "keep").unwrap();
+    let path = fake_dialogs(&env, &["0|uninstall", "0|", "0|", "0|"]);
+    let out = env
+        .cmd(&["gui"])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 4, "{shown:#?}");
+    let last = &shown[3];
+    assert!(last.contains("Pithagoras Sync is uninstalled"), "{last}");
+    assert!(
+        last.contains(&format!(
+            "Note: Kept {}: something in it is not the client's.",
+            config.display()
+        )),
+        "{last}"
+    );
+    assert!(config.join("mine.txt").exists());
+    assert!(!config.join("config.toml").exists());
 }
 
 /// A client folder that is a link leads to files that are not the client's to
@@ -753,6 +921,32 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
             assert!(out.contains("cannot come from commands"), "{args}: {out}");
         }
     }
+    // The graphical flow with a link, from a command: refused before it asks
+    // anything, even with a display and a dialog program that would say yes.
+    let path = fake_dialogs(&env, &["0|", "0|", "0|"]);
+    let evil = "pithagoras-sync://pair?portal=http://127.0.0.1:9&code=EVIL1";
+    let (out, _) = exec(
+        &dl,
+        40,
+        &format!(
+            "DISPLAY=:99 PATH={path} PITHAGORAS_SYNC_TEST_DIALOG_DIR={} {}",
+            env.p("fakebin"),
+            me(&format!("'{evil}'"))
+        ),
+        &env.p("home/proj"),
+    )
+    .await;
+    assert!(out.contains("exit=1"), "{out}");
+    let shown = dialogs_shown(&env);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(shown[0].contains(&"--error".to_string()), "{shown:?}");
+    assert!(
+        shown[0]
+            .last()
+            .unwrap()
+            .contains("cannot come from commands"),
+        "{shown:?}"
+    );
     // Refused, so the audit log the owner relies on is still there.
     assert!(
         env.home
@@ -819,6 +1013,651 @@ async fn install_print_and_toggle() {
     let out = env.cmd(&["status"]).output().await.unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
+}
+
+/// `install` in a graphical session also writes the menu entry, the icon and the
+/// handler of pairing links, and `uninstall` and `uninstall --purge` take them
+/// away. Stand-ins for systemctl, update-desktop-database and xdg-mime log
+/// their arguments: nothing reaches the real systemd or the real `~/.local`.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_in_a_desktop_session_registers_the_pairing_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let path = fake_systemd(&env);
+    let log = env.root.join("systemctl.log");
+    for prog in ["update-desktop-database", "xdg-mime"] {
+        let p = env.root.join("fakebin").join(prog);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\necho \"{prog} $*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let data = env.root.join("data");
+    let run = |args: &[&str], display: bool| {
+        let mut c = env.cmd(args);
+        c.env("PATH", &path).env("XDG_DATA_HOME", &data);
+        if display {
+            c.env("DISPLAY", ":99");
+        }
+        c
+    };
+    let entry = data.join("applications/pithagoras-sync.desktop");
+    let icon = data.join("icons/hicolor/scalable/apps/pithagoras-sync.svg");
+    // Over ssh (no display) nothing of the desktop's.
+    let out = run(&["install", "--print"], false).output().await.unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        !text.contains(".desktop") && !text.contains("xdg-mime"),
+        "{text}"
+    );
+
+    let out = run(&["install", "--print"], true).output().await.unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("write {}", entry.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("write {}", icon.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("xdg-mime default pithagoras-sync.desktop x-scheme-handler/pithagoras-sync"),
+        "{text}"
+    );
+    assert!(!entry.exists());
+
+    let out = run(&["install"], true).output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let program = env.home.join(".local/bin/pithagoras-sync");
+    let desktop = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        desktop.contains(&format!("Exec=\"{}\" gui %u", program.display())),
+        "{desktop}"
+    );
+    assert!(std::fs::read_to_string(&icon).unwrap().starts_with("<svg"));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains(&format!(
+            "update-desktop-database {}",
+            data.join("applications").display()
+        )),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("xdg-mime default pithagoras-sync.desktop x-scheme-handler/pithagoras-sync"),
+        "{calls}"
+    );
+
+    // `uninstall` (no display needed) lists and removes them.
+    let out = run(&["uninstall", "--print"], false)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("remove {}", entry.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("remove {}", icon.display())),
+        "{text}"
+    );
+    assert!(entry.exists());
+    let out = run(&["uninstall"], false).output().await.unwrap();
+    assert!(out.status.success());
+    assert!(!entry.exists() && !icon.exists());
+
+    // Left without the unit, `--purge` still finds them.
+    let out = run(&["install"], true).output().await.unwrap();
+    assert!(out.status.success());
+    std::fs::remove_file(
+        env.home
+            .join(".config/systemd/user/pithagoras-sync.service"),
+    )
+    .unwrap();
+    let out = run(&["uninstall", "--purge", "--yes"], false)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("remove {}", entry.display())),
+        "{text}"
+    );
+    assert!(!entry.exists() && !icon.exists());
+    // The program stays, as `--purge` says.
+    assert!(program.exists());
+}
+
+/// A stand-in `zenity` (and `kdialog`) in `fakebin`: it writes each dialog's
+/// arguments, one per line and a `----` line after them, to `dialogs.log`, its
+/// environment to `dialogs.env`, and answers with the next line of
+/// `dialogs.answers` (`<exit code>|<output>`; none left is a cancel). Returns
+/// the PATH to run with.
+fn fake_dialogs(env: &Env, answers: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = env.root.join("dialogs.log");
+    let envlog = env.root.join("dialogs.env");
+    let open = env.root.join("dialogs.parent");
+    let ans = env.root.join("dialogs.answers");
+    std::fs::write(
+        &ans,
+        answers.iter().map(|a| format!("{a}\n")).collect::<String>(),
+    )
+    .unwrap();
+    for prog in ["zenity", "kdialog"] {
+        let p = bin.join(prog);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\necho ---- >> '{log}'\nenv >> '{envlog}'\ncat /proc/$PPID/environ >/dev/null 2>&1 && echo $PPID >> '{open}'\nline=$(head -n 1 '{ans}')\nsed -i 1d '{ans}'\n[ -z \"$line\" ] && exit 1\nout=${{line#*|}}\n[ -n \"$out\" ] && printf '%s\\n' \"$out\"\nexit ${{line%%|*}}\n",
+                log = log.display(),
+                envlog = envlog.display(),
+                open = open.display(),
+                ans = ans.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Whether a dialog program could read the memory of the process that showed
+/// it, as any process of the same user could (`/proc/<pid>/environ` stands in
+/// for `/proc/<pid>/mem`).
+fn dialog_parent_was_open(env: &Env) -> bool {
+    env.root.join("dialogs.parent").exists()
+}
+
+/// The dialogs shown so far: each one's arguments.
+fn dialogs_shown(env: &Env) -> Vec<Vec<String>> {
+    let log = std::fs::read_to_string(env.root.join("dialogs.log")).unwrap_or_default();
+    log.split("----\n")
+        .filter(|d| !d.is_empty())
+        .map(|d| d.lines().map(str::to_string).collect())
+        .collect()
+}
+
+/// Makes the client look installed for this user (the unit file `install`
+/// writes), so the graphical flow goes straight to pairing.
+fn looks_installed(env: &Env) {
+    let unit = env
+        .home
+        .join(".config/systemd/user/pithagoras-sync.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(unit, "installed").unwrap();
+}
+
+/// A pairing link opened from the browser (the program started with the link
+/// alone): one question showing the portal it parsed, never the raw link or its
+/// code, then the pairing as `pair` does it, and the running client connects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_link_pairs_after_the_owner_says_yes() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    // A headless config: pairing asks no password there, as `pair` asks none
+    // (the desktop's password check: `pairing_in_the_window_on_a_desktop_...`).
+    env.ok(&["mode", "ask"]).await;
+    let path = fake_dialogs(&env, &["0|", "0|"]);
+    let daemon = env.start();
+    let link = mock.pair_uri("CODE9999");
+    let out = env
+        .cmd(&[&link])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    mock.next_device(WAIT).await.expect("the client connects");
+    let shown = dialogs_shown(&env);
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    assert!(shown[0].contains(&"--question".to_string()), "{shown:?}");
+    let question = shown[0].join("\n");
+    let portal = link
+        .split("portal=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap()
+        .replace("%3A", ":")
+        .replace("%2F", "/");
+    assert!(
+        question.contains(&format!("portal {portal} as \"")),
+        "{question}"
+    );
+    assert!(!question.contains("CODE9999") && !question.contains("pithagoras-sync://"));
+    assert!(shown[1].contains(&"--info".to_string()));
+    assert!(
+        shown[1].join("\n").contains("running, connected to"),
+        "{shown:?}"
+    );
+    // The dialog program got a cleaned environment.
+    let denv = std::fs::read_to_string(env.root.join("dialogs.env")).unwrap();
+    assert!(
+        !denv.contains("PORTAL_SECRET") && !denv.contains("must-not-leak"),
+        "{denv}"
+    );
+    assert!(denv.contains("DISPLAY=:99"), "{denv}");
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains(&format!("url = \"{portal}\"")), "{cfg}");
+    stop(daemon).await;
+}
+
+/// On a desktop, pairing from the window asks for the user's password as
+/// `pair` does in a terminal, and checks it with `su` (which refuses it here:
+/// the test's user has none). Nothing is paired, the code stays unused, and the
+/// password is in no file and no dialog's arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_in_the_window_on_a_desktop_needs_the_users_password() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let answer = format!("0|{PW}");
+    let path = fake_dialogs(&env, &["0|", &answer]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 3, "{shown:#?}");
+    assert!(shown[0].contains("--question"), "{shown:#?}");
+    assert!(
+        shown[1].contains("--hide-text") && shown[1].contains("needs your password ("),
+        "{shown:#?}"
+    );
+    assert!(shown[2].contains("--error"), "{shown:#?}");
+    assert!(!env.config().exists());
+    assert!(!env.home.join(".config/pithagoras-sync/token").exists());
+    assert_eq!(
+        files_holding(&env.root, PW.as_bytes()),
+        Vec::<PathBuf>::new()
+    );
+    // The password passed through the window, whose memory no other process
+    // of the user could read.
+    assert!(!dialog_parent_was_open(&env));
+    // The code is still unused.
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+}
+
+/// Something traces the window (a debugger, or a command of the agent that
+/// attached before it could stop that): it asks for no password and says why.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_window_asks_for_no_password_while_traced() {
+    use std::os::unix::process::CommandExt as _;
+    let env = Env::new();
+    looks_installed(&env);
+    let answer = format!("0|{PW}");
+    let path = fake_dialogs(&env, &["0|", &answer, "0|"]);
+    let mut cmd = env.cmd(&[
+        "gui",
+        "--link",
+        "pithagoras-sync://pair?portal=http://127.0.0.1:9&code=CODE9999",
+    ]);
+    cmd.env("PATH", &path).env("DISPLAY", ":99");
+    // Spawned and traced from one thread: only that thread is its tracer.
+    let code = tokio::task::spawn_blocking(move || {
+        let cmd = cmd.as_std_mut();
+        // SAFETY: ptrace only, async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // Reaped below with waitpid, as its tracer must.
+        #[allow(clippy::zombie_processes)]
+        let child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        // As the tracer: let it go on after every stop, until it exits.
+        loop {
+            let mut status = 0;
+            // SAFETY: waits for our own child.
+            if unsafe { libc::waitpid(pid, &mut status, libc::__WALL) } < 0 {
+                panic!("waitpid: {}", std::io::Error::last_os_error());
+            }
+            if libc::WIFEXITED(status) {
+                break libc::WEXITSTATUS(status);
+            }
+            if libc::WIFSIGNALED(status) {
+                break -libc::WTERMSIG(status);
+            }
+            if libc::WIFSTOPPED(status) {
+                let sig = match libc::WSTOPSIG(status) {
+                    libc::SIGTRAP => 0,
+                    s => s,
+                };
+                // SAFETY: the window is our tracee.
+                unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, sig) };
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 1);
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 1, "{shown:#?}");
+    assert!(
+        shown[0].contains("--error") && shown[0].contains("being traced"),
+        "{shown:#?}"
+    );
+}
+
+/// No to the question: nothing is paired, the code is not used.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_link_the_owner_refuses_changes_nothing() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let path = fake_dialogs(&env, &["1|"]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(dialogs_shown(&env).len(), 1);
+    assert!(!env.config().exists());
+    assert!(!env.home.join(".config/pithagoras-sync/token").exists());
+    // The code is still unused: `pair` takes it.
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+}
+
+/// In a German session the windows speak German, and the dialog program gets
+/// the language for its buttons.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_windows_follow_the_desktops_language() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    looks_installed(&env);
+    let path = fake_dialogs(&env, &["1|"]);
+    let out = env
+        .cmd(&["gui", "--link", &mock.pair_uri("CODE9999")])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .env("LANG", "de_DE.UTF-8")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let shown = dialogs_shown(&env);
+    let q = shown[0].join("\n");
+    assert!(
+        q.contains("Diesen Computer mit dem Pithagoras-Portal"),
+        "{q}"
+    );
+    assert!(q.contains("koppeln?"), "{q}");
+    let denv = std::fs::read_to_string(env.root.join("dialogs.env")).unwrap();
+    assert!(denv.contains("LANG=de_DE.UTF-8"), "{denv}");
+    // Where that locale is not installed, the dialog program gets one that is
+    // (else it refuses the umlauts and shows nothing), and the language.
+    if let Some(l) = denv.lines().find_map(|l| l.strip_prefix("LC_ALL=")) {
+        assert!(
+            l.to_lowercase().replace('-', "").ends_with(".utf8"),
+            "{denv}"
+        );
+        assert!(denv.contains("LANGUAGE=de\n"), "{denv}");
+    }
+    assert!(!env.config().exists());
+}
+
+/// Every file below `dir` that holds `needle`.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() && !p.is_symlink() {
+            found.extend(files_holding(&p, needle));
+        } else if let Ok(b) = std::fs::read(&p)
+            && b.windows(needle.len()).any(|w| w == needle)
+        {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// The sudo password typed into a window: a wrong one is refused by sudo and
+/// never kept; the right one goes to the running client and sudo access is
+/// switched on after a yes. The password is in no dialog's arguments or
+/// environment, no file and no process's command line or environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sudo_password_can_be_set_in_the_window() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "elev"])
+        .await;
+    let sudo = fake_sudo(&env);
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.sudo_path",
+        &sudo.to_string_lossy(),
+    ])
+    .await;
+    looks_installed(&env);
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    let pw_answer = format!("0|{PW}");
+    let path = fake_dialogs(
+        &env,
+        &[
+            "0|sudo",
+            "0|set",
+            "0|not the password",
+            "0|",
+            "0|set",
+            &pw_answer,
+            "0|",
+            "0|",
+            "0|back",
+            "0|quit",
+        ],
+    );
+    let out = env
+        .cmd(&["gui"])
+        .env("PATH", &path)
+        .env("DISPLAY", ":99")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: Vec<String> = dialogs_shown(&env).iter().map(|d| d.join("\n")).collect();
+    assert_eq!(shown.len(), 10, "{shown:#?}");
+    assert!(shown[2].contains("--hide-text"), "{shown:#?}");
+    assert!(
+        shown[3].contains("sudo did not accept this password (sudo: 1 incorrect password attempt)"),
+        "{shown:#?}"
+    );
+    assert!(
+        shown[6].contains("The password is stored in the running client."),
+        "{shown:#?}"
+    );
+    assert!(shown[7].contains("Sudo access is on."), "{shown:#?}");
+    assert!(
+        shown[8].contains("Sudo access: on. Password: stored."),
+        "{shown:#?}"
+    );
+    // Checked with -k, the password on stdin: two checks, each asking first
+    // whether sudo needs one at all.
+    let validated = std::fs::read_to_string(env.root.join("fakesudo.validated")).unwrap();
+    assert_eq!(
+        validated.lines().collect::<Vec<_>>(),
+        ["-k -n -v", "-k -S -p  -v", "-k -n -v", "-k -S -p  -v"]
+    );
+    assert_eq!(env.elevation().await, "sudo");
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(
+        r.out.contains("Password:    set (kept in memory)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        files_holding(&env.root, PW.as_bytes()),
+        Vec::<PathBuf>::new()
+    );
+    assert_eq!(in_proc(PW.as_bytes()), None);
+    stop(daemon).await;
+}
+
+/// Without a display, or without a dialog program, `gui` shows nothing: it
+/// says so on stderr and in `gui.log`. Neither a start without a command
+/// nor any other command starts the dialogs there.
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_run_without_a_display_or_a_bus() {
+    let env = Env::new();
+    let path = fake_dialogs(&env, &["0|", "0|", "0|"]);
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1111".into()],
+    })
+    .await;
+    let run = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.env("PATH", &path);
+        c
+    };
+    // The program alone (no terminal, no display): the help, nothing else.
+    let out = run(&[]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Usage:"), "{err}");
+    let out = run(&["gui"]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot show its windows"), "{err}");
+    let state = env.home.join(".local/state/pithagoras-sync");
+    let log = std::fs::read_to_string(state.join("gui.log")).unwrap();
+    assert!(
+        log.contains("gui: Pithagoras Sync cannot show its windows"),
+        "{log}"
+    );
+    // Not in client.log: that file there would make the windows open it as the
+    // client's log later instead of the journal.
+    assert!(!state.join("client.log").exists());
+    let out = run(&[&mock.pair_uri("CODE1111")]).output().await.unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    // With a display but no dialog program on PATH: the same.
+    let out = env
+        .cmd(&["gui"])
+        .env("DISPLAY", ":99")
+        .env("PATH", "/nonexistent")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    // Dialog programs in a folder the user can write, first on PATH: not used,
+    // as they could keep the passwords typed into them.
+    let planted = env.root.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    for prog in ["zenity", "kdialog"] {
+        std::fs::copy(env.root.join("fakebin").join(prog), planted.join(prog)).unwrap();
+    }
+    let before = dialogs_shown(&env).len();
+    let out = env
+        .cmd(&["gui"])
+        .env("DISPLAY", ":99")
+        .env("PATH", format!("{}:/nonexistent", planted.display()))
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        dialogs_shown(&env).len(),
+        before,
+        "{:#?}",
+        dialogs_shown(&env)
+    );
+    for args in [
+        &["install", "--print"][..],
+        &["uninstall", "--print"],
+        &["uninstall", "--purge", "--print"],
+        &["status"],
+        &["status", "--json"],
+        &["config", "get"],
+        &["mode"],
+        &["folder", "list"],
+        &["sudo", "status"],
+        &["setup", "--create-user", "--print"],
+        &["update", "--check"],
+        &["approvals"],
+        &["toggle"],
+        &[
+            "pair",
+            "pithagoras-sync://pair?portal=https://x.example&code=A B",
+        ],
+    ] {
+        let out = tokio::time::timeout(WAIT, run(args).output())
+            .await
+            .unwrap_or_else(|_| panic!("{args:?} hangs"))
+            .unwrap();
+        // Each ends on its own (some with an error: nothing is paired or running).
+        assert!(out.status.code().is_some(), "{args:?}");
+    }
+    env.ok(&["pair", &mock.pair_uri("CODE1111")]).await;
+    let daemon = env.start();
+    mock.next_device(WAIT).await.expect("the client connects");
+    env.ok(&["status"]).await;
+    stop(daemon).await;
+    assert!(dialogs_shown(&env).is_empty(), "{:?}", dialogs_shown(&env));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -905,7 +1744,8 @@ const PW: &str = "Elev8-pw \"q\\z";
 
 /// A stand-in for sudo: takes the password from stdin like `sudo -S`, compares
 /// its hash, then runs the command as is (the test machine is never touched as
-/// root).
+/// root). `-v` only checks the password (`-n -v`: whether none is needed) and
+/// logs its arguments to `fakesudo.validated`.
 fn fake_sudo(env: &Env) -> PathBuf {
     let mut c = std::process::Command::new("sha256sum")
         .stdin(Stdio::piped())
@@ -925,6 +1765,15 @@ fn fake_sudo(env: &Env) -> PathBuf {
         &path,
         format!(
             r#"#!/bin/sh
+case " $* " in *" -v "*)
+  echo "$*" >> "$0.validated"
+  [ -e "$0.nopasswd" ] && exit 0
+  case " $* " in *" -n "*) echo "sudo: a password is required" >&2; exit 1;; esac
+  IFS= read -r pw || {{ echo "sudo: no password" >&2; exit 1; }}
+  h=$(printf '%s' "$pw" | sha256sum); pw=
+  [ "${{h%% *}}" = "{hash}" ] || {{ echo "sudo: 1 incorrect password attempt" >&2; exit 1; }}
+  exit 0;;
+esac
 case "$1" in -n) echo "sudo: a password is required" >&2; exit 1;; esac
 while [ "$1" != "--" ]; do shift; done; shift
 # A sudoers rule without a password: sudo leaves stdin alone.
@@ -1350,6 +2199,7 @@ finish(None)
             .env("TMPDIR", self.root.join("tmp"))
             .env("LANG", "C.UTF-8")
             .env("USER", "tester")
+            .env("PITHAGORAS_SYNC_NO_KEYRING", "1")
             .stdin(Stdio::null())
             .output()
             .ok()?;
@@ -1849,4 +2699,753 @@ async fn a_detached_client_writes_its_log_to_a_file() {
     assert!(!log.contains('\x1b'), "{log}");
     let stderr = std::fs::read_to_string(env.root.join("stderr.txt")).unwrap();
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Waits until `f` holds, up to `WAIT`.
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + WAIT;
+    while !f() {
+        assert!(std::time::Instant::now() < end, "never happened: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The client reads the password from the keyring at start, and the keyring
+/// asks the owner to unlock it first. A `panic` while that prompt waits wins:
+/// what is read after it is not kept, until `unlock` loads it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_while_the_keyring_prompt_waits_keeps_the_password_out() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = None;
+    }
+    let daemon = env.start();
+    eventually("the client asks to unlock the keyring", || {
+        state.lock().unwrap().prompts > 0
+    })
+    .await;
+    env.ok(&["panic"]).await;
+    keyring::answer_waiting(&state, true).await;
+    let log = env.root.join("daemon.log");
+    eventually("the client drops what it read after panic", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("elevation password not loaded: panic")
+    })
+    .await;
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["paused"], true);
+    assert_eq!(status["elevation_password"], false, "{status}");
+    // The stored one is still there for unlock.
+    env.ok(&["unlock"]).await;
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+    assert_eq!(status["elevation_password"], true, "{status}");
+    stop(daemon).await;
+}
+
+/// The client started before the keyring service (at login): it tries again,
+/// connects and loads the password once the service is there, without the
+/// owner doing anything.
+/// A reload while the keyring cannot be read (locked, its prompt cancelled)
+/// leaves the running link as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_link_outlasts_a_late_or_locked_keyring() {
+    use sync_testkit::keyring;
+    const NAME: &str = "org.freedesktop.secrets";
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into()],
+    })
+    .await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "late"])
+        .await;
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    service.release_name(NAME).await.unwrap();
+    let daemon = env.start();
+    // Empty until the client answers.
+    let detail = || async {
+        let s: Value =
+            serde_json::from_str(&env.run(&["status", "--json"]).await.out).unwrap_or_default();
+        (
+            s["link"]["state"].as_str().unwrap_or_default().to_string(),
+            s["link"]["detail"].as_str().unwrap_or_default().to_string(),
+        )
+    };
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let (state, detail) = detail().await;
+        if state == "stopped" && detail.contains("no keyring service") {
+            assert!(detail.contains("trying again in"), "{detail}");
+            break;
+        }
+        assert!(std::time::Instant::now() < end, "{state}: {detail}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    service.request_name(NAME).await.unwrap();
+    mock.next_device(WAIT)
+        .await
+        .expect("connects once the keyring is there");
+    // The password is read again as well.
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        if s["elevation_password"] == true {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "the password was never loaded: {s}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A policy change reloads the client; it does not read the token again,
+    // so a locked keyring shows no prompt for it and the link stays.
+    let prompts = {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+        s.prompts
+    };
+    let log = env.root.join("daemon.log");
+    let reloads = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("config reloaded")
+            .count()
+    };
+    let before = reloads();
+    env.ok(&["mode", "ask"]).await;
+    env.ok(&["mode", "full"]).await;
+    eventually("the client reloaded twice", || reloads() >= before + 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(state.lock().unwrap().prompts, prompts, "no unlock prompt");
+    assert_eq!(detail().await.0, "connected");
+    stop(daemon).await;
+}
+
+/// The token and the elevation password in the keyring: the fake Secret
+/// Service of the testkit on a private bus stands in for the desktop's, so no
+/// real keyring is touched. The token moves with `token_storage` both ways
+/// without being lost, a cancelled unlock prompt is an error and never a
+/// fallback, and `unpair` and `sudo clear` take the entries out again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_and_the_password_in_the_keyring() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into(), "CODE8888".into()],
+    })
+    .await;
+    let in_keyring = |name: &str| {
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .find(|(_, a, _)| a.get("name").map(String::as_str) == Some(name))
+            .map(|(.., v)| String::from_utf8(v.clone()).unwrap())
+    };
+    let token_file = env.home.join(".config/pithagoras-sync/token");
+
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "kbox"])
+        .await;
+    let token = in_keyring("token").expect("the token is in the keyring");
+    assert!(!token_file.exists());
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains("token_storage = \"keyring\""), "{cfg}");
+    assert!(!cfg.contains(&token));
+    let daemon = env.start();
+    mock.next_device(WAIT)
+        .await
+        .expect("connects with the keyring's token");
+    let out = env.ok(&["status"]).await;
+    assert!(out.contains("Token:     kept in the keyring"), "{out}");
+
+    // To the file and back: the token goes along, the old place loses it.
+    env.ok(&["config", "set", "token_storage", "file"]).await;
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), token);
+    assert_eq!(in_keyring("token"), None);
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    assert_eq!(in_keyring("token").as_deref(), Some(token.as_str()));
+    assert!(!token_file.exists());
+
+    // Locked, and the owner cancels the unlock prompt: pairing again fails and
+    // leaves the old token where it was; nothing lands in the file instead.
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+    }
+    let out = env
+        .cmd(&["pair", &mock.pair_uri("CODE8888")])
+        .output()
+        .await
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("cancelled") && err.contains("keyring"),
+        "{err}"
+    );
+    assert!(!token_file.exists());
+    {
+        let mut s = state.lock().unwrap();
+        s.answer = Some(true);
+    }
+
+    // The password: kept in the keyring, never in the file or the client's log.
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(in_keyring("elevation").as_deref(), Some(PW));
+    assert!(
+        !env.home
+            .join(".config/pithagoras-sync/elevation.secret")
+            .exists()
+    );
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("set (kept in keyring)"), "{}", r.out);
+    env.ok(&["sudo", "clear"]).await;
+    assert_eq!(in_keyring("elevation"), None);
+
+    env.ok(&["unpair"]).await;
+    assert_eq!(in_keyring("token"), None);
+    stop(daemon).await;
+    let log = std::fs::read_to_string(env.root.join("daemon.log")).unwrap();
+    assert!(!log.contains(PW) && !log.contains(&token), "{log}");
+}
+
+/// A keyring that refuses to delete (its prompt dismissed) after the setting
+/// already changed: `config set token_storage` keeps the change, says what was
+/// left behind and tells the running client; `unpair` lets the running client
+/// go of the portal before it fails on the keyring.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyring_that_will_not_delete_still_lets_the_client_hear_of_the_change() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into()],
+    })
+    .await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "stuck"])
+        .await;
+    let daemon = env.start();
+    let link = mock.next_device(WAIT).await.expect("connects");
+    state.lock().unwrap().refuse_delete = Some("delete dismissed".into());
+
+    let r = env.run(&["config", "set", "token_storage", "file"]).await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(
+        r.err.contains("keyring entry stays") && r.err.contains("delete dismissed"),
+        "{}",
+        r.err
+    );
+    assert!(
+        r.out.contains("The running client took the change."),
+        "{}",
+        r.out
+    );
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains("token_storage = \"file\""), "{cfg}");
+    assert!(env.home.join(".config/pithagoras-sync/token").exists());
+
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    // The same token: the link was kept through both changes.
+    assert!(link.closed(Duration::from_millis(500)).await.is_none());
+    let r = env.run(&["unpair"]).await;
+    assert_ne!(r.code, 0);
+    assert!(
+        r.err.contains("delete dismissed") && r.err.contains("unpair` again"),
+        "{}",
+        r.err
+    );
+    assert!(
+        link.closed(WAIT).await.is_some(),
+        "the running client let go of the portal"
+    );
+    state.lock().unwrap().refuse_delete = None;
+    env.ok(&["unpair"]).await;
+    assert!(state.lock().unwrap().items.is_empty());
+    stop(daemon).await;
+}
+
+/// `sudo set` waits on the keyring's unlock prompt: a `panic` meanwhile keeps
+/// the password out of the client's memory (the stored one comes back with
+/// `unlock`), and a `sudo clear` meanwhile runs after the set and takes out
+/// what it stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_or_clear_while_sudo_set_waits_on_the_keyring_wins() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let daemon = env.start();
+    let end = std::time::Instant::now() + WAIT;
+    while !env
+        .run(&["status", "--json"])
+        .await
+        .out
+        .contains("\"paused\"")
+    {
+        assert!(std::time::Instant::now() < end, "the client never answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stored = || {
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .any(|(_, a, _)| a.get("name").map(String::as_str) == Some("elevation"))
+    };
+    let held = || async {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        s["elevation_password"].as_bool().unwrap()
+    };
+    let lock = || {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = None;
+        s.prompts
+    };
+
+    let line = format!("{PW}\n");
+    let before = lock();
+    let (set, ()) = tokio::join!(env.run_with(&["sudo", "set", "--stdin"], &line), async {
+        eventually("sudo set asks to unlock the keyring", || {
+            state.lock().unwrap().prompts > before
+        })
+        .await;
+        env.ok(&["panic"]).await;
+        keyring::answer_waiting(&state, true).await;
+    });
+    assert_ne!(set.code, 0);
+    assert!(
+        set.err.contains("panic or sudo clear came in"),
+        "{}",
+        set.err
+    );
+    assert!(!set.err.contains(PW));
+    assert!(stored());
+    assert!(!held().await);
+    env.ok(&["unlock"]).await;
+    assert!(held().await);
+
+    let log = env.root.join("daemon.log");
+    let before = lock();
+    let (set, clear, ()) = tokio::join!(
+        env.run_with(&["sudo", "set", "--stdin"], &line),
+        async {
+            eventually("sudo set asks to unlock the keyring", || {
+                state.lock().unwrap().prompts > before
+            })
+            .await;
+            env.run(&["sudo", "clear"]).await
+        },
+        async {
+            eventually("sudo clear waits for the set", || {
+                std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("sudo clear waits for the sudo set before it")
+            })
+            .await;
+            keyring::answer_waiting(&state, true).await;
+        }
+    );
+    assert_ne!(set.code, 0, "{}", set.out);
+    assert_eq!(clear.code, 0, "{}", clear.err);
+    assert!(!stored(), "the clear took out what the set stored");
+    assert!(!held().await);
+    stop(daemon).await;
+}
+
+/// Right after the pairing changes, the link to the old portal may still be up:
+/// `status` does not call that connected to the new one, so the window that
+/// paired does not report a portal that turns the client away as connected.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_link_is_not_reported_as_the_new_pairing() {
+    let env = Env::new();
+    let old = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into()],
+    })
+    .await;
+    // Knows no token of this device: it refuses the link.
+    let new = MockPortal::start(MockOptions::default()).await;
+    env.ok(&["pair", &old.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let _dl = old.next_device(WAIT).await.expect("the client connects");
+    let cfg = std::fs::read_to_string(env.config()).unwrap();
+    assert!(cfg.contains(&old.url), "{cfg}");
+    std::fs::write(env.config(), cfg.replace(&old.url, &new.url)).unwrap();
+    // Any edit by the owner reloads the config.
+    env.ok(&["mode", "ask"]).await;
+    let end = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < end {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        assert_eq!(s["portal"], new.url.as_str());
+        assert_ne!(s["link"]["state"], "connected", "{s}");
+    }
+    assert!(new.refused() > 0);
+    stop(daemon).await;
+}
+
+/// A pairing the portal answers with the device id it gave before, and a new
+/// token: the running client switches to that token, though only the time of
+/// the pairing tells the two apart in the config.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pairing_with_the_same_device_id_is_used() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into(), "CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let first = mock.next_device(WAIT).await.expect("the client connects");
+    let id = first.device_id.clone();
+    mock.pair_next_as(&id);
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "testbox"])
+        .await;
+    let again = mock
+        .next_device(WAIT)
+        .await
+        .expect("the client links again");
+    assert_eq!(again.device_id, id);
+    stop(daemon).await;
+}
+
+/// The portal removed the device: the client stays down until it is paired
+/// again. A policy change in between does not try the refused token once more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_waits_for_a_new_pairing() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE1234".into(), "CODE5678".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE1234"), "--name", "testbox"])
+        .await;
+    let daemon = env.start();
+    let first = mock.next_device(WAIT).await.expect("the client connects");
+    mock.revoke(&first.device_id).await;
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        if s["link"]["state"] == "rejected" {
+            break;
+        }
+        assert!(std::time::Instant::now() < end, "{s}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    env.ok(&["mode", "ask"]).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(mock.refused(), 0, "the refused token was tried again");
+    env.ok(&["pair", &mock.pair_uri("CODE5678"), "--name", "testbox"])
+        .await;
+    mock.next_device(WAIT)
+        .await
+        .expect("the new pairing connects");
+    assert_eq!(mock.refused(), 0);
+    stop(daemon).await;
+}
+
+/// A keyring prompt the owner leaves open ends the request within the client's
+/// time for it (shortened here): the CLI hears an error before it stops
+/// waiting, the prompt is dismissed, and nothing is taken, cleared or loaded
+/// after that answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyring_prompt_left_open_ends_the_request_in_time() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    env.vars
+        .push(("PITHAGORAS_SYNC_TEST_KEYRING_WORK_MS".into(), "1500".into()));
+    env.ok(&[
+        "config",
+        "set",
+        "policy.privilege.secret_storage",
+        "keyring",
+    ])
+    .await;
+    let daemon = env.start();
+    let end = std::time::Instant::now() + WAIT;
+    while !env
+        .run(&["status", "--json"])
+        .await
+        .out
+        .contains("\"paused\"")
+    {
+        assert!(std::time::Instant::now() < end, "the client never answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stored = || {
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .any(|(_, a, _)| a.get("name").map(String::as_str) == Some("elevation"))
+    };
+    let held = || async {
+        let s: Value = serde_json::from_str(&env.ok(&["status", "--json"]).await).unwrap();
+        s["elevation_password"].as_bool().unwrap()
+    };
+    let lock = || {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = None;
+    };
+    let dismissed = || state.lock().unwrap().dismissed;
+    let line = format!("{PW}\n");
+
+    lock();
+    let started = std::time::Instant::now();
+    let set = env.run_with(&["sudo", "set", "--stdin"], &line).await;
+    assert_ne!(set.code, 0);
+    assert!(set.err.contains("did not finish in time"), "{}", set.err);
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+    eventually("the set's prompt is dismissed", || dismissed() == 1).await;
+    assert!(!stored());
+    assert!(!held().await);
+
+    state.lock().unwrap().locked = false;
+    let set = env.run_with(&["sudo", "set", "--stdin"], &line).await;
+    assert_eq!(set.code, 0, "{}", set.err);
+    assert!(stored() && held().await);
+    lock();
+    let clear = env.run(&["sudo", "clear"]).await;
+    assert_ne!(clear.code, 0);
+    assert!(clear.err.contains("sudo clear` again"), "{}", clear.err);
+    eventually("the clear's prompt is dismissed", || dismissed() == 2).await;
+    assert!(!held().await, "forgotten in memory all the same");
+    assert!(stored());
+    let unlock = env.run(&["unlock"]).await;
+    assert_ne!(unlock.code, 0);
+    assert!(
+        unlock.err.contains("did not finish in time"),
+        "{}",
+        unlock.err
+    );
+    eventually("the unlock's prompt is dismissed", || dismissed() == 3).await;
+    // The owner answers at last: nothing waits on it any more.
+    keyring::answer_waiting(&state, true).await;
+    assert!(!held().await);
+    stop(daemon).await;
+}
+
+/// The owner kept the password and the token in the keyring, then switched
+/// both away from it (the token's old entry could not be removed then):
+/// `sudo clear` and `uninstall --purge` still take out what is left there,
+/// and a status looks without a prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_an_earlier_setting_left_in_the_keyring_is_removed_too() {
+    use sync_testkit::keyring;
+    let Some(bus) = keyring::private_bus() else {
+        return;
+    };
+    let state = keyring::Shared::default();
+    let _service = keyring::serve(&bus, state.clone()).await;
+    let mut env = Env::new();
+    env.vars
+        .push(("DBUS_SESSION_BUS_ADDRESS".into(), bus.address.clone()));
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into()],
+    })
+    .await;
+    let names = || {
+        let mut n: Vec<String> = state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .filter_map(|(_, a, _)| a.get("name").cloned())
+            .collect();
+        n.sort();
+        n
+    };
+    let secret_storage = "policy.privilege.secret_storage";
+    env.ok(&["config", "set", secret_storage, "keyring"]).await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    // Locked: the status sees the entry without asking to unlock.
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.answer = Some(false);
+    }
+    let r = env.run(&["sudo", "status"]).await;
+    assert!(r.out.contains("set (kept in keyring)"), "{}", r.out);
+    assert_eq!(state.lock().unwrap().prompts, 0);
+    state.lock().unwrap().locked = false;
+
+    env.ok(&["config", "set", secret_storage, "memory"]).await;
+    env.ok(&["sudo", "clear"]).await;
+    assert!(names().is_empty(), "{:?}", names());
+
+    env.ok(&["config", "set", secret_storage, "keyring"]).await;
+    let r = env
+        .run_with(&["sudo", "set", "--stdin"], &format!("{PW}\n"))
+        .await;
+    assert_eq!(r.code, 0, "{}", r.err);
+    env.ok(&["config", "set", secret_storage, "file"]).await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    env.ok(&["pair", &mock.pair_uri("CODE7777"), "--name", "left"])
+        .await;
+    state.lock().unwrap().refuse_delete = Some("delete dismissed".into());
+    env.ok(&["config", "set", "token_storage", "file"]).await;
+    state.lock().unwrap().refuse_delete = None;
+    assert_eq!(names(), ["elevation", "token"]);
+
+    let path = fake_systemd(&env);
+    let out = env
+        .cmd(&["uninstall", "--purge", "--print"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("remove the connector token from the keyring")
+            && text.contains("remove the elevation password from the keyring"),
+        "{text}"
+    );
+    let out = env
+        .cmd(&["uninstall", "--purge", "--yes"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(names().is_empty(), "{:?}", names());
+
+    // Both set to the keyring, which holds nothing: there is nothing to
+    // remove from it.
+    env.ok(&["config", "set", secret_storage, "keyring"]).await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    let out = env
+        .cmd(&["uninstall", "--purge", "--print"])
+        .env("PATH", &path)
+        .output()
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("from the keyring"), "{text}");
+}
+
+/// A test without the fake keyring reaches no keyring at all: the harness
+/// keeps the real session bus of whoever runs the tests out.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_fake_keyring_the_tests_reach_no_keyring() {
+    let env = Env::new();
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE7777".into()],
+    })
+    .await;
+    env.ok(&["config", "set", "token_storage", "keyring"]).await;
+    let r = env.run(&["pair", &mock.pair_uri("CODE7777")]).await;
+    assert_ne!(r.code, 0);
+    assert!(
+        r.err.contains("PITHAGORAS_SYNC_NO_KEYRING is set"),
+        "{}",
+        r.err
+    );
 }

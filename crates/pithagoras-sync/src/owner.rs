@@ -3,8 +3,11 @@
 //! On a headless machine the shell login is the authentication (spec 10.1). On a
 //! Linux desktop, a change also asks for the user's password in a terminal (through
 //! `su`, so PAM checks it), which a command the agent runs cannot type. In both
-//! cases a change from a command the client itself runs is refused.
+//! cases a change from a command the client itself runs is refused. The windows
+//! (`gui`) ask for the same password in a dialog and give it to `su` on a
+//! terminal of its own (`check_password`).
 
+use sync_policy::secret::Secret;
 use sync_policy::{Dirs, Profile};
 
 use crate::control::{self, Request};
@@ -25,10 +28,270 @@ pub async fn not_from_own_command(dirs: &Dirs) -> Result<(), String> {
 
 /// Confirms that the owner makes this change.
 pub fn confirm(profile: Profile) -> Result<(), String> {
-    if profile == Profile::Headless {
+    if !password_needed(profile) {
         return Ok(());
     }
     confirm_desktop()
+}
+
+/// Whether a change in this profile asks for the user's password: on a Linux
+/// desktop. Windows has no way to check it (`confirm_desktop`).
+pub fn password_needed(profile: Profile) -> bool {
+    profile != Profile::Headless && cfg!(unix)
+}
+
+/// How long `su` may take to check the password, its delay after a wrong one
+/// included.
+#[cfg(target_os = "linux")]
+const PASSWORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Checks the user's password with `su` as `confirm` does, for the windows:
+/// `su` runs on a pseudo-terminal of its own, and the password typed into the
+/// dialog is written to it once `su` switched echo off for its prompt. It is
+/// never in an argument or the environment. `Ok(false)`: `su` said the
+/// password is wrong; any other failure is an error that says what `su` said.
+#[cfg(target_os = "linux")]
+pub async fn check_password(pw: &Secret) -> Result<bool, String> {
+    let user = account()?;
+    let cmd = su_check(&user)?;
+    let pw = pw.clone();
+    tokio::task::spawn_blocking(move || check_with(cmd, &pw, PASSWORD_WAIT))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Runs the check `cmd` (`su`) and reads its answer. Only a program that asked
+/// for the password and exited 0 says yes: one that exits 0 without asking
+/// (root, `pam_rootok`, a PAM stack that trusts this user) has checked
+/// nothing, and that fails closed.
+#[cfg(target_os = "linux")]
+fn check_with(
+    cmd: std::process::Command,
+    pw: &Secret,
+    wait: std::time::Duration,
+) -> Result<bool, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let a = pty::answer(cmd, pw, wait)?;
+    // Its last line, as plain text; never anything that holds the password.
+    let said = crate::secrets::last_line(&a.said, Some(pw));
+    match (a.asked, a.success) {
+        (true, true) => Ok(true),
+        (false, true) => Err(format!(
+            "{program} let this account through without asking for its password, so the password cannot be checked here"
+        )),
+        // util-linux and shadow su, busybox su, BSD su (LC_ALL=C).
+        (true, false)
+            if ["Authentication failure", "incorrect password", "Sorry"]
+                .iter()
+                .any(|w| said.contains(w)) =>
+        {
+            Ok(false)
+        }
+        (_, false) if said.is_empty() => Err(format!(
+            "{program} could not check the password and did not say why"
+        )),
+        (_, false) => Err(format!("{program} could not check the password: {said}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn check_password(_pw: &Secret) -> Result<bool, String> {
+    Err("the password can be checked in a window only on Linux".into())
+}
+
+/// A program on a pseudo-terminal, answered with a password.
+#[cfg(target_os = "linux")]
+mod pty {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use sync_policy::secret::Secret;
+
+    fn os_err(what: &str) -> String {
+        format!("{what}: {}", std::io::Error::last_os_error())
+    }
+
+    /// A new pseudo-terminal: its master and the path of its other end.
+    fn open() -> Result<(OwnedFd, std::ffi::CString), String> {
+        // SAFETY: plain libc calls; the descriptor is owned right after.
+        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(os_err("no pseudo-terminal"));
+        }
+        // SAFETY: fd is a new descriptor of ours.
+        let master = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: on the master just opened.
+        if unsafe { libc::grantpt(fd) } != 0 || unsafe { libc::unlockpt(fd) } != 0 {
+            return Err(os_err("no pseudo-terminal"));
+        }
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: the buffer is of the length given.
+        if unsafe { libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) } != 0 {
+            return Err(os_err("no pseudo-terminal"));
+        }
+        // SAFETY: ptsname_r wrote a NUL-terminated name into the buffer.
+        let path = unsafe { CStr::from_ptr(name.as_ptr()) }.to_owned();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: on our descriptor.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(os_err("no pseudo-terminal"));
+        }
+        Ok((master, path))
+    }
+
+    /// Whether the terminal's echo is off: the program waits for a password.
+    fn echo_off(master: &OwnedFd) -> bool {
+        // SAFETY: termios is plain data; tcgetattr on the master reads the
+        // terminal's settings.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::tcgetattr(master.as_raw_fd(), &mut t) == 0 && t.c_lflag & libc::ECHO == 0 }
+    }
+
+    fn write_all(master: &OwnedFd, mut b: &[u8]) -> Result<(), String> {
+        while !b.is_empty() {
+            // SAFETY: the buffer is valid for its length.
+            let n = unsafe { libc::write(master.as_raw_fd(), b.as_ptr().cast(), b.len()) };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                return Err(format!("cannot type the password: {e}"));
+            }
+            b = &b[n as usize..];
+        }
+        Ok(())
+    }
+
+    /// How a program on the terminal ended.
+    pub struct Answer {
+        /// Whether it switched echo off and got the password.
+        pub asked: bool,
+        /// Whether it exited 0.
+        pub success: bool,
+        /// The end of what it wrote to the terminal (echo was off for the
+        /// password).
+        pub said: Vec<u8>,
+    }
+
+    /// The most of its output `Answer::said` keeps: the end, where the reason is.
+    const SAID_MAX: usize = 4096;
+
+    /// Runs `cmd` with the terminal as its controlling one, types `pw` and a
+    /// newline once it switched echo off, and says how it ended. Killed after
+    /// `wait`.
+    pub fn answer(mut cmd: Command, pw: &Secret, wait: Duration) -> Result<Answer, String> {
+        // The line discipline would act on these (erase, kill, end of file)
+        // instead of passing them on.
+        if pw.expose().chars().any(char::is_control) {
+            return Err(
+                "this password holds control characters; use the command line in a terminal".into(),
+            );
+        }
+        let (master, path) = open()?;
+        // SAFETY: opens the other end of our pseudo-terminal.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(os_err("no pseudo-terminal"));
+        }
+        // SAFETY: fd is a new descriptor of ours.
+        let other = unsafe { OwnedFd::from_raw_fd(fd) };
+        let io = |f: &OwnedFd| f.try_clone().map(Stdio::from).map_err(|e| e.to_string());
+        cmd.stdin(io(&other)?)
+            .stdout(io(&other)?)
+            .stderr(Stdio::from(other));
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("TERM", "dumb");
+        // SAFETY: setsid and ioctl are async-signal-safe; the child gets a
+        // session of its own with the terminal (its stdin) as the controlling one.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot run {program} to check the password: {e}"))?;
+        // Our copies of the terminal's other end go.
+        drop(cmd);
+        let deadline = Instant::now() + wait;
+        let mut typed = false;
+        let mut said = Vec::new();
+        // What it says is read as it comes, so it never blocks on a full
+        // terminal; only the end is kept.
+        let read = |said: &mut Vec<u8>| {
+            let mut buf = [0u8; 256];
+            loop {
+                // SAFETY: the buffer is valid for its length; the master does
+                // not block.
+                let n =
+                    unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                said.extend_from_slice(&buf[..n as usize]);
+                if said.len() > SAID_MAX {
+                    said.drain(..said.len() - SAID_MAX);
+                }
+            }
+        };
+        let result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    read(&mut said);
+                    break Ok(status.success());
+                }
+                Ok(None) => {}
+                Err(e) => break Err(e.to_string()),
+            }
+            read(&mut said);
+            if !typed && echo_off(&master) {
+                if let Err(e) = write_all(&master, pw.expose().as_bytes())
+                    .and_then(|()| write_all(&master, b"\n"))
+                {
+                    break Err(e);
+                }
+                typed = true;
+            }
+            if Instant::now() >= deadline {
+                break Err(format!(
+                    "{program} did not {} in time",
+                    if typed {
+                        "finish"
+                    } else {
+                        "ask for the password"
+                    }
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        result.map(|success| Answer {
+            asked: typed,
+            success,
+            said,
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -39,10 +302,7 @@ fn confirm_desktop() -> Result<(), String> {
             "on a desktop, policy changes ask for your password; run this in a terminal".into(),
         );
     }
-    let (user, _) = sync_ops::info::user();
-    if user.is_empty() || user.starts_with('-') {
-        return Err("cannot tell which user this is".into());
-    }
+    let user = account()?;
     eprintln!("Changing what the portal may do on this device needs your password ({user}).");
     let status = su_check(&user)?
         .status()
@@ -51,6 +311,19 @@ fn confirm_desktop() -> Result<(), String> {
         Ok(())
     } else {
         Err("password check failed; nothing changed".into())
+    }
+}
+
+/// The account whose password is checked: the one this process runs as, from
+/// the user database. Not `$USER`: whoever started the process sets that, and
+/// could name an account whose password they know.
+#[cfg(unix)]
+pub fn account() -> Result<String, String> {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    match sync_ops::info::passwd_name(uid) {
+        Some(u) if !u.is_empty() && !u.starts_with('-') => Ok(u),
+        _ => Err(format!("cannot tell which user this is (uid {uid})")),
     }
 }
 
@@ -66,6 +339,11 @@ fn su_check(user: &str) -> Result<std::process::Command, String> {
     let mut cmd = std::process::Command::new(su);
     cmd.args(["-c", "true", user]);
     Ok(cmd)
+}
+
+#[cfg(windows)]
+pub fn account() -> Result<String, String> {
+    Ok(sync_ops::info::user().0)
 }
 
 #[cfg(windows)]
@@ -89,6 +367,96 @@ mod tests {
         }
         assert!(confirm(Profile::Desktop).unwrap_err().contains("terminal"));
         assert!(confirm(Profile::Headless).is_ok());
+    }
+
+    /// A stand-in `su` takes the password from its terminal only after it
+    /// switched echo off (a real one flushes what came before), never from its
+    /// arguments or environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_password_is_typed_into_a_terminal_of_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        if !std::path::Path::new("/bin/bash").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let su = dir.path().join("su");
+        std::fs::write(
+            &su,
+            format!(
+                "#!/bin/bash\n{{ echo \"$*\"; env; tty; }} > '{seen}'\nprintf 'Password: '\nsleep 0.3\nread -t 0 && echo early >> '{seen}'\nstty -echo\nIFS= read -r p\nstty echo\necho\ncase \"$p\" in\n'right one') exit 0 ;;\n'expired one') echo 'su: Authentication token is no longer valid; new one required'; exit 1 ;;\n*) echo 'su: Authentication failure'; exit 1 ;;\nesac\n",
+                seen = seen.display()
+            ),
+        )
+        .unwrap();
+        let quiet = dir.path().join("quiet");
+        std::fs::write(&quiet, "#!/bin/sh\nsleep 30\n").unwrap();
+        // `su` as root, or with `pam_rootok`: in without a prompt.
+        let trusting = dir.path().join("trusting");
+        std::fs::write(&trusting, "#!/bin/sh\nexit 0\n").unwrap();
+        // A PAM stack that fails before it asks.
+        let broken = dir.path().join("broken");
+        std::fs::write(
+            &broken,
+            "#!/bin/sh\necho 'su: Authentication service cannot retrieve authentication info'\nexit 1\n",
+        )
+        .unwrap();
+        for p in [&su, &quiet, &trusting, &broken] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wait = Duration::from_secs(10);
+        let run = |pw: &str| check_with(Command::new(&su), &Secret::new(pw.into()), wait);
+        assert_eq!(run("right one"), Ok(true));
+        let s = std::fs::read_to_string(&seen).unwrap();
+        assert!(!s.contains("right one"), "{s}");
+        assert!(!s.contains("early"), "typed before echo was off: {s}");
+        assert!(s.contains("/dev/pts/"), "on a terminal of its own: {s}");
+        assert_eq!(run("wrong one"), Ok(false));
+        // A failure that is not the password says what su said.
+        let e = run("expired one").unwrap_err();
+        assert!(e.contains("no longer valid"), "{e}");
+        // Through without being asked: nothing was checked, so no.
+        let any = Secret::new("anything".into());
+        let e = check_with(Command::new(&trusting), &any, wait).unwrap_err();
+        assert!(e.contains("without asking"), "{e}");
+        let e = check_with(Command::new(&broken), &any, wait).unwrap_err();
+        assert!(e.contains("cannot retrieve authentication info"), "{e}");
+        // The line discipline would act on these.
+        assert!(run("right\u{15}one").unwrap_err().contains("control"));
+        // A program that never asks: an error after the wait, and it is ended.
+        let start = Instant::now();
+        let e = check_with(
+            Command::new(&quiet),
+            &Secret::new("x".into()),
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(e.contains("did not ask for the password"), "{e}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Run by the test below in a process of its own, with `USER` set.
+    #[test]
+    fn print_account() {
+        if std::env::var_os("PRINT_ACCOUNT").is_some() {
+            println!("account={:?}", account());
+        }
+    }
+
+    #[test]
+    fn the_account_checked_is_not_taken_from_the_environment() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "owner::tests::print_account", "--nocapture"])
+            .env("USER", "someone-else")
+            .env("PRINT_ACCOUNT", "1")
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(out.contains("account="), "{out}");
+        assert!(!out.contains("someone-else"), "{out}");
     }
 
     #[test]

@@ -47,10 +47,51 @@ pub enum Request {
     Restart,
 }
 
+/// How long the CLI waits for the client's answer.
+pub const REPLY_WAIT: Duration = Duration::from_secs(30);
+/// How long the client works on one request that reads or writes the keyring,
+/// waiting for a `sudo set` before it included: two prompts (an unlock and a
+/// confirmation, up to two minutes each for the owner) and the calls around
+/// them. Then it gives up, dismisses a prompt still open and answers with an
+/// error; prompts left open longer, or one request waiting on another, end
+/// that way.
+pub const KEYRING_WORK: Duration = Duration::from_secs(300);
+/// How long the CLI waits on such a request: longer than the client works on
+/// it, so the CLI never reports a failure while the client goes on to store or
+/// clear the password.
+pub const KEYRING_REPLY_WAIT: Duration = Duration::from_secs(300 + 30);
+
+/// Set (debug builds only) to a shorter time in milliseconds for
+/// `KEYRING_WORK`: the tests' wait for it to run out. A release build ignores
+/// it, and it never makes the time longer.
+pub const TEST_KEYRING_WORK_MS: &str = "PITHAGORAS_SYNC_TEST_KEYRING_WORK_MS";
+
+/// `KEYRING_WORK`, or the tests' shorter time.
+pub fn keyring_work() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TEST_KEYRING_WORK_MS)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms).min(KEYRING_WORK);
+    }
+    KEYRING_WORK
+}
+
 impl Request {
     /// Whether a command the client itself runs (a descendant) may send this.
     pub fn allowed_from_own_commands(&self) -> bool {
         matches!(self, Request::Status | Request::Panic)
+    }
+
+    /// How long the answer may take.
+    pub fn reply_wait(&self) -> Duration {
+        match self {
+            Request::SecretSet { .. } | Request::SecretClear { .. } | Request::Unlock => {
+                KEYRING_REPLY_WAIT
+            }
+            _ => REPLY_WAIT,
+        }
     }
 }
 
@@ -83,6 +124,10 @@ pub struct Status {
     /// Whether the client holds the elevation password now (for `sudo status`).
     #[serde(default)]
     pub elevation_password: bool,
+    /// Where the connector token is kept: `file`, `keyring`, or the keyring as
+    /// this platform's default.
+    #[serde(default)]
+    pub token_storage: String,
     pub running_commands: usize,
     pub cgroups: bool,
     pub landlock: bool,
@@ -159,6 +204,7 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(mut s: S, reply: &Reply) {
 }
 
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Result<Reply, String> {
+    let wait = req.reply_wait();
     let (r, mut w) = tokio::io::split(s);
     let mut text = serde_json::to_string(&req).unwrap_or_default();
     text.push('\n');
@@ -170,7 +216,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(s: S, req: Request) -> Resu
     let mut line = String::new();
     // Room for the approvals list (`MAX_APPROVAL_LIST`) and its escapes.
     let mut r = BufReader::new(r).take(4 << 20);
-    tokio::time::timeout(Duration::from_secs(30), r.read_line(&mut line))
+    tokio::time::timeout(wait, r.read_line(&mut line))
         .await
         .map_err(|_| "the client did not answer".to_string())?
         .map_err(|e| e.to_string())?;
@@ -269,6 +315,25 @@ mod tests {
         assert!(!descends_from(me, child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn requests_that_may_wait_on_a_keyring_prompt_get_the_time_for_it() {
+        use sync_policy::keyring::secret_service::{CALL, PROMPT};
+        let secret = Request::SecretSet {
+            name: "elevation".into(),
+            value: Secret::new("x".into()),
+        };
+        let clear = Request::SecretClear {
+            name: "elevation".into(),
+        };
+        // Two prompts (an unlock, then a confirmation), plus the calls around
+        // them; and the CLI waits longer than the client works.
+        assert!(KEYRING_WORK >= PROMPT * 2 + CALL * 6);
+        for r in [secret, clear, Request::Unlock] {
+            assert!(r.reply_wait() >= KEYRING_WORK + REPLY_WAIT, "{r:?}");
+        }
+        assert_eq!(Request::Status.reply_wait(), REPLY_WAIT);
     }
 
     #[test]

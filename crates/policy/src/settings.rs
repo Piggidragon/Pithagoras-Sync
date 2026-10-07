@@ -2,7 +2,8 @@
 //! the owner switched `portal_policy` to `write`, replaces (`policy.set`).
 //!
 //! The document is the config file's `[policy]` and `[exec]` tables. Never in it:
-//! the pairing, the profile, `portal_policy` itself and the elevation secret. A few
+//! the pairing, the profile, `portal_policy` itself, where the connector token is
+//! kept (`token_storage`) and the elevation secret. A few
 //! settings in it are the device's alone (the shell and sudo the client runs, where
 //! the secret is kept): a portal that could point them elsewhere could make the
 //! device hand the secret to a program of its choosing.
@@ -274,11 +275,15 @@ mod tests {
         ] {
             assert!(matches!(set(&c, edit), Err(SetError::Denied(_))));
         }
-        // Neither the switch nor the pairing is in the document at all.
+        // Neither the switch, the pairing nor where the token is kept is in the
+        // document at all.
         for edit in [
             |v: &mut Value| v["portal_policy"] = "write".into(),
             |v: &mut Value| v["portal"] = serde_json::json!({}),
             |v: &mut Value| v["secret"] = "x".into(),
+            |v: &mut Value| v["token_storage"] = "file".into(),
+            |v: &mut Value| v["policy"]["token_storage"] = "file".into(),
+            |v: &mut Value| v["policy"]["privilege"]["token_storage"] = "file".into(),
         ] {
             assert!(matches!(set(&c, edit), Err(SetError::Invalid(_))));
         }
