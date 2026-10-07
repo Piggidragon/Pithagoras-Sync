@@ -1868,6 +1868,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Sudo { cmd } => sudo_cmd(&dirs, cmd).await?,
         Cmd::Update { check, manifest } => {
+            // Before both parts: a command the client runs updates neither.
+            owner::not_from_own_command(&dirs).await?;
             let asked = if check { Asked::Check } else { Asked::Anything };
             let client = update(&dirs, manifest.as_deref(), asked, &mut |l| println!("{l}")).await;
             // The computer-use server moves with its own pins, also when there

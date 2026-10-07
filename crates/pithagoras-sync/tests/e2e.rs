@@ -904,6 +904,13 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "sudo clear --deactivate",
         "update --manifest /nowhere/manifest.json",
         "uninstall --purge --yes",
+        "computer-use install",
+        "computer-use allow --minutes 5",
+        "computer-use ask",
+        "computer-use test",
+        "computer-use update",
+        "computer-use rollback",
+        "computer-use uninstall",
     ]
     .iter()
     .enumerate()
