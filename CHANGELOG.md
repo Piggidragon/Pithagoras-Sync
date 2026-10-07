@@ -2,7 +2,7 @@
 
 What changed in each release of Pithagoras Sync, newest first. Every release has a section here: the release workflow stops a version tag whose section is missing, and uses the section as the release notes. How to write one: [docs/releasing.md](docs/releasing.md).
 
-## 0.0.2 - unreleased
+## 0.0.2 - 2026-10-07
 
 The graphical install: a person who never opens a terminal can install, pair, set up sudo access and uninstall the client. A server install stays command-line only and works as before.
 
@@ -26,7 +26,7 @@ The graphical install: a person who never opens a terminal can install, pair, se
 
 - A console window can flash when the logon task starts the client on Windows (Windows Terminal about 0.2 s, the classic console about 25 ms); a launcher without a console comes later (issue #6).
 - The window texts for the CLI's errors, and the notes of installing, pairing and uninstalling, are English; SmartScreen warns about the unsigned Windows file (issue #7).
-- Tried with Edge on Windows 11, Ubuntu's GNOME tools and kdialog under a virtual screen; links from Chrome and Firefox, Windows 10 and a real Plasma session are not tried yet.
+- Tried with Edge, Chrome and Firefox on Windows 11, and with Ubuntu's GNOME tools and kdialog under a virtual screen, and by hand on GNOME (Wayland); Windows 10, links from Chrome and Firefox on Linux and a real Plasma session are not tried yet.
 
 ## 0.0.1 - 2026-10-06
 
