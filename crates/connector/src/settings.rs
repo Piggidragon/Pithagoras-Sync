@@ -94,16 +94,18 @@ impl ConfigStore {
         }
     }
 
-    /// Changes the settings the client runs by, as `f` says, and saves them,
-    /// without taking anything else from the file: the device's own change
-    /// (`panic`, `computer-use off`), made also when the file holds edits it
-    /// would not take now. Audited as the owner's.
-    pub fn update(&self, why: &str, f: impl FnOnce(&mut DeviceConfig)) -> Result<(), String> {
+    /// Changes the settings the client runs by, as `f` says, without taking
+    /// anything else from the file: the device's own narrowing (`panic`,
+    /// `computer-use off`), made also when the file holds edits it would not
+    /// take now. Audited as the owner's. It takes effect in the running client
+    /// first, so a file that cannot be written does not keep it from holding;
+    /// then the same change goes into the file as it is now (what the owner
+    /// wrote there meanwhile stays). An error says the file was not changed.
+    pub fn update(&self, why: &str, f: impl Fn(&mut DeviceConfig)) -> Result<(), String> {
         let mut next = self.config();
         f(&mut next);
         let mut changes = Vec::new();
         settings::diff("", &owned(&self.config()), &owned(&next), &mut changes);
-        next.save(&self.file)?;
         for c in &changes {
             self.engine.record(
                 None,
@@ -114,7 +116,19 @@ impl ConfigStore {
             );
         }
         self.apply(next, why);
-        Ok(())
+        let mut file = DeviceConfig::load(&self.file)?;
+        f(&mut file);
+        file.save(&self.file)
+    }
+
+    /// Takes the record of the installed computer-use servers from the file,
+    /// and nothing else: the client's own change after it updated a server,
+    /// made also when the file holds edits it would not take now.
+    pub fn reload_mcp(&self) -> Result<DeviceConfig, String> {
+        let file = DeviceConfig::load(&self.file)?;
+        let mut cfg = self.cfg.lock().unwrap();
+        cfg.mcp = file.mcp;
+        Ok(cfg.clone())
     }
 
     pub fn portal_policy(&self) -> PortalPolicy {

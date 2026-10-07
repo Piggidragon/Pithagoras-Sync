@@ -101,16 +101,26 @@ fn a_bad_document_changes_nothing() {
     );
     assert_eq!(s.seen_serial(), 0);
     assert_eq!(s.current().serial, 0);
-    assert!(!t.path().join("mcp/pins.json").exists());
-    // A kept document that was changed on disk is not used.
+    let kept = t.path().join("mcp").join(sync_mcp::pins::KEPT_FILE);
+    assert!(!kept.exists());
+    // A kept document that was changed on disk is not used, and neither is
+    // the baseline, which may name a server the signed one took back:
+    // nothing is pinned until a document is taken again.
     let good = doc(8, &["screenshot"]);
     s.take(&good, &key.sign(&good, "t")).unwrap();
-    std::fs::write(
-        t.path().join("mcp/pins.json"),
-        doc(9, &["screenshot", "PowerShell"]),
-    )
-    .unwrap();
-    assert_eq!(s.current().serial, 0);
+    assert_eq!(s.current().serial, 8);
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&kept).unwrap()).unwrap();
+    v["document"] = json!(String::from_utf8(doc(9, &["screenshot", "PowerShell"])).unwrap());
+    std::fs::write(&kept, serde_json::to_vec(&v).unwrap()).unwrap();
+    let c = s.current();
+    assert_eq!((c.serial, c.servers.len()), (8, 0), "{c:?}");
+    // The same when the kept file is lost (a write cut short, say).
+    std::fs::remove_file(&kept).unwrap();
+    let c = s.current();
+    assert_eq!((c.serial, c.servers.len()), (8, 0), "{c:?}");
+    // Taking the document again restores it.
+    s.take(&good, &key.sign(&good, "t")).unwrap();
+    assert_eq!(s.current().servers.len(), 1);
     // Without a release key no document is taken at all.
     let keyless = PinStore::new(t.path().join("mcp2"), t.path().join("serial2"), None);
     assert!(keyless.take(&good, &key.sign(&good, "t")).is_err());

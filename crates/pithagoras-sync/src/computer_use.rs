@@ -409,10 +409,7 @@ pub fn installed(dirs: &Dirs, cfg: &DeviceConfig) -> Result<(String, PathBuf, Se
         .ok_or("no computer-use server is installed: `pithagoras-sync computer-use install`")?;
     let dir = install::verify(&dirs.mcp_dir(), name, &rec.folder, &rec.sha256)?;
     let doc = store(dirs).current();
-    let pin = match doc.server(name, sync_mcp::os()) {
-        Some(p) if p.version == rec.version => p.clone(),
-        _ => install::kept_pin(&dir)?,
-    };
+    let pin = sync_mcp::service::effective_pin(name, sync_mcp::os(), &rec.folder, &doc, &dir)?;
     Ok((name.clone(), dir, pin))
 }
 

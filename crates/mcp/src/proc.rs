@@ -20,6 +20,10 @@ pub const MAX_LOG: u64 = 1 << 20;
 
 pub struct Spawned {
     pub child: Child,
+    /// The server's process group (its pid at the start), kept apart from
+    /// `child`: once the server is reaped `child.id()` is gone, and the group
+    /// may still hold what it started.
+    pub group: Group,
     #[cfg(windows)]
     pub job: sync_ops::Job,
 }
@@ -90,26 +94,43 @@ fn spawn_once(launch: &Launch) -> std::io::Result<Spawned> {
         }
         child
     };
+    let group = Group(child.id());
     Ok(Spawned {
         child,
+        group,
         #[cfg(windows)]
         job,
     })
 }
 
+/// A server's process group (Unix; on Windows the Job Object is the group).
+pub struct Group(Option<u32>);
+
+impl Group {
+    /// Kills every process left in the group, once: after that its number is
+    /// not used again, as it may be another program's by then.
+    pub fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take() {
+            // SAFETY: the group is the server's own (`process_group(0)`).
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+        #[cfg(not(unix))]
+        {
+            self.0 = None;
+        }
+    }
+}
+
 /// Kills the server and its process group (Unix), and reaps it.
-pub async fn kill_tree(child: &mut Child) {
-    kill_now(child);
+pub async fn kill_tree(child: &mut Child, group: &mut Group) {
+    kill_now(child, group);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
 }
 
 /// The same without waiting (for `Drop`).
-pub fn kill_now(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // SAFETY: the group is the server's own (`process_group(0)`).
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
+pub fn kill_now(child: &mut Child, group: &mut Group) {
+    group.kill();
     let _ = child.start_kill();
 }
 

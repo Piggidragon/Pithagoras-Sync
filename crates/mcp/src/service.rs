@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -167,17 +167,26 @@ pub struct InUse {
 }
 
 pub struct Service {
+    /// Itself, for the reload the last call out starts.
+    me: Weak<Service>,
     engine: Arc<Engine>,
     opts: Options,
     servers: Mutex<BTreeMap<String, Arc<Server>>>,
     changes: broadcast::Sender<McpChanged>,
     last: Mutex<Option<McpChanged>>,
     /// Calls in flight, their questions included: an update waits for none.
+    /// Taken before a call looks up its server, and checked under the same
+    /// lock as the swap, so no call holds a server the swap replaced.
     busy: AtomicUsize,
     /// The installed servers and pins to switch to once nothing is in flight.
     pending: Mutex<Option<(BTreeMap<String, InstalledServer>, Document)>>,
+    /// One reload at a time.
+    applying: tokio::sync::Mutex<()>,
     in_use: Mutex<Option<InUse>>,
     last_call_ms: AtomicI64,
+    /// Calls past their consent (`active`), and when the last one ended.
+    acting: AtomicUsize,
+    last_acted_ms: AtomicI64,
     /// Bumped by `stop_all` (`panic`): every request in flight ends at once.
     stop: watch::Sender<u64>,
 }
@@ -224,7 +233,8 @@ impl Service {
     pub fn new(engine: Arc<Engine>, opts: Options) -> Arc<Service> {
         let (changes, _) = broadcast::channel(16);
         let (stop, _) = watch::channel(0);
-        Arc::new(Service {
+        Arc::new_cyclic(|me| Service {
+            me: me.clone(),
             engine,
             opts,
             servers: Mutex::new(BTreeMap::new()),
@@ -232,8 +242,11 @@ impl Service {
             last: Mutex::new(None),
             busy: AtomicUsize::new(0),
             pending: Mutex::new(None),
+            applying: tokio::sync::Mutex::new(()),
             in_use: Mutex::new(None),
             last_call_ms: AtomicI64::new(i64::MIN / 2),
+            acting: AtomicUsize::new(0),
+            last_acted_ms: AtomicI64::new(i64::MIN / 2),
             stop,
         })
     }
@@ -245,42 +258,76 @@ impl Service {
     /// Takes the installed servers and the pins in force. While a call is in
     /// flight it waits and is applied when the last one ends, so no server is
     /// swapped under a running call or an open question.
-    pub fn reload(&self, installed: BTreeMap<String, InstalledServer>, doc: Document) {
+    pub async fn reload(&self, installed: BTreeMap<String, InstalledServer>, doc: Document) {
         *self.pending.lock().unwrap() = Some((installed, doc));
-        if self.busy.load(Ordering::SeqCst) == 0 {
-            self.apply_pending();
-        } else {
-            info!("computer use: the new servers wait for the calls in flight");
-        }
+        self.apply_pending().await;
     }
 
-    fn apply_pending(&self) {
+    /// Applies a waiting reload unless a call is in flight (the last one out
+    /// starts it again). The changed servers' files are hashed off the
+    /// runtime; a call that comes meanwhile keeps the servers it found, and
+    /// the swap waits for it.
+    async fn apply_pending(&self) {
+        let _one = self.applying.lock().await;
+        if self.busy.load(Ordering::SeqCst) > 0 {
+            if self.pending.lock().unwrap().is_some() {
+                info!("computer use: the new servers wait for the calls in flight");
+            }
+            return;
+        }
         let Some((installed, doc)) = self.pending.lock().unwrap().take() else {
             return;
         };
         let mut next = BTreeMap::new();
         let old = self.servers.lock().unwrap().clone();
-        for (name, rec) in installed {
-            let dir = install::version_dir(&self.opts.dir, &name, &rec.folder);
-            let pin = self.effective_pin(&name, &rec, &doc, &dir);
+        for (name, rec) in &installed {
+            let dir = install::version_dir(&self.opts.dir, name, &rec.folder);
+            let pin = effective_pin(name, &self.opts.os, &rec.folder, &doc, &dir);
             // The same files run by the same pin: the running process stays.
-            if let Some(s) = old.get(&name)
+            if let Some(s) = old.get(name)
                 && s.folder == rec.folder
                 && s.sha256 == rec.sha256
                 && s.error().is_none()
                 && pin.as_ref().is_ok_and(|p| *p == s.pin)
             {
-                next.insert(name, s.clone());
+                next.insert(name.clone(), s.clone());
                 continue;
             }
-            next.insert(name.clone(), Arc::new(self.load(&name, &rec, pin, dir)));
+            let (mcp, n, folder, sha) = (
+                self.opts.dir.clone(),
+                name.clone(),
+                rec.folder.clone(),
+                rec.sha256.clone(),
+            );
+            let checked =
+                tokio::task::spawn_blocking(move || install::verify(&mcp, &n, &folder, &sha))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+            next.insert(
+                name.clone(),
+                Arc::new(self.load(name, rec, pin, dir, checked)),
+            );
         }
-        let stale: Vec<Arc<Server>> = old
-            .iter()
-            .filter(|(n, s)| next.get(*n).is_none_or(|x| !Arc::ptr_eq(x, s)))
-            .map(|(_, s)| s.clone())
-            .collect();
-        *self.servers.lock().unwrap() = next;
+        let stale: Vec<Arc<Server>> = {
+            let mut servers = self.servers.lock().unwrap();
+            if self.busy.load(Ordering::SeqCst) > 0 {
+                // A call came while the files were hashed: the last one out
+                // applies this (unless a newer reload came too).
+                let mut pending = self.pending.lock().unwrap();
+                if pending.is_none() {
+                    *pending = Some((installed, doc));
+                }
+                info!("computer use: the new servers wait for the calls in flight");
+                return;
+            }
+            let stale = old
+                .iter()
+                .filter(|(n, s)| next.get(*n).is_none_or(|x| !Arc::ptr_eq(x, s)))
+                .map(|(_, s)| s.clone())
+                .collect();
+            *servers = next;
+            stale
+        };
         // The old processes end; nothing is in flight on them.
         for s in stale {
             tokio::spawn(async move {
@@ -292,32 +339,10 @@ impl Service {
         self.announce();
     }
 
-    /// The pin a server runs by: the document's when it pins this version
-    /// (its allow-list may have narrowed); else the one it was installed
-    /// from, narrowed to what the document allows for its newer version
-    /// (a tool it dropped stays off, and the focus check runs wherever
-    /// either asks for it). A server the document no longer names is not run.
-    fn effective_pin(
-        &self,
-        name: &str,
-        rec: &InstalledServer,
-        doc: &Document,
-        dir: &std::path::Path,
-    ) -> Result<ServerPin, String> {
-        match doc.server(name, &self.opts.os) {
-            Some(p) if p.version == rec.version => Ok(p.clone()),
-            Some(p) => {
-                let mut kept = install::kept_pin(dir)?;
-                let allowed = p.allowed();
-                kept.allow.retain(|t| allowed.contains(t));
-                kept.observe.retain(|t| p.observe.contains(t));
-                Ok(kept)
-            }
-            None if doc.serial == 0 => install::kept_pin(dir),
-            None => Err(format!(
-                "the signed pins no longer name {name}, so it is not run; `pithagoras-sync computer-use uninstall` removes it"
-            )),
-        }
+    /// Holds `busy` (a call, the owner's test or a probe) until dropped.
+    fn hold(&self) -> Busy<'_> {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(self)
     }
 
     fn load(
@@ -326,8 +351,8 @@ impl Service {
         rec: &InstalledServer,
         pin: Result<ServerPin, String>,
         dir: PathBuf,
+        checked: Result<PathBuf, String>,
     ) -> Server {
-        let checked = install::verify(&self.opts.dir, name, &rec.folder, &rec.sha256);
         let (pin, error) = match (pin, checked) {
             (Ok(p), Ok(_)) => (Some(p), None),
             (Ok(p), Err(e)) => (Some(p), Some(e)),
@@ -412,6 +437,8 @@ impl Service {
     }
 
     pub async fn status(&self, probe: bool) -> Vec<ServerStatus> {
+        // A probe may start a server: none the swap replaces.
+        let _busy = probe.then(|| self.hold());
         let servers: Vec<Arc<Server>> = self.servers.lock().unwrap().values().cloned().collect();
         let mut out = Vec::new();
         for s in servers {
@@ -674,6 +701,8 @@ impl Service {
         // Waiting in the queue does not outlast the consent: switched off,
         // run out, paused or outside the hours meanwhile, the call is refused.
         self.engine.screen_still_allowed(&call, &target)?;
+        // From here the call may act on the screen.
+        let _acting = Acting::new(self);
         self.ensure_started(&s, &mut slot, stop).await?;
         if s.pin.is_input(&p.tool)
             && let Err(e) = self.focus_check(&s, &mut slot).await
@@ -767,6 +796,7 @@ impl Service {
         server: &str,
         f: impl for<'c> FnOnce(&'c mut Client, &'c ServerPin) -> BoxFuture<'c, T>,
     ) -> Result<T, String> {
+        let _busy = self.hold();
         let s = self
             .servers
             .lock()
@@ -790,14 +820,46 @@ impl Service {
         self.busy.load(Ordering::SeqCst) > 0
     }
 
-    /// Whether computer use is active: a call in flight or one within
-    /// `BURST_GAP_MS`. Meanwhile the agent may be typing into a terminal or
-    /// clicking in a browser of the owner's, so the client takes no answer,
-    /// setting or secret from the owner's side (only `status`, `panic` and a
-    /// denial): it could be the agent answering itself.
+    /// Whether computer use is active: a call past its consent in flight, or
+    /// one that ended within `active_ms`. Meanwhile the agent may be typing
+    /// into a terminal or clicking in a browser of the owner's, so the client
+    /// takes no answer, setting or secret from the owner's side (only
+    /// `status`, `panic` and a denial): it could be the agent answering
+    /// itself. A call that waits for its consent question does not count, so
+    /// the owner can answer a chat's first question on the device.
     pub fn active(&self) -> bool {
-        self.busy()
-            || self.engine.now() - self.last_call_ms.load(Ordering::SeqCst) < self.opts.active_ms
+        self.acting.load(Ordering::SeqCst) > 0
+            || self.engine.now() - self.last_acted_ms.load(Ordering::SeqCst) < self.opts.active_ms
+    }
+}
+
+/// The pin an installed server runs by: the document's when it is the very
+/// pin the server's folder was installed from (the folder's name holds its
+/// hash); else the one it was installed from, narrowed to what the document
+/// allows (a tool it dropped stays off, and the focus check runs wherever
+/// either asks for it). So the files of one pin never run by another's
+/// program, arguments or environment. A server the signed document no longer
+/// names is not run.
+pub fn effective_pin(
+    name: &str,
+    os: &str,
+    folder: &str,
+    doc: &Document,
+    dir: &Path,
+) -> Result<ServerPin, String> {
+    match doc.server(name, os) {
+        Some(p) if install::folder_name(p) == folder => Ok(p.clone()),
+        Some(p) => {
+            let mut kept = install::kept_pin(dir)?;
+            let allowed = p.allowed();
+            kept.allow.retain(|t| allowed.contains(t));
+            kept.observe.retain(|t| p.observe.contains(t));
+            Ok(kept)
+        }
+        None if doc.serial == 0 => install::kept_pin(dir),
+        None => Err(format!(
+            "the signed pins in force do not name {name} (or the kept pins are lost or no longer verify), so it is not run; `pithagoras-sync computer-use update` fetches the pins again, `computer-use uninstall` removes it"
+        )),
     }
 }
 
@@ -856,14 +918,39 @@ impl Drop for Counter<'_> {
     }
 }
 
-/// Holds `busy` for a call; the last one out applies a waiting reload.
+/// Holds `busy` for a call; the last one out applies a waiting reload (or
+/// one that is being prepared and may still have to wait), off the call.
 struct Busy<'a>(&'a Service);
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        if self.0.busy.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.apply_pending();
+        let s = self.0;
+        if s.busy.fetch_sub(1, Ordering::SeqCst) == 1
+            && (s.pending.lock().unwrap().is_some() || s.applying.try_lock().is_err())
+            && let Some(me) = s.me.upgrade()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move { me.apply_pending().await });
         }
+    }
+}
+
+/// Counts a call past its consent; when it ends, computer use stays active for
+/// `active_ms`.
+struct Acting<'a>(&'a Service);
+
+impl<'a> Acting<'a> {
+    fn new(s: &'a Service) -> Acting<'a> {
+        s.acting.fetch_add(1, Ordering::SeqCst);
+        Acting(s)
+    }
+}
+
+impl Drop for Acting<'_> {
+    fn drop(&mut self) {
+        let s = self.0;
+        s.last_acted_ms.store(s.engine.now(), Ordering::SeqCst);
+        s.acting.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -878,8 +965,7 @@ impl sync_connector::device::ComputerUse for Service {
         params: McpCallParams,
     ) -> BoxFuture<'a, Result<McpCallResult, RpcError>> {
         Box::pin(async move {
-            self.busy.fetch_add(1, Ordering::SeqCst);
-            let _busy = Busy(self);
+            let _busy = self.hold();
             self.call_inner(id, params).await
         })
     }

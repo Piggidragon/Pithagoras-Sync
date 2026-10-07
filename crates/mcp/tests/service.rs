@@ -22,7 +22,26 @@ use sync_proto::methods::{Consent, McpCallParams, McpContent};
 use sync_proto::{Id, RpcError, code, mcp_reason as why};
 use sync_testkit::files::FileServer;
 
-struct Scripted(Answer, AtomicUsize);
+/// Answers every question with its answer; held, it first says it was asked
+/// and waits until the test lets it answer.
+struct Scripted(Answer, AtomicUsize, Mutex<Option<Gate>>);
+
+#[derive(Clone)]
+struct Gate {
+    asked: Arc<tokio::sync::Notify>,
+    answer: Arc<tokio::sync::Notify>,
+}
+
+impl Scripted {
+    fn hold(&self) -> Gate {
+        let g = Gate {
+            asked: Arc::new(tokio::sync::Notify::new()),
+            answer: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.2.lock().unwrap() = Some(g.clone());
+        g
+    }
+}
 
 impl Approver for Scripted {
     fn can_prompt(&self) -> bool {
@@ -31,7 +50,14 @@ impl Approver for Scripted {
     fn ask<'a>(&'a self, _req: &'a ApprovalRequest) -> BoxFuture<'a, Answer> {
         self.1.fetch_add(1, Ordering::SeqCst);
         let a = self.0;
-        Box::pin(async move { a })
+        let gate = self.2.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some(g) = gate {
+                g.asked.notify_one();
+                g.answer.notified().await;
+            }
+            a
+        })
     }
 }
 
@@ -83,7 +109,7 @@ impl Fx {
                 held: false,
             },
         );
-        self.svc.reload(installed, doc(&pin));
+        self.svc.reload(installed, doc(&pin)).await;
         // The install's own run is not what the tests look at.
         let _ = std::fs::remove_file(self.root.join("record"));
         pin
@@ -119,7 +145,7 @@ async fn fx(consent: Consent, answer: Answer, limits: sync_mcp::Limits) -> Fx {
         .computer_use
         .set(consent, minutes, sync_policy::system_clock()())
         .unwrap();
-    let approver = Arc::new(Scripted(answer, AtomicUsize::new(0)));
+    let approver = Arc::new(Scripted(answer, AtomicUsize::new(0), Mutex::new(None)));
     let engine = Arc::new(Engine::new(
         policy,
         Profile::Desktop,
@@ -160,6 +186,32 @@ async fn fx(consent: Consent, answer: Answer, limits: sync_mcp::Limits) -> Fx {
 
 fn reason(e: &RpcError) -> Option<&str> {
     e.reason()
+}
+
+async fn wait_for_version(f: &Fx, version: &str) {
+    for _ in 0..200 {
+        if f.svc.list().servers[0].version == version {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never switched to {version}: {:?}", f.svc.list());
+}
+
+/// The record of the server `install` loaded.
+fn installed(f: &Fx, pin: &ServerPin) -> BTreeMap<String, InstalledServer> {
+    let folder = sync_mcp::install::folder_name(pin);
+    BTreeMap::from([(
+        "fake".to_string(),
+        InstalledServer {
+            version: pin.version.clone(),
+            sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake").join(&folder)).unwrap(),
+            folder,
+            serial: 1,
+            previous: None,
+            held: false,
+        },
+    )])
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -216,20 +268,23 @@ async fn nothing_runs_without_consent_and_a_disallowed_tool_never_runs() {
     // new_tool is on this pin's table but was not listed at install... it was:
     // the fake lists it in new-tool mode. A pin without it denies it.
     pin.allow.retain(|t| t != "new_tool");
-    f.svc.reload(
-        BTreeMap::from([(
-            "fake".to_string(),
-            InstalledServer {
-                version: "1.0.0".into(),
-                sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake").join(&folder)).unwrap(),
-                folder,
-                serial: 2,
-                previous: None,
-                held: false,
-            },
-        )]),
-        doc(&pin),
-    );
+    f.svc
+        .reload(
+            BTreeMap::from([(
+                "fake".to_string(),
+                InstalledServer {
+                    version: "1.0.0".into(),
+                    sha256: sync_mcp::fsutil::tree_hash(&f.mcp().join("fake").join(&folder))
+                        .unwrap(),
+                    folder,
+                    serial: 2,
+                    previous: None,
+                    held: false,
+                },
+            )]),
+            doc(&pin),
+        )
+        .await;
     let e = f.call("c1", "new_tool", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), Some(why::TOOL_NOT_ALLOWED));
     let rec = f.record();
@@ -402,26 +457,29 @@ async fn an_update_waits_for_the_calls_in_flight_and_is_announced() {
     let call = f.call("c1", "screenshot", json!({}));
     let update = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        f.svc.reload(
-            BTreeMap::from([(
-                "fake".to_string(),
-                InstalledServer {
-                    version: "2.0.0".into(),
-                    folder: done.folder.clone(),
-                    sha256: done.sha256.clone(),
-                    serial: 2,
-                    previous: None,
-                    held: false,
-                },
-            )]),
-            doc(&next),
-        );
+        f.svc
+            .reload(
+                BTreeMap::from([(
+                    "fake".to_string(),
+                    InstalledServer {
+                        version: "2.0.0".into(),
+                        folder: done.folder.clone(),
+                        sha256: done.sha256.clone(),
+                        serial: 2,
+                        previous: None,
+                        held: false,
+                    },
+                )]),
+                doc(&next),
+            )
+            .await;
         // Still the old one while the call runs.
         assert_eq!(f.svc.list().servers[0].version, "1.0.0");
     };
     let (r, ()) = tokio::join!(call, update);
     assert_eq!(r.unwrap_err().code, code::TIMEOUT);
-    assert_eq!(f.svc.list().servers[0].version, "2.0.0");
+    // The last call out applies it, off the call.
+    wait_for_version(&f, "2.0.0").await;
     assert_ne!(f.svc.list().version, before);
     let c = changes.recv().await.unwrap();
     assert_eq!(c.version, f.svc.list().version);
@@ -452,14 +510,16 @@ async fn a_newer_document_narrows_or_stops_an_installed_version() {
     newer.version = "2.0.0".into();
     newer.allow.retain(|t| t != "type_text");
     newer.observe.retain(|t| t != "screenshot");
-    f.svc.reload(
-        installed(),
-        Document {
-            serial: 3,
-            issued_ms: 1,
-            servers: vec![newer],
-        },
-    );
+    f.svc
+        .reload(
+            installed(),
+            Document {
+                serial: 3,
+                issued_ms: 1,
+                servers: vec![newer],
+            },
+        )
+        .await;
     let e = f
         .call("c1", "type_text", json!({"text": "x"}))
         .await
@@ -473,15 +533,113 @@ async fn a_newer_document_narrows_or_stops_an_installed_version() {
         .unwrap();
     assert!(shot.input, "the focus check runs where either asks");
     // Pins that no longer name the server stop it.
-    f.svc.reload(
-        installed(),
-        Document {
-            serial: 4,
-            issued_ms: 1,
-            servers: vec![],
-        },
-    );
+    f.svc
+        .reload(
+            installed(),
+            Document {
+                serial: 4,
+                issued_ms: 1,
+                servers: vec![],
+            },
+        )
+        .await;
     assert_eq!(f.svc.list().servers[0].state, "unavailable");
     let e = f.call("c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(e.code, code::SERVER);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_pin_for_the_same_version_does_not_run_the_old_files() {
+    let f = fx(Consent::Allow, Answer::Once, common::limits()).await;
+    let pin = f.install("1.0.0", &[], None).await;
+    // Signed pins for the same version from other files, run another way,
+    // whose install has not happened (it failed, or auto_update is off).
+    let mut other = pin.clone();
+    other.run.program = "not-installed".into();
+    other.allow.retain(|t| t != "type_text");
+    assert_ne!(
+        sync_mcp::install::folder_name(&other),
+        sync_mcp::install::folder_name(&pin)
+    );
+    f.svc
+        .reload(
+            installed(&f, &pin),
+            Document {
+                serial: 2,
+                issued_ms: 1,
+                servers: vec![other],
+            },
+        )
+        .await;
+    // The installed files run as they were installed, narrowed by the pins.
+    f.call("c1", "screenshot", json!({})).await.unwrap();
+    let e = f
+        .call("c1", "type_text", json!({"text": "x"}))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), Some(why::TOOL_NOT_ALLOWED));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_waiting_for_its_consent_question_is_not_activity() {
+    let f = fx(Consent::Ask, Answer::Once, common::limits()).await;
+    f.install("1.0.0", &[], None).await;
+    let gate = f.approver.hold();
+    let call = f.call("c1", "screenshot", json!({}));
+    let owner = async {
+        gate.asked.notified().await;
+        // The owner can answer the chat's first question on the device.
+        let active = f.svc.active();
+        gate.answer.notify_one();
+        active
+    };
+    let (r, active_while_asked) = tokio::join!(call, owner);
+    r.unwrap();
+    assert!(!active_while_asked);
+    // Once a call ran, it is.
+    assert!(f.svc.active());
+}
+
+/// The reload runs as far as hashing the changed server's files; meanwhile a
+/// call takes the server it finds. The reload must not swap it under the call.
+#[tokio::test]
+async fn a_reload_never_swaps_the_server_a_call_holds() {
+    let f = fx(Consent::Ask, Answer::Once, common::limits()).await;
+    let pin = f.install("1.0.0", &[], None).await;
+    let gate = f.approver.hold();
+    let svc = f.svc.clone();
+    let record = installed(&f, &pin);
+    // New pins that no longer name the server.
+    let reload = tokio::spawn(async move {
+        svc.reload(
+            record,
+            Document {
+                serial: 5,
+                issued_ms: 1,
+                servers: vec![],
+            },
+        )
+        .await
+    });
+    // The reload task starts and waits for its hash.
+    tokio::task::yield_now().await;
+    let call = f.call("c1", "screenshot", json!({}));
+    let check = async {
+        gate.asked.notified().await;
+        reload.await.unwrap();
+        let state = f.svc.list().servers[0].state.clone();
+        gate.answer.notify_one();
+        state
+    };
+    let (r, state) = tokio::join!(call, check);
+    assert_eq!(state, "ready", "swapped under the call");
+    r.unwrap();
+    // The last call out applies the reload.
+    for _ in 0..200 {
+        if f.svc.list().servers[0].state == "unavailable" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the reload was never applied");
 }

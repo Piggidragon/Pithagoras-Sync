@@ -150,7 +150,12 @@ pub fn main_with(args: &[String]) {
     let mut pids: Vec<String> = Vec::from([std::process::id().to_string()]);
     #[cfg(unix)]
     if fake.has("child")
-        && let Ok(c) = std::process::Command::new("/bin/sleep").arg("1000").spawn()
+        // Not on the server's output: its end is the server's end.
+        && let Ok(c) = std::process::Command::new("/bin/sleep")
+            .arg("1000")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
     {
         pids.push(c.id().to_string());
     }

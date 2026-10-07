@@ -105,7 +105,7 @@ The task runs `pithagoras-sync.exe run --detach` (a hidden form of `run`, which 
 
 Computer use ([computer-use.md](computer-use.md)) runs [Windows-MCP](https://github.com/CursorTouch/Windows-MCP), a Python program. The person does not set up Python: `computer-use install` (or the install window's question) brings one, everything pinned by sha256 ([mcp-pins.md](mcp-pins.md)):
 
-- the embeddable CPython for Windows x86_64 from python.org, of the version Windows-MCP asks for, unpacked into `%LOCALAPPDATA%\pithagoras-sync\mcp\windows-mcp\<version>\python`, with its `pythonXY._pth` written by the client so that `Lib\site-packages` is on the path and `import site` is on;
+- the embeddable CPython for Windows x86_64 from python.org, of the version Windows-MCP asks for, unpacked into `%LOCALAPPDATA%\pithagoras-sync\mcp\windows-mcp\<version>-<pin hash>\python`, with its `pythonXY._pth` written by the client so that `Lib\site-packages` is on the path and `import site` is on;
 - Windows-MCP's wheel and the wheel of every dependency of its lock, from PyPI, each checked against its hash and unpacked into `Lib\site-packages` by the client itself (wheels are zip files; no `pip`, nothing from the machine's own Python, from `PATH` or from an index query);
 - a check with that Python that every module the server imports is there (`python -c "import ..."`), which names a missing one (the embeddable Python has no `tkinter`).
 

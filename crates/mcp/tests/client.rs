@@ -249,6 +249,33 @@ async fn stopping_kills_the_server_and_its_children() {
 }
 
 #[tokio::test]
+async fn a_server_that_ended_on_its_own_takes_its_children_along() {
+    // It crashes during a call: the client reaps it, then kills its group.
+    let t = tempfile::tempdir().unwrap();
+    let mut c = start(t.path(), &["child", "crash"], limits()).await;
+    let p = pids(t.path());
+    assert_eq!(p.len(), 2, "the server and its child");
+    let e = c.call("screenshot", &Map::new()).await.unwrap_err();
+    assert!(matches!(e, ClientError::Crashed(_)), "{e:?}");
+    assert!(gone(p[1]).await, "the child of a crashed server still runs");
+    // It is killed from outside and found dead between calls.
+    let t = tempfile::tempdir().unwrap();
+    let mut c = start(t.path(), &["child"], limits()).await;
+    let p = pids(t.path());
+    // SAFETY: the test's own server.
+    unsafe { libc::kill(p[0] as i32, libc::SIGKILL) };
+    for _ in 0..100 {
+        if c.is_dead() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(c.is_dead());
+    c.kill().await;
+    assert!(gone(p[1]).await, "the child of a dead server still runs");
+}
+
+#[tokio::test]
 async fn a_stop_ends_the_call_in_flight() {
     let t = tempfile::tempdir().unwrap();
     let (tx, rx) = tokio::sync::watch::channel(0u64);

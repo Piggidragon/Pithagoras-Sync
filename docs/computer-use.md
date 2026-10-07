@@ -19,7 +19,7 @@ So it is off until you switch it on, separately from everything else, and only o
 - **`ask`**: the first computer-use call of each chat asks you, in the portal's Devices tab or with `pithagoras-sync approvals`. You answer once, for this chat, or deny. The question names the tool and shows its arguments (the text it would type, the keys it would press). Nobody answering within the approval timeout is a denial.
 - **`allow --minutes N`**: no questions, for at most 8 hours; then it is `off` again.
 
-`pithagoras-sync panic` stops every computer-use call and the server at once, and turns an `allow` into `off`; `unlock` does not switch it on again.
+`pithagoras-sync panic` stops every computer-use call and the server at once, and turns an `allow` into `off`; `unlock` does not switch it on again. `panic` and `computer-use off` switch it off in the running client even when `config.toml` cannot be written; they then say so, because the file would allow it again at the next start or reload until it is fixed.
 
 What else holds while it is on:
 
@@ -27,7 +27,7 @@ What else holds while it is on:
 - **Not into Pithagoras Sync's own windows.** Before every click or key, the client asks the server which windows are open and which has the focus, and refuses while a window of Pithagoras Sync is open (its install and pairing windows, any question it shows). If it cannot tell, it refuses too.
 - **The chat counts as having seen untrusted content.** A screenshot can show anything, including text written to trick the agent. After a computer-use call, that chat's next command or write asks you even in Full mode (`policy.full.taint_prompts`, on by default).
 - **An indicator.** At the start of each burst of calls a desktop notification (Linux) says which chat uses the screen; `pithagoras-sync status` shows it too ("Computer use: ... in use by chat ..."). Every decision is in the audit log.
-- **Your own command line waits while it is active.** From a computer-use call until a minute after the last one, the agent could be typing into one of your terminals. So the client then takes no approval, setting, `unlock` or secret from its command line (`approve`, `config set`, `mode`, `computer-use ask` and the like say "computer use is active"); `status`, `panic`, `computer-use off` and `deny` work. Answer approvals in the portal meanwhile, or wait a minute.
+- **Your own command line waits while it is active.** From the moment a computer-use call is past its consent until a minute after the last one ends, the agent could be typing into one of your terminals. So the client then takes no approval, setting, `unlock` or secret from its command line (`approve`, `config set`, `mode`, `computer-use ask` and the like say "computer use is active"), and a click on a notification's allow counts as no; `status`, `panic`, `computer-use off` and `deny` work. Answer approvals in the portal meanwhile, or wait a minute. A call that waits for your answer to its question does not count: a chat's first question can be answered with `pithagoras-sync approve` or the notification.
 - **No way around the rest.** The file tools never reach the server's folder (in no mode, as the stored sudo password), so a portal cannot read or replace the server through them; and only the allowed tools above are ever called, never one that runs commands or reads files.
 
 ## Install
@@ -37,7 +37,7 @@ pithagoras-sync computer-use install --print    # what it would download, and fr
 pithagoras-sync computer-use install
 ```
 
-or `pithagoras-sync install --computer-use` together with the client, or "Also install computer use?" in the install window. It downloads the pinned version of the server from its project's releases (GitHub, and on Windows python.org and PyPI), checks each file's size and sha256 against the pin before anything is written, puts it into the client's own folder (`~/.local/state/pithagoras-sync/mcp/<server>/<version>/`, `%LOCALAPPDATA%\pithagoras-sync\mcp\...` on Windows; private to you), starts it once to see that it answers and which tools it has, and records the version and a hash of the whole folder in `config.toml`. Before every start the client checks that hash again: a server changed after install is not run. Nothing comes from your `PATH`, and nothing is installed system-wide.
+or `pithagoras-sync install --computer-use` together with the client, or "Also install computer use?" in the install window. It downloads the pinned version of the server from its project's releases (GitHub, and on Windows python.org and PyPI), checks each file's size and sha256 against the pin before anything is written, puts it into the client's own folder (`~/.local/state/pithagoras-sync/mcp/<server>/<version>-<pin hash>/`, `%LOCALAPPDATA%\pithagoras-sync\mcp\...` on Windows; private to you), starts it once to see that it answers and which tools it has, and records the version and a hash of the whole folder in `config.toml`. Before every start the client checks that hash again: a server changed after install is not run. Nothing comes from your `PATH`, and nothing is installed system-wide.
 
 Each version goes into a folder of its own, named after the version and its pin. Versions are exact pins, never "latest". The pins are built into the client and can be replaced by a newer list the owner of this project signs with the release key ([mcp-updates.md](mcp-updates.md)), without a new client.
 
@@ -47,7 +47,7 @@ Each version goes into a folder of its own, named after the version and its pin.
 pithagoras-sync computer-use setup
 ```
 
-walks through what the server needs on this desktop, step by step, with the exact command or setting, and asks before it changes anything.
+walks through what the server needs on this desktop, step by step, with the exact command or setting, and asks before it changes anything. Like `install`, it refuses to run from a command the client started (the agent's) or while computer use is active.
 
 - **GNOME** (validated upstream on Ubuntu 25.10, GNOME 50, Wayland):
   1. Accessibility (AT-SPI): `gsettings set org.gnome.desktop.interface toolkit-accessibility true` (the setup offers to run it).

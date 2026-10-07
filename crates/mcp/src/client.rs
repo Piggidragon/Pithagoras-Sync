@@ -111,6 +111,7 @@ pub struct Tool {
 
 pub struct Client {
     child: Child,
+    group: crate::proc::Group,
     stdin: ChildStdin,
     lines: mpsc::Receiver<Line>,
     next_id: i64,
@@ -158,6 +159,7 @@ impl Client {
         tokio::spawn(read_lines(stdout, tx, limits.max_line));
         let mut client = Client {
             child: c.child,
+            group: c.group,
             stdin,
             lines,
             next_id: 0,
@@ -201,12 +203,14 @@ impl Client {
         Ok(client)
     }
 
-    /// Whether the server ended or was stopped.
+    /// Whether the server ended or was stopped. A server found ended takes
+    /// what it started with it.
     pub fn is_dead(&mut self) -> bool {
         if self.dead.is_none()
             && let Ok(Some(st)) = self.child.try_wait()
         {
             self.dead = Some(format!("exited ({st})"));
+            self.group.kill();
         }
         self.dead.is_some()
     }
@@ -216,7 +220,7 @@ impl Client {
         if self.dead.is_none() {
             self.dead = Some("stopped".into());
         }
-        crate::proc::kill_tree(&mut self.child).await;
+        crate::proc::kill_tree(&mut self.child, &mut self.group).await;
         #[cfg(windows)]
         self._job.terminate();
     }
@@ -434,7 +438,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        crate::proc::kill_now(&mut self.child);
+        crate::proc::kill_now(&mut self.child, &mut self.group);
     }
 }
 

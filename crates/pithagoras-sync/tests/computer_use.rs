@@ -26,6 +26,8 @@ struct Env {
     key: TestKey,
     files: FileServer,
     active_ms: String,
+    /// The first daily look for new pins this long after the start.
+    check_ms: Option<String>,
 }
 
 impl Env {
@@ -43,6 +45,7 @@ impl Env {
             key: TestKey::generate(),
             files: FileServer::start().await,
             active_ms: "0".into(),
+            check_ms: None,
         }
     }
 
@@ -68,7 +71,18 @@ impl Env {
             .env("PITHAGORAS_SYNC_TEST_MCP_ACTIVE_MS", &self.active_ms)
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(ms) = &self.check_ms {
+            c.env("PITHAGORAS_SYNC_TEST_MCP_CHECK_MS", ms);
+        }
         c
+    }
+
+    fn mode_line(status: &str) -> String {
+        status
+            .lines()
+            .find(|l| l.starts_with("Mode:"))
+            .unwrap_or_default()
+            .to_string()
     }
 
     async fn run(&self, args: &[&str]) -> (bool, String) {
@@ -459,5 +473,43 @@ async fn while_computer_use_is_active_the_owners_side_takes_nothing() {
     let e = call(&dl, "c1", "screenshot", json!({})).await.unwrap_err();
     assert_eq!(reason(&e), "consent_off");
     env.ok(&["panic"]).await;
+    stop(daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daily_look_takes_only_the_servers_from_the_file() {
+    let mut env = Env::new().await;
+    env.check_ms = Some("1500".into());
+    let mock = MockPortal::start(MockOptions {
+        tls: false,
+        codes: vec!["CODE9999".into()],
+    })
+    .await;
+    env.ok(&["pair", &mock.pair_uri("CODE9999")]).await;
+    env.publish(1, "1.0.0");
+    env.ok(&["computer-use", "install"]).await;
+    let daemon = env.start();
+    let dl = mock.next_device(WAIT).await.expect("connects");
+    let before = Env::mode_line(&env.ok(&["status"]).await);
+    assert!(!before.contains("full"), "{before}");
+    // Typed into an editor while computer use was active, say: only the
+    // owner's reload takes it.
+    let file = env.home.join(".config/pithagoras-sync/config.toml");
+    let mut cfg = sync_policy::DeviceConfig::load(&file).unwrap();
+    cfg.policy.mode = sync_policy::Mode::Full;
+    cfg.save(&file).unwrap();
+    env.publish(2, "2.0.0");
+    let mut updated = false;
+    for _ in 0..200 {
+        let l = dl.call("mcp.list", json!({})).await.unwrap();
+        if l["servers"][0]["version"] == "2.0.0" {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(updated, "the daily look updated the server");
+    let after = Env::mode_line(&env.ok(&["status"]).await);
+    assert_eq!(after, before, "the daily look took the mode from the file");
     stop(daemon).await;
 }

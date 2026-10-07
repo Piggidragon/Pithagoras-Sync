@@ -2111,7 +2111,11 @@ async fn computer_use_cmd(dirs: &Dirs, cmd: ComputerUseCmd) -> Result<ExitCode, 
             println!("Computer use is off: every call is refused.");
         }
         ComputerUseCmd::Status { json } => return computer_use_status(dirs, json).await,
-        ComputerUseCmd::Setup { yes } => computer_use_setup(dirs, yes)?,
+        ComputerUseCmd::Setup { yes } => {
+            // Its steps change the owner's desktop (accessibility, extensions).
+            owner::not_from_own_command(dirs).await?;
+            computer_use_setup(dirs, yes)?
+        }
         ComputerUseCmd::Test { verbose } => {
             owner::not_from_own_command(dirs).await?;
             let steps = match control::send(&dirs.socket(), Request::McpTest { verbose }).await? {

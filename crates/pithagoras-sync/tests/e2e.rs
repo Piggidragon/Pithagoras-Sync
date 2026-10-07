@@ -910,6 +910,7 @@ async fn commands_the_client_runs_cannot_change_its_policy() {
         "computer-use test",
         "computer-use update",
         "computer-use rollback",
+        "computer-use setup --yes",
         "computer-use uninstall",
     ]
     .iter()

@@ -248,7 +248,8 @@ pub async fn run(dirs: Dirs) -> Result<bool, String> {
             active_ms: crate::computer_use::active_ms(),
         },
     );
-    mcp.reload(cfg.mcp.clone(), crate::computer_use::store(&dirs).current());
+    mcp.reload(cfg.mcp.clone(), crate::computer_use::store(&dirs).current())
+        .await;
     device.set_computer_use(mcp.clone());
     let _ = gate.set(mcp.clone());
     let keyring = sync_policy::keyring::system(&dirs);
@@ -406,7 +407,7 @@ async fn wait_for_signals(daemon: &Arc<Daemon>) {
                 _ = int.recv() => return,
                 _ = daemon.restart.notified() => return,
                 _ = hup.recv() => {
-                    if let Err(e) = daemon.reload() {
+                    if let Err(e) = daemon.reload().await {
                         warn!("reload failed, keeping the old config: {e}");
                     }
                 }
@@ -442,19 +443,34 @@ impl Daemon {
 
     /// Takes the config file as it is now. A bad file leaves the running policy as it
     /// was.
-    pub fn reload(&self) -> Result<(), String> {
+    pub async fn reload(&self) -> Result<(), String> {
         let cfg = self.store.reload()?;
         if let Some(p) = &cfg.portal {
             self.device.set_name(p.name.clone());
         }
         // Waits for the calls in flight before a server changes.
-        self.mcp.reload(
-            cfg.mcp.clone(),
-            crate::computer_use::store(&self.dirs).current(),
-        );
+        self.mcp
+            .reload(
+                cfg.mcp.clone(),
+                crate::computer_use::store(&self.dirs).current(),
+            )
+            .await;
         self.mcp.announce();
         let _ = self.relink.try_send(());
         info!("config reloaded");
+        Ok(())
+    }
+
+    /// Takes the installed servers' record from the file and the pins in
+    /// force, and nothing else of the file: what the daily look changed. The
+    /// file may hold edits typed while computer use was active, which only
+    /// the owner's reload takes.
+    async fn reload_servers(&self) -> Result<(), String> {
+        let cfg = self.store.reload_mcp()?;
+        self.mcp
+            .reload(cfg.mcp, crate::computer_use::store(&self.dirs).current())
+            .await;
+        self.mcp.announce();
         Ok(())
     }
 
@@ -531,24 +547,29 @@ impl Daemon {
 
     /// `panic` takes an allow of computer use back: `unlock` does not give it
     /// again.
-    fn consent_off_after_panic(&self) {
+    fn consent_off_after_panic(&self) -> Result<(), String> {
         if self.store.config().policy.computer_use.consent == Consent::Allow {
-            self.consent_off("panic");
+            return self.consent_off("panic");
         }
+        Ok(())
     }
 
-    /// Switches computer use off in the running client and the file, taking
-    /// nothing else from the file (it may hold what the agent typed into an
-    /// editor while computer use was active).
-    fn consent_off(&self, why: &str) {
+    /// Switches computer use off in the running client, then in the file,
+    /// taking nothing else from the file (it may hold what the agent typed
+    /// into an editor while computer use was active). An error says the file
+    /// still holds the old consent: the running client is off all the same.
+    fn consent_off(&self, why: &str) -> Result<(), String> {
         let r = self.store.update(why, |cfg| {
             cfg.policy.computer_use.consent = Consent::Off;
             cfg.policy.computer_use.until_ms = None;
         });
-        if let Err(e) = r {
-            warn!("{why} could not switch computer use off in the config: {e}");
-        }
         self.mcp.announce();
+        r.map_err(|e| {
+            warn!("{why} could not switch computer use off in the config file: {e}");
+            format!(
+                "computer use is off in the running client, but the config file could not be changed ({e}): it still allows computer use and would allow it again at the next start or reload. Fix the file, then run `pithagoras-sync computer-use off` again"
+            )
+        })
     }
 
     async fn handle(&self, req: Request) -> Reply {
@@ -567,8 +588,10 @@ impl Daemon {
                 // Kept in memory only, the secret is gone until the owner types it
                 // again; a stored one comes back with unlock.
                 self.drop_secret();
-                self.consent_off_after_panic();
-                Reply::ok()
+                match self.consent_off_after_panic() {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => Reply::err(format!("paused, but {e}")),
+                }
             }
             Request::Unlock => {
                 if let Err(e) = std::fs::remove_file(self.dirs.paused_file())
@@ -592,7 +615,7 @@ impl Daemon {
                     )),
                 }
             }
-            Request::Reload => match self.reload() {
+            Request::Reload => match self.reload().await {
                 Ok(()) => Reply::ok(),
                 Err(e) => Reply::err(e),
             },
@@ -613,8 +636,10 @@ impl Daemon {
                 Err(e) => Reply::err(e.to_string()),
             },
             Request::ComputerUseOff => {
-                self.consent_off("the device owner (computer-use off)");
-                Reply::ok()
+                match self.consent_off("the device owner (computer-use off)") {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => Reply::err(e),
+                }
             }
             Request::McpStatus { probe } => Reply {
                 mcp: Some(crate::control::McpReport {
@@ -896,8 +921,8 @@ async fn daily_pins(d: Arc<Daemon>, mut shutdown: watch::Receiver<bool>) {
             summary,
             crate::update::utc((now_ms() / 1000) as u64)
         ));
-        if let Err(e) = d.reload() {
-            warn!("{e}");
+        if let Err(e) = d.reload_servers().await {
+            warn!("computer use: the servers were not reloaded: {e}");
         }
     }
 }

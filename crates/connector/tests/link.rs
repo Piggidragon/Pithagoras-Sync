@@ -901,6 +901,57 @@ async fn with_write_the_portal_changes_the_policy_and_each_change_is_audited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_devices_own_narrowing_holds_without_the_file_and_keeps_the_owners_edits() {
+    let fx = Fx::new();
+    let mut policy = fx.folders(&[("home/proj", Access::Rw)]);
+    let now = system_clock()();
+    policy
+        .computer_use
+        .set(Consent::Allow, Some(60), now)
+        .unwrap();
+    let (dev, _queue, store) = fx.full_device(policy.clone(), PortalPolicy::Off);
+    let off = |c: &mut DeviceConfig| {
+        c.policy.computer_use.consent = Consent::Off;
+        c.policy.computer_use.until_ms = None;
+    };
+    // The owner changed the file meanwhile, and the client has not taken it.
+    let mut cfg = DeviceConfig::load(&fx.config_file()).unwrap();
+    cfg.policy.tools.bash = false;
+    cfg.save(&fx.config_file()).unwrap();
+    store.update("panic", off).unwrap();
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Off
+    );
+    assert!(
+        dev.engine.policy().0.tools.bash,
+        "nothing else taken from the file"
+    );
+    let saved = DeviceConfig::load(&fx.config_file()).unwrap();
+    assert_eq!(saved.policy.computer_use.consent, Consent::Off);
+    assert!(
+        !saved.policy.tools.bash,
+        "the owner's edit stays in the file"
+    );
+
+    // A file that cannot be written: the running client narrows all the same,
+    // and the caller hears that the file is unchanged.
+    let fx = Fx::new();
+    let (dev, _queue, store) = fx.full_device(policy, PortalPolicy::Off);
+    std::fs::remove_file(fx.config_file()).unwrap();
+    std::fs::create_dir(fx.config_file()).unwrap();
+    assert!(store.update("panic", off).is_err());
+    assert_eq!(
+        dev.engine.policy().0.computer_use.effective(now),
+        Consent::Off
+    );
+    assert_eq!(
+        store.config().policy.computer_use.effective(now),
+        Consent::Off
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn tool_labels_only_narrow() {
     let fx = Fx::new();
     let mut policy = fx.folders(&[("home/proj", Access::Rw)]);

@@ -610,6 +610,17 @@ impl Document {
 
 const BASELINE: &str = include_str!("../pins/baseline.json");
 
+/// The kept signed document's file in the servers' folder.
+pub const KEPT_FILE: &str = "pins.signed.json";
+
+/// The kept signed document: its text as it came and its signature.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Kept {
+    document: String,
+    minisig: String,
+}
+
 /// The pins compiled into this client.
 pub fn baseline() -> Document {
     Document::parse(BASELINE.as_bytes(), true).expect("the built-in pins are valid")
@@ -625,8 +636,9 @@ pub enum Taken {
 }
 
 /// The newest pins this user's client has taken, kept beside the servers:
-/// the signed document as it came (`pins.json`, `pins.json.minisig`, checked
-/// again on every read) and the highest serial seen (a 0600 file).
+/// the signed document as it came with its signature, in one file written at
+/// once (`pins.signed.json`, checked again on every read), and the highest
+/// serial seen (a 0600 file).
 pub struct PinStore {
     pub dir: PathBuf,
     pub serial_file: PathBuf,
@@ -644,7 +656,7 @@ impl PinStore {
     }
 
     fn doc_file(&self) -> PathBuf {
-        self.dir.join("pins.json")
+        self.dir.join(KEPT_FILE)
     }
 
     /// The highest serial taken; 0 when none (or unreadable, which only
@@ -664,17 +676,32 @@ impl PinStore {
     pub fn kept(&self) -> Option<Document> {
         let key = self.key.as_deref()?;
         let data = std::fs::read(self.doc_file()).ok()?;
-        let sig = std::fs::read_to_string(self.dir.join("pins.json.minisig")).ok()?;
-        verify(&data, &sig, key).ok()
+        let kept: Kept = serde_json::from_slice(&data).ok()?;
+        verify(kept.document.as_bytes(), &kept.minisig, key).ok()
     }
 
     /// The pins in force: the kept signed document when its serial is above
-    /// the baseline's, else the baseline.
+    /// the baseline's; the baseline when no signed document was ever taken.
+    /// A signed document taken before that is gone or no longer verifies
+    /// leaves no server pinned (fail closed: the baseline may still name one
+    /// a later document took back) until a new one is taken.
     pub fn current(&self) -> Document {
         let base = baseline();
         match self.kept() {
             Some(d) if d.serial > base.serial => d,
-            _ => base,
+            Some(_) => base,
+            None => {
+                let seen = self.seen_serial();
+                if seen > base.serial {
+                    Document {
+                        serial: seen,
+                        issued_ms: 0,
+                        servers: Vec::new(),
+                    }
+                } else {
+                    base
+                }
+            }
         }
     }
 
@@ -696,13 +723,15 @@ impl PinStore {
         if doc.serial == seen && self.kept().is_some() {
             return Ok(Taken::Same(doc));
         }
-        sync_policy::config::write_private(&self.doc_file(), data)
-            .and_then(|()| {
-                sync_policy::config::write_private(
-                    &self.dir.join("pins.json.minisig"),
-                    sig.as_bytes(),
-                )
-            })
+        // The document and its signature in one file, swapped in at once: a
+        // write cut short leaves the old pair or the new one, never a mix.
+        let kept = serde_json::to_vec(&Kept {
+            document: String::from_utf8(data.to_vec())
+                .map_err(|_| "the pins document is not UTF-8".to_string())?,
+            minisig: sig.to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+        sync_policy::config::write_private(&self.doc_file(), &kept)
             .map_err(|e| format!("cannot keep the pins document: {e}"))?;
         if doc.serial > seen {
             sync_policy::config::write_private(
